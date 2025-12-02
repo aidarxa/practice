@@ -23,7 +23,8 @@ inline void BlockLoadDirect(const Acc& acc,size_t tid, int tile_offset, T (&item
     }
 }
 template <typename Acc, int BLOCK_THREADS, int ITEMS_PER_THREAD>
-inline void BlockLoad(Acc &acc, size_t tid, int tile_offset, int (&items)[ITEMS_PER_THREAD],int num_items) {
+inline void BlockLoad(Acc &acc, size_t tid, int tile_offset, int (&items)[ITEMS_PER_THREAD],int num_items) 
+{
     if(BLOCK_THREADS * ITEMS_PER_THREAD == num_items){
         BlockLoadDirect<typename Acc::value_type,BLOCK_THREADS,ITEMS_PER_THREAD>(
             acc,tid,tile_offset,items);

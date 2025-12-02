@@ -23,8 +23,9 @@ inline unsigned long long select(nd_item<1> it, Acc lo_orderdate, Acc lo_discoun
     int num_tile_items = TILE_SIZE;
 
     if (it.get_group_linear_id() == num_tiles - 1) {
-        num_tile_items = lo_num_entries - tile_offset;
+        num_tile_items = num_entries - tile_offset;
     }
+    //BlockLoad<int>
 }
 
 int main() {
@@ -64,8 +65,53 @@ int main() {
             int num_tiles = (LO_LEN + TILE_SIZE - 1) / TILE_SIZE;
             size_t local  = BLOCK_THREADS;
             size_t global = num_tiles * BLOCK_THREADS;
-            h.parallel_for<select_kernel>(nd_range<1>(global,local),[=](nd_item<1> it){
-                unsigned long long local_sum = select(it, a_lo_orderdate, a_lo_discount, a_lo_quantity, a_lo_extendedprice, LO_LEN);
+            h.parallel_for<select_kernel>(nd_range<1>(global,local),[&](nd_item<1> it){
+
+                int items[ITEMS_PER_THREAD];
+                int flags[ITEMS_PER_THREAD];
+                int items2[ITEMS_PER_THREAD];
+                
+                int tid = it.get_local_linear_id();
+                int num_entries = LO_LEN;
+                unsigned long long sum = 0;
+                
+                int tile_offset =  it.get_group_linear_id()* TILE_SIZE;
+                int num_tiles = (num_entries + TILE_SIZE - 1) / TILE_SIZE;
+                int num_tile_items = TILE_SIZE;
+
+                if (it.get_group_linear_id() == num_tiles - 1) {
+                    num_tile_items = num_entries - tile_offset;
+                }
+                BlockLoad<decltype(a_lo_orderdate),BLOCK_THREADS,ITEMS_PER_THREAD>(a_lo_orderdate,tid,tile_offset,items,num_tile_items);
+                BlockPredGTE<int,BLOCK_THREADS,ITEMS_PER_THREAD>(tid,items,flags,19940101,num_tile_items);
+                BlockPredALTE<int,BLOCK_THREADS,ITEMS_PER_THREAD>(tid,items,flags,19940131,num_tile_items);
+
+                BlockLoad<decltype(a_lo_quantity),BLOCK_THREADS,ITEMS_PER_THREAD>(a_lo_quantity,tid,tile_offset,items,num_tile_items);
+                BlockPredAGTE<int,BLOCK_THREADS,ITEMS_PER_THREAD>(tid,items,flags,26,num_tile_items);
+                BlockPredALTE<int,BLOCK_THREADS,ITEMS_PER_THREAD>(tid,items,flags,35,num_tile_items);
+
+                BlockLoad<decltype(a_lo_discount),BLOCK_THREADS,ITEMS_PER_THREAD>(a_lo_discount,tid,tile_offset,items,num_tile_items);
+                BlockPredAGTE<int,BLOCK_THREADS,ITEMS_PER_THREAD>(tid,items,flags,4,num_tile_items);
+                BlockPredALTE<int,BLOCK_THREADS,ITEMS_PER_THREAD>(tid,items,flags,6,num_tile_items);
+
+                BlockLoad<decltype(a_lo_extendedprice),BLOCK_THREADS,ITEMS_PER_THREAD>(a_lo_extendedprice,tid,tile_offset,items2,num_tile_items);
+
+                #pragma unroll
+                for (int i = 0; i < ITEMS_PER_THREAD; ++i) {
+                    if(tid + BLOCK_THREADS * i < num_tile_items){
+                        if(flags[i]){
+                            sum += items2[i] * items[i] ;
+                        }
+                    }
+                }
+                it.barrier(sycl::access::fence_space::local_space);
+
+
+                it.barrier(sycl::access::fence_space::local_space);
+
+
+
+                //unsigned long long local_sum = select(it, a_lo_orderdate, a_lo_discount, a_lo_quantity, a_lo_extendedprice, LO_LEN);
             });
         });
         q.wait();

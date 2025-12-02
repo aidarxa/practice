@@ -143,109 +143,109 @@ inline void BlockPredOr(size_t tid, T (&items)[ITEMS_PER_THREAD],int (&flags)[IT
             tid,items,flags,pred,num_items);
     }
 }
-template <typename T,typename Predicate, int BLOCK_THREADS, int ITEMS_PER_THREAD>
+template <typename T, int BLOCK_THREADS, int ITEMS_PER_THREAD>
 inline void BlockPredLT(size_t tid, T (&items)[ITEMS_PER_THREAD],int (&flags)[ITEMS_PER_THREAD], T compare, int num_items) {
     LessThan<T> pred(compare);
     BlockPred<T,LessThan<T>,BLOCK_THREADS,ITEMS_PER_THREAD>(
         tid,items,flags,pred,num_items);
 }
-template <typename T,typename Predicate, int BLOCK_THREADS, int ITEMS_PER_THREAD>
+template <typename T, int BLOCK_THREADS, int ITEMS_PER_THREAD>
 inline void BlockPredALT(size_t tid, T (&items)[ITEMS_PER_THREAD],int (&flags)[ITEMS_PER_THREAD], T compare, int num_items) {
     LessThan<T> pred(compare);
     BlockPredAnd<T,LessThan<T>,BLOCK_THREADS,ITEMS_PER_THREAD>(
         tid,items,flags,pred,num_items);
 }
-template <typename T,typename Predicate, int BLOCK_THREADS, int ITEMS_PER_THREAD>
+template <typename T, int BLOCK_THREADS, int ITEMS_PER_THREAD>
 inline void BlockPredOLT(size_t tid, T (&items)[ITEMS_PER_THREAD],int (&flags)[ITEMS_PER_THREAD], T compare, int num_items) {
     LessThan<T> pred(compare);
     BlockPredOr<T,LessThan<T>,BLOCK_THREADS,ITEMS_PER_THREAD>(
         tid,items,flags,pred,num_items);
 }
-template <typename T,typename Predicate, int BLOCK_THREADS, int ITEMS_PER_THREAD>
+template <typename T, int BLOCK_THREADS, int ITEMS_PER_THREAD>
 inline void BlockPredGT(size_t tid, T (&items)[ITEMS_PER_THREAD],int (&flags)[ITEMS_PER_THREAD], T compare, int num_items) {
     GreaterThan<T> pred(compare);
     BlockPred<T,GreaterThan<T>,BLOCK_THREADS,ITEMS_PER_THREAD>(
         tid,items,flags,pred,num_items);
 }
-template <typename T,typename Predicate, int BLOCK_THREADS, int ITEMS_PER_THREAD>
+template <typename T, int BLOCK_THREADS, int ITEMS_PER_THREAD>
 inline void BlockPredAGT(size_t tid, T (&items)[ITEMS_PER_THREAD],int (&flags)[ITEMS_PER_THREAD], T compare, int num_items) {
     GreaterThan<T> pred(compare);
     BlockPredAnd<T,GreaterThan<T>,BLOCK_THREADS,ITEMS_PER_THREAD>(
         tid,items,flags,pred,num_items);
 }
-template <typename T,typename Predicate, int BLOCK_THREADS, int ITEMS_PER_THREAD>
+template <typename T, int BLOCK_THREADS, int ITEMS_PER_THREAD>
 inline void BlockPredOGT(size_t tid, T (&items)[ITEMS_PER_THREAD],int (&flags)[ITEMS_PER_THREAD], T compare, int num_items) {
     GreaterThan<T> pred(compare);
     BlockPredOr<T,GreaterThan<T>,BLOCK_THREADS,ITEMS_PER_THREAD>(
         tid,items,flags,pred,num_items);
 }
-template <typename T,typename Predicate, int BLOCK_THREADS, int ITEMS_PER_THREAD>
+template <typename T, int BLOCK_THREADS, int ITEMS_PER_THREAD>
 inline void BlockPredLTE(size_t tid, T (&items)[ITEMS_PER_THREAD],int (&flags)[ITEMS_PER_THREAD], T compare, int num_items) {
     LessThanEq<T> pred(compare);
     BlockPred<T,LessThanEq<T>,BLOCK_THREADS,ITEMS_PER_THREAD>(
         tid,items,flags,pred,num_items);
 }
-template <typename T,typename Predicate, int BLOCK_THREADS, int ITEMS_PER_THREAD>
+template <typename T, int BLOCK_THREADS, int ITEMS_PER_THREAD>
 inline void BlockPredALTE(size_t tid, T (&items)[ITEMS_PER_THREAD],int (&flags)[ITEMS_PER_THREAD], T compare, int num_items) {
     LessThanEq<T> pred(compare);
     BlockPredAnd<T,LessThanEq<T>,BLOCK_THREADS,ITEMS_PER_THREAD>(
         tid,items,flags,pred,num_items);
 }
-template <typename T,typename Predicate, int BLOCK_THREADS, int ITEMS_PER_THREAD>
+template <typename T, int BLOCK_THREADS, int ITEMS_PER_THREAD>
 inline void BlockPredOLTE(size_t tid, T (&items)[ITEMS_PER_THREAD],int (&flags)[ITEMS_PER_THREAD], T compare, int num_items) {
     LessThanEq<T> pred(compare);
     BlockPredOr<T,LessThanEq<T>,BLOCK_THREADS,ITEMS_PER_THREAD>(
         tid,items,flags,pred,num_items);
 }
-template <typename T,typename Predicate, int BLOCK_THREADS, int ITEMS_PER_THREAD>
+template <typename T, int BLOCK_THREADS, int ITEMS_PER_THREAD>
 inline void BlockPredGTE(size_t tid, T (&items)[ITEMS_PER_THREAD],int (&flags)[ITEMS_PER_THREAD], T compare, int num_items) {
     GreaterThanEq<T> pred(compare);
     BlockPred<T,GreaterThanEq<T>,BLOCK_THREADS,ITEMS_PER_THREAD>(
         tid,items,flags,pred,num_items);
 }
-template <typename T,typename Predicate, int BLOCK_THREADS, int ITEMS_PER_THREAD>
+template <typename T, int BLOCK_THREADS, int ITEMS_PER_THREAD>
 inline void BlockPredAGTE(size_t tid, T (&items)[ITEMS_PER_THREAD],int (&flags)[ITEMS_PER_THREAD], T compare, int num_items) {
     GreaterThanEq<T> pred(compare);
     BlockPredAnd<T,GreaterThanEq<T>,BLOCK_THREADS,ITEMS_PER_THREAD>(
         tid,items,flags,pred,num_items);
 }
-template <typename T,typename Predicate, int BLOCK_THREADS, int ITEMS_PER_THREAD>
+template <typename T, int BLOCK_THREADS, int ITEMS_PER_THREAD>
 inline void BlockPredOGTE(size_t tid, T (&items)[ITEMS_PER_THREAD],int (&flags)[ITEMS_PER_THREAD], T compare, int num_items) {
     GreaterThanEq<T> pred(compare);
     BlockPredOr<T,GreaterThanEq<T>,BLOCK_THREADS,ITEMS_PER_THREAD>(
         tid,items,flags,pred,num_items);
 }
-template <typename T,typename Predicate, int BLOCK_THREADS, int ITEMS_PER_THREAD>
+template <typename T, int BLOCK_THREADS, int ITEMS_PER_THREAD>
 inline void BlockPredEq(size_t tid, T (&items)[ITEMS_PER_THREAD],int (&flags)[ITEMS_PER_THREAD], T compare, int num_items) {
     Equal<T> pred(compare);
     BlockPred<T,Equal<T>,BLOCK_THREADS,ITEMS_PER_THREAD>(
         tid,items,flags,pred,num_items);
 }
-template <typename T,typename Predicate, int BLOCK_THREADS, int ITEMS_PER_THREAD>
+template <typename T, int BLOCK_THREADS, int ITEMS_PER_THREAD>
 inline void BlockPredAEq(size_t tid, T (&items)[ITEMS_PER_THREAD],int (&flags)[ITEMS_PER_THREAD], T compare, int num_items) {
     Equal<T> pred(compare);
     BlockPredAnd<T,Equal<T>,BLOCK_THREADS,ITEMS_PER_THREAD>(
         tid,items,flags,pred,num_items);
 }
-template <typename T,typename Predicate, int BLOCK_THREADS, int ITEMS_PER_THREAD>
+template <typename T, int BLOCK_THREADS, int ITEMS_PER_THREAD>
 inline void BlockPredOrEq(size_t tid, T (&items)[ITEMS_PER_THREAD],int (&flags)[ITEMS_PER_THREAD], T compare, int num_items) {
     Equal<T> pred(compare);
     BlockPredOr<T,Equal<T>,BLOCK_THREADS,ITEMS_PER_THREAD>(
         tid,items,flags,pred,num_items);
 }
-template <typename T,typename Predicate, int BLOCK_THREADS, int ITEMS_PER_THREAD>
+template <typename T, int BLOCK_THREADS, int ITEMS_PER_THREAD>
 inline void BlockPredNEq(size_t tid, T (&items)[ITEMS_PER_THREAD],int (&flags)[ITEMS_PER_THREAD], T compare, int num_items) {
     NotEqual<T> pred(compare);
     BlockPred<T,NotEqual<T>,BLOCK_THREADS,ITEMS_PER_THREAD>(
         tid,items,flags,pred,num_items);
 }
-template <typename T,typename Predicate, int BLOCK_THREADS, int ITEMS_PER_THREAD>
+template <typename T, int BLOCK_THREADS, int ITEMS_PER_THREAD>
 inline void BlockPredANEq(size_t tid, T (&items)[ITEMS_PER_THREAD],int (&flags)[ITEMS_PER_THREAD], T compare, int num_items) {
     NotEqual<T> pred(compare);
     BlockPredAnd<T,NotEqual<T>,BLOCK_THREADS,ITEMS_PER_THREAD>(
         tid,items,flags,pred,num_items);
 }
-template <typename T,typename Predicate, int BLOCK_THREADS, int ITEMS_PER_THREAD>
+template <typename T, int BLOCK_THREADS, int ITEMS_PER_THREAD>
 inline void BlockPredOrNEq(size_t tid, T (&items)[ITEMS_PER_THREAD],int (&flags)[ITEMS_PER_THREAD], T compare, int num_items) {
     NotEqual<T> pred(compare);
     BlockPredOr<T,NotEqual<T>,BLOCK_THREADS,ITEMS_PER_THREAD>(
