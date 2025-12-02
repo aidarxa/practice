@@ -1,0 +1,7 @@
+#pragma once
+
+#define MITEMS_PER_THREAD 4
+#define MBLOCK_THREADS 256
+
+constexpr int ITEMS_PER_THREAD = MITEMS_PER_THREAD;
+constexpr int BLOCK_THREADS = MBLOCK_THREADS;
