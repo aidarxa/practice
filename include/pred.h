@@ -7,7 +7,7 @@ struct GreaterThan{
     T _compare;
     GreaterThan(T compare):_compare(compare){};
     bool operator()(const T& value) const noexcept {
-        retuen value >_compare;
+        return value >_compare;
     };
 };
 template <typename T>
@@ -23,7 +23,7 @@ struct GreaterThanEq{
     T _compare;
     GreaterThanEq(T compare):_compare(compare){};
     bool operator()(const T& value) const noexcept {
-        retuen value >=_compare;
+        return value >=_compare;
     };
 };
 template <typename T>
@@ -45,7 +45,7 @@ struct Equal{
 template <typename T>
 struct NotEqual{
     T _compare;
-    Equal(T compare):_compare(compare){};
+    NotEqual(T compare):_compare(compare){};
     bool operator()(const T& value) const noexcept {
         return value == _compare;
     };

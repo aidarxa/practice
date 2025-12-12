@@ -1,11 +1,20 @@
 #include <string>
+#include <vector>
+#define BASE_PATH "/home/aidar/practice/data/"  //edit base path to data
 #define SF 10
 #if SF == 10
-#define DATA_DIR BASE_PATH "/home/aidar/practice/data/10/"  //Позже изменить
+#define DATA_DIR BASE_PATH "10/"
 #define LO_LEN 59986214
 #define P_LEN 800000
 #define S_LEN 20000
 #define C_LEN 300000
+#define D_LEN 2556
+#else // 20
+#define DATA_DIR BASE_PATH "20/"
+#define LO_LEN 119994746
+#define P_LEN 1000000
+#define S_LEN 40000
+#define C_LEN 600000
 #define D_LEN 2556
 #endif
 
@@ -45,14 +54,15 @@ std::string lookup(std::string col_name) {
 }
 
 template<typename T>
-T* loadColumn(string col_name, int num_entries) {
-  T* h_col = new T[num_entries];
-  string filename = DATA_DIR + lookup(col_name);
-  ifstream colData (filename.c_str(), ios::in | ios::binary);
+std::vector<T> loadColumn(std::string col_name, int num_entries) {
+  std::vector<T> ret(num_entries);
+
+  std::string filename = DATA_DIR + lookup(col_name);
+  std::ifstream colData (filename.c_str(), std::ios::in | std::ios::binary);
   if (!colData) {
-    return NULL;
+    throw std::runtime_error("Cannot open file: " + filename);
   }
 
-  colData.read((char*)h_col, num_entries * sizeof(T));
-  return h_col;
+  colData.read((char*)ret.data(), num_entries * sizeof(T));
+  return ret;
 }
