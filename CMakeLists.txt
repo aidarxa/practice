@@ -28,9 +28,9 @@ endif()
 
 include_directories(${ACPP_BINARY_ROOT} ${ACPP_SOURCE_ROOT})
 
-file(GLOB SRC_CPP_FILES CONFIGURE_DEPENDS "${CMAKE_SOURCE_DIR}/src/*.cpp")
+file(GLOB TEST_CPP_FILES CONFIGURE_DEPENDS "${CMAKE_SOURCE_DIR}/test/*.cpp")
 
-foreach(cpp_file IN LISTS SRC_CPP_FILES)
+foreach(cpp_file IN LISTS TEST_CPP_FILES)
   get_filename_component(target_name "${cpp_file}" NAME_WE)
 
   add_executable(${target_name} "${cpp_file}")
