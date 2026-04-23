@@ -18,7 +18,7 @@ int main() {
     int num_trials = 4;
     std::chrono::duration<double> mean{};
 
-    queue q(gpu_selector_v);
+    queue q(gpu_selector_v, property::queue::in_order());
 
     // Host memory allocations
     int* h_lo_orderdate = malloc_host<int>(LO_LEN, q);

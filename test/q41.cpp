@@ -1,10 +1,12 @@
 #include <sycl/sycl.hpp>
-#include "../include/load.h"
-#include "../include/pred.h"
-#include "../include/join.h"
-#include "../include/utils.h"
+#include "crystal/load.h"
+#include "crystal/pred.h"
+#include "crystal/join.h"
+#include "crystal/utils.h"
 
+#include <iostream>
 #include <chrono>
+#include <vector>
 using namespace sycl;
 
 constexpr int BLOCK_THREADS = 128;
@@ -18,81 +20,136 @@ class build_hashtable_p;
 class build_hashtable_d;
 
 int main() {
+    queue q(gpu_selector_v, property::queue::in_order());
     int num_trials = 4;
     std::chrono::duration<double> mean;
 
-    std::vector<int> h_lo_orderdate = loadColumn<int>("lo_orderdate", LO_LEN);
-    std::vector<int> h_lo_suppkey = loadColumn<int>("lo_suppkey", LO_LEN);
-    std::vector<int> h_lo_custkey = loadColumn<int>("lo_custkey", LO_LEN);
-    std::vector<int> h_lo_partkey = loadColumn<int>("lo_partkey", LO_LEN);
-    std::vector<int> h_lo_revenue = loadColumn<int>("lo_revenue", LO_LEN);
-    std::vector<int> h_lo_supplycost = loadColumn<int>("lo_supplycost", LO_LEN);
+    auto v_lo_orderdate = loadColumn<int>("lo_orderdate", LO_LEN);
+    int* h_lo_orderdate = malloc_host<int>(LO_LEN, q);
+    std::copy(v_lo_orderdate.begin(), v_lo_orderdate.end(), h_lo_orderdate);
+    int* d_lo_orderdate = malloc_device<int>(LO_LEN, q);
+    q.memcpy(d_lo_orderdate, h_lo_orderdate, LO_LEN * sizeof(int));
+    auto v_lo_suppkey = loadColumn<int>("lo_suppkey", LO_LEN);
+    int* h_lo_suppkey = malloc_host<int>(LO_LEN, q);
+    std::copy(v_lo_suppkey.begin(), v_lo_suppkey.end(), h_lo_suppkey);
+    int* d_lo_suppkey = malloc_device<int>(LO_LEN, q);
+    q.memcpy(d_lo_suppkey, h_lo_suppkey, LO_LEN * sizeof(int));
+    auto v_lo_custkey = loadColumn<int>("lo_custkey", LO_LEN);
+    int* h_lo_custkey = malloc_host<int>(LO_LEN, q);
+    std::copy(v_lo_custkey.begin(), v_lo_custkey.end(), h_lo_custkey);
+    int* d_lo_custkey = malloc_device<int>(LO_LEN, q);
+    q.memcpy(d_lo_custkey, h_lo_custkey, LO_LEN * sizeof(int));
+    auto v_lo_partkey = loadColumn<int>("lo_partkey", LO_LEN);
+    int* h_lo_partkey = malloc_host<int>(LO_LEN, q);
+    std::copy(v_lo_partkey.begin(), v_lo_partkey.end(), h_lo_partkey);
+    int* d_lo_partkey = malloc_device<int>(LO_LEN, q);
+    q.memcpy(d_lo_partkey, h_lo_partkey, LO_LEN * sizeof(int));
+    auto v_lo_revenue = loadColumn<int>("lo_revenue", LO_LEN);
+    int* h_lo_revenue = malloc_host<int>(LO_LEN, q);
+    std::copy(v_lo_revenue.begin(), v_lo_revenue.end(), h_lo_revenue);
+    int* d_lo_revenue = malloc_device<int>(LO_LEN, q);
+    q.memcpy(d_lo_revenue, h_lo_revenue, LO_LEN * sizeof(int));
+    auto v_lo_supplycost = loadColumn<int>("lo_supplycost", LO_LEN);
+    int* h_lo_supplycost = malloc_host<int>(LO_LEN, q);
+    std::copy(v_lo_supplycost.begin(), v_lo_supplycost.end(), h_lo_supplycost);
+    int* d_lo_supplycost = malloc_device<int>(LO_LEN, q);
+    q.memcpy(d_lo_supplycost, h_lo_supplycost, LO_LEN * sizeof(int));
 
-    std::vector<int> h_d_datekey = loadColumn<int>("d_datekey", D_LEN);
-    std::vector<int> h_d_year = loadColumn<int>("d_year", D_LEN);
-    std::vector<int> h_d_yearmonthnum = loadColumn<int>("d_yearmonthnum", D_LEN);
+    auto v_d_datekey = loadColumn<int>("d_datekey", D_LEN);
+    int* h_d_datekey = malloc_host<int>(D_LEN, q);
+    std::copy(v_d_datekey.begin(), v_d_datekey.end(), h_d_datekey);
+    int* d_d_datekey = malloc_device<int>(D_LEN, q);
+    q.memcpy(d_d_datekey, h_d_datekey, D_LEN * sizeof(int));
+    auto v_d_year = loadColumn<int>("d_year", D_LEN);
+    int* h_d_year = malloc_host<int>(D_LEN, q);
+    std::copy(v_d_year.begin(), v_d_year.end(), h_d_year);
+    int* d_d_year = malloc_device<int>(D_LEN, q);
+    q.memcpy(d_d_year, h_d_year, D_LEN * sizeof(int));
+    auto v_d_yearmonthnum = loadColumn<int>("d_yearmonthnum", D_LEN);
+    int* h_d_yearmonthnum = malloc_host<int>(D_LEN, q);
+    std::copy(v_d_yearmonthnum.begin(), v_d_yearmonthnum.end(), h_d_yearmonthnum);
+    int* d_d_yearmonthnum = malloc_device<int>(D_LEN, q);
+    q.memcpy(d_d_yearmonthnum, h_d_yearmonthnum, D_LEN * sizeof(int));
 
-    std::vector<int> h_s_suppkey = loadColumn<int>("s_suppkey", S_LEN);
-    std::vector<int> h_s_region = loadColumn<int>("s_region", S_LEN);
+    auto v_s_suppkey = loadColumn<int>("s_suppkey", S_LEN);
+    int* h_s_suppkey = malloc_host<int>(S_LEN, q);
+    std::copy(v_s_suppkey.begin(), v_s_suppkey.end(), h_s_suppkey);
+    int* d_s_suppkey = malloc_device<int>(S_LEN, q);
+    q.memcpy(d_s_suppkey, h_s_suppkey, S_LEN * sizeof(int));
+    auto v_s_region = loadColumn<int>("s_region", S_LEN);
+    int* h_s_region = malloc_host<int>(S_LEN, q);
+    std::copy(v_s_region.begin(), v_s_region.end(), h_s_region);
+    int* d_s_region = malloc_device<int>(S_LEN, q);
+    q.memcpy(d_s_region, h_s_region, S_LEN * sizeof(int));
 
-    std::vector<int> h_p_partkey = loadColumn<int>("p_partkey", P_LEN);
-    std::vector<int> h_p_mfgr = loadColumn<int>("p_mfgr", P_LEN);
+    auto v_p_partkey = loadColumn<int>("p_partkey", P_LEN);
+    int* h_p_partkey = malloc_host<int>(P_LEN, q);
+    std::copy(v_p_partkey.begin(), v_p_partkey.end(), h_p_partkey);
+    int* d_p_partkey = malloc_device<int>(P_LEN, q);
+    q.memcpy(d_p_partkey, h_p_partkey, P_LEN * sizeof(int));
+    auto v_p_mfgr = loadColumn<int>("p_mfgr", P_LEN);
+    int* h_p_mfgr = malloc_host<int>(P_LEN, q);
+    std::copy(v_p_mfgr.begin(), v_p_mfgr.end(), h_p_mfgr);
+    int* d_p_mfgr = malloc_device<int>(P_LEN, q);
+    q.memcpy(d_p_mfgr, h_p_mfgr, P_LEN * sizeof(int));
 
-    std::vector<int> h_c_custkey = loadColumn<int>("c_custkey", C_LEN);
-    std::vector<int> h_c_region = loadColumn<int>("c_region", C_LEN);
-    std::vector<int> h_c_nation = loadColumn<int>("c_nation", C_LEN);
+    auto v_c_custkey = loadColumn<int>("c_custkey", C_LEN);
+    int* h_c_custkey = malloc_host<int>(C_LEN, q);
+    std::copy(v_c_custkey.begin(), v_c_custkey.end(), h_c_custkey);
+    int* d_c_custkey = malloc_device<int>(C_LEN, q);
+    q.memcpy(d_c_custkey, h_c_custkey, C_LEN * sizeof(int));
+    auto v_c_region = loadColumn<int>("c_region", C_LEN);
+    int* h_c_region = malloc_host<int>(C_LEN, q);
+    std::copy(v_c_region.begin(), v_c_region.end(), h_c_region);
+    int* d_c_region = malloc_device<int>(C_LEN, q);
+    q.memcpy(d_c_region, h_c_region, C_LEN * sizeof(int));
+    auto v_c_nation = loadColumn<int>("c_nation", C_LEN);
+    int* h_c_nation = malloc_host<int>(C_LEN, q);
+    std::copy(v_c_nation.begin(), v_c_nation.end(), h_c_nation);
+    int* d_c_nation = malloc_device<int>(C_LEN, q);
+    q.memcpy(d_c_nation, h_c_nation, C_LEN * sizeof(int));
 
-    std::cout << "** LOADED DATA **" << "\n";
+    std::cout << "** LOADING DATA **" << "\n";
 
-    buffer<int> b_lo_orderdate (h_lo_orderdate.data(),range<1>(LO_LEN));
-    buffer<int> b_lo_suppkey (h_lo_suppkey.data(),range<1>(LO_LEN));
-    buffer<int> b_lo_custkey (h_lo_custkey.data(),range<1>(LO_LEN));
-    buffer<int> b_lo_partkey (h_lo_partkey.data(),range<1>(LO_LEN));
-    buffer<int> b_lo_revenue (h_lo_revenue.data(),range<1>(LO_LEN));
-    buffer<int> b_lo_supplycost (h_lo_supplycost.data(),range<1>(LO_LEN));
-
-    buffer<int> b_d_datekey (h_d_datekey.data(),range<1>(D_LEN));
-    buffer<int> b_d_year (h_d_year.data(),range<1>(D_LEN));
-    buffer<int> b_d_yearmonthnum (h_d_yearmonthnum.data(),range<1>(D_LEN));
-
-    buffer<int> b_s_suppkey (h_s_suppkey.data(),range<1>(S_LEN));
-    buffer<int> b_s_region (h_s_region.data(),range<1>(S_LEN));
-
-    buffer<int> b_p_partkey (h_p_partkey.data(),range<1>(P_LEN));
-    buffer<int> b_p_mfgr (h_p_mfgr.data(),range<1>(P_LEN));
-
-    buffer<int> b_c_custkey (h_c_custkey.data(),range<1>(C_LEN));
-    buffer<int> b_c_region (h_c_region.data(),range<1>(C_LEN));
-    buffer<int> b_c_nation (h_c_nation.data(),range<1>(C_LEN));
-
+                        
+            
+        
+        
+            
     int res_size = ((1998-1992+1) * 25);
     int res_array_size = res_size * 4;
-    buffer<unsigned long long, 1> b_result{range<1>(res_array_size)};
+    unsigned long long* h_result = malloc_host<unsigned long long>(res_array_size, q);
+    unsigned long long* d_result = malloc_device<unsigned long long>(res_array_size, q);
 
     int d_val_len = 19981230 - 19920101 + 1;
-    buffer<int> b_s_hash_table(range<1>(2*S_LEN));
-    buffer<int> b_c_hash_table(range<1>(2*C_LEN));
-    buffer<int> b_p_hash_table(range<1>(2*P_LEN));
-    buffer<int> b_d_hash_table(range<1>(2*d_val_len));
+    int* h_s_hash_table = malloc_host<int>(2*S_LEN, q);
+    int* d_s_hash_table = malloc_device<int>(2*S_LEN, q);
+    int s_hash_table_sz = 2*S_LEN;
+    int* h_c_hash_table = malloc_host<int>(2*C_LEN, q);
+    int* d_c_hash_table = malloc_device<int>(2*C_LEN, q);
+    int c_hash_table_sz = 2*C_LEN;
+    int* h_p_hash_table = malloc_host<int>(2*P_LEN, q);
+    int* d_p_hash_table = malloc_device<int>(2*P_LEN, q);
+    int p_hash_table_sz = 2*P_LEN;
+    int* h_d_hash_table = malloc_host<int>(2*d_val_len, q);
+    int* d_d_hash_table = malloc_device<int>(2*d_val_len, q);
+    int d_hash_table_sz = 2*d_val_len;
 
-    auto q = queue(gpu_selector_v);
+    q.wait();
+    std::cout << "** LOADING DATA **" << "\n";
 
     for (int t = 0; t < num_trials; t++) {
         {
-            auto host_res = b_result.get_host_access(write_only);
-            std::fill(host_res.begin(), host_res.end(), 0);
+            std::fill_n(h_result, res_array_size, 0);
+            q.memcpy(d_result, h_result, res_array_size * sizeof(unsigned long long)).wait();
 
-            auto s_ht = b_s_hash_table.get_host_access(write_only);
-            std::fill(s_ht.begin(), s_ht.end(), 0);
+            q.memset(d_s_hash_table, 0, s_hash_table_sz * sizeof(int));
 
-            auto c_ht = b_c_hash_table.get_host_access(write_only);
-            std::fill(c_ht.begin(), c_ht.end(), 0);
+            q.memset(d_c_hash_table, 0, c_hash_table_sz * sizeof(int));
 
-            auto p_ht = b_p_hash_table.get_host_access(write_only);
-            std::fill(p_ht.begin(), p_ht.end(), 0);
+            q.memset(d_p_hash_table, 0, p_hash_table_sz * sizeof(int));
 
-            auto d_ht = b_d_hash_table.get_host_access(write_only);
-            std::fill(d_ht.begin(), d_ht.end(), 0);
+            q.memset(d_d_hash_table, 0, d_hash_table_sz * sizeof(int));
         }
         using namespace std::chrono;
         high_resolution_clock::time_point start, finish;
@@ -100,10 +157,7 @@ int main() {
 
         // 1 build_hashtable_s
         q.submit([&](sycl::handler& h) {
-            auto a_s_region = b_s_region.get_access<access_mode::read>(h);
-            auto a_s_suppkey = b_s_suppkey.get_access<access_mode::read>(h);
-            auto a_s_hash_table= b_s_hash_table.get_access<access_mode::read_write>(h);
-
+                                    
             int num_tiles = (S_LEN + TILE_SIZE - 1)/TILE_SIZE;
             size_t local = BLOCK_THREADS;
             size_t global = num_tiles*BLOCK_THREADS;
@@ -119,21 +173,17 @@ int main() {
                 if (it.get_group_linear_id() == num_tiles - 1) {
                     num_tile_items = S_LEN - tile_offset;
                 }
-                BlockLoad<decltype(a_s_region),BLOCK_THREADS,ITEMS_PER_THREAD>(a_s_region,tid,tile_offset,items,num_tile_items);
+                BlockLoad<int,BLOCK_THREADS,ITEMS_PER_THREAD>(d_s_region + tile_offset,tid,tile_offset,items,num_tile_items);
                 BlockPredEq<int,BLOCK_THREADS,ITEMS_PER_THREAD>(tid,items,flags,1,num_tile_items);
 
-                BlockLoad<decltype(a_s_suppkey),BLOCK_THREADS,ITEMS_PER_THREAD>(a_s_suppkey,tid,tile_offset,items,num_tile_items);
-                BlockBuildSelectivePHT_1<decltype(a_s_hash_table),BLOCK_THREADS,ITEMS_PER_THREAD>(tid,items,flags,a_s_hash_table,S_LEN,num_tile_items);
+                BlockLoad<int,BLOCK_THREADS,ITEMS_PER_THREAD>(d_s_suppkey + tile_offset,tid,tile_offset,items,num_tile_items);
+                BlockBuildSelectivePHT_1<int,BLOCK_THREADS,ITEMS_PER_THREAD>(tid,items,flags,d_s_hash_table,S_LEN,num_tile_items);
             });
         });
 
         // 2 build_hashtable_c
         q.submit([&](sycl::handler& h){
-            auto a_c_region = b_c_region.get_access<access_mode::read>(h);
-            auto a_c_custkey = b_c_custkey.get_access<access_mode::read>(h);
-            auto a_c_nation = b_c_nation.get_access<access_mode::read>(h);
-            auto a_c_hash_table = b_c_hash_table.get_access<access_mode::read_write>(h);
-
+                                                
             int num_tiles = (C_LEN + TILE_SIZE - 1)/TILE_SIZE;
             size_t local = BLOCK_THREADS;
             size_t global = num_tiles*BLOCK_THREADS;
@@ -150,21 +200,18 @@ int main() {
                 if (it.get_group_linear_id() == num_tiles - 1) {
                     num_tile_items = C_LEN - tile_offset;
                 }
-                BlockLoad<decltype(a_c_region),BLOCK_THREADS,ITEMS_PER_THREAD>(a_c_region,tid,tile_offset,items,num_tile_items);
+                BlockLoad<int,BLOCK_THREADS,ITEMS_PER_THREAD>(d_c_region + tile_offset,tid,tile_offset,items,num_tile_items);
                 BlockPredEq<int,BLOCK_THREADS,ITEMS_PER_THREAD>(tid,items,flags,1,num_tile_items);
 
-                BlockLoad<decltype(a_c_custkey),BLOCK_THREADS,ITEMS_PER_THREAD>(a_c_custkey,tid,tile_offset,items,num_tile_items);
-                BlockLoad<decltype(a_c_nation),BLOCK_THREADS,ITEMS_PER_THREAD>(a_c_nation,tid,tile_offset,items2,num_tile_items);
-                BlockBuildSelectivePHT_2<decltype(a_c_hash_table),BLOCK_THREADS,ITEMS_PER_THREAD>(tid,items,items2,flags,a_c_hash_table,C_LEN,num_tile_items);
+                BlockLoad<int,BLOCK_THREADS,ITEMS_PER_THREAD>(d_c_custkey + tile_offset,tid,tile_offset,items,num_tile_items);
+                BlockLoad<int,BLOCK_THREADS,ITEMS_PER_THREAD>(d_c_nation + tile_offset,tid,tile_offset,items2,num_tile_items);
+                BlockBuildSelectivePHT_2<int,int,BLOCK_THREADS,ITEMS_PER_THREAD>(tid,items,items2,flags,d_c_hash_table,C_LEN,num_tile_items);
             });
         });
         
         // 3 build_hashtable_p
         q.submit([&](sycl::handler& h){
-            auto a_p_mfgr = b_p_mfgr.get_access<access_mode::read>(h);
-            auto a_p_partkey = b_p_partkey.get_access<access_mode::read>(h);
-            auto a_p_hash_table = b_p_hash_table.get_access<access_mode::read_write>(h);
-
+                                    
             int num_tiles = (P_LEN + TILE_SIZE - 1)/TILE_SIZE;
             size_t local = BLOCK_THREADS;
             size_t global = num_tiles*BLOCK_THREADS;
@@ -180,21 +227,18 @@ int main() {
                 if (it.get_group_linear_id() == num_tiles - 1) {
                     num_tile_items = P_LEN - tile_offset;
                 }
-                BlockLoad<decltype(a_p_mfgr),BLOCK_THREADS,ITEMS_PER_THREAD>(a_p_mfgr,tid,tile_offset,items,num_tile_items);
+                BlockLoad<int,BLOCK_THREADS,ITEMS_PER_THREAD>(d_p_mfgr + tile_offset,tid,tile_offset,items,num_tile_items);
                 BlockPredEq<int,BLOCK_THREADS,ITEMS_PER_THREAD>(tid,items,flags,0,num_tile_items);
                 BlockPredOrEq<int,BLOCK_THREADS,ITEMS_PER_THREAD>(tid,items,flags,1,num_tile_items);
                 
-                BlockLoad<decltype(a_p_partkey),BLOCK_THREADS,ITEMS_PER_THREAD>(a_p_partkey,tid,tile_offset,items,num_tile_items);
-                BlockBuildSelectivePHT_1<decltype(a_p_hash_table),BLOCK_THREADS,ITEMS_PER_THREAD>(tid,items,flags,a_p_hash_table,P_LEN,num_tile_items);
+                BlockLoad<int,BLOCK_THREADS,ITEMS_PER_THREAD>(d_p_partkey + tile_offset,tid,tile_offset,items,num_tile_items);
+                BlockBuildSelectivePHT_1<int,BLOCK_THREADS,ITEMS_PER_THREAD>(tid,items,flags,d_p_hash_table,P_LEN,num_tile_items);
             });
         });
 
         // 4 build_hashtable_d
         q.submit([&](sycl::handler& h){
-            auto a_d_datekey = b_d_datekey.get_access<access_mode::read>(h);
-            auto a_d_year = b_d_year.get_access<access_mode::read>(h);
-            auto a_d_hash_table = b_d_hash_table.get_access<access_mode::read_write>(h);
-
+                                    
             int num_tiles = (D_LEN + TILE_SIZE - 1)/TILE_SIZE;
             size_t local = BLOCK_THREADS;
             size_t global = num_tiles*BLOCK_THREADS;
@@ -213,28 +257,17 @@ int main() {
                 }
 
                 InitFlags<BLOCK_THREADS,ITEMS_PER_THREAD>(flags);
-                BlockLoad<decltype(a_d_datekey),BLOCK_THREADS,ITEMS_PER_THREAD>(a_d_datekey,tid,tile_offset,items,num_tile_items);
-                BlockLoad<decltype(a_d_year),BLOCK_THREADS,ITEMS_PER_THREAD>(a_d_year,tid,tile_offset,items2,num_tile_items);
-                BlockBuildSelectivePHT_2<decltype(a_d_hash_table),BLOCK_THREADS,ITEMS_PER_THREAD>(tid,items,items2,flags,a_d_hash_table,d_val_len,19920101,num_tile_items);
+                BlockLoad<int,BLOCK_THREADS,ITEMS_PER_THREAD>(d_d_datekey + tile_offset,tid,tile_offset,items,num_tile_items);
+                BlockLoad<int,BLOCK_THREADS,ITEMS_PER_THREAD>(d_d_year + tile_offset,tid,tile_offset,items2,num_tile_items);
+                BlockBuildSelectivePHT_2<int,int,BLOCK_THREADS,ITEMS_PER_THREAD>(tid,items,items2,flags,d_d_hash_table,d_val_len,19920101,num_tile_items);
             });
         });
         
         //5 select
         q.submit([&](sycl::handler& h){
-            auto a_lo_orderdate = b_lo_orderdate.get_access<access_mode::read>(h);
-            auto a_lo_partkey = b_lo_partkey.get_access<access_mode::read>(h);
-            auto a_lo_custkey = b_lo_custkey.get_access<access_mode::read>(h);
-            auto a_lo_suppkey = b_lo_suppkey.get_access<access_mode::read>(h);
-            auto a_lo_revenue = b_lo_revenue.get_access<access_mode::read>(h);
-            auto a_lo_supplycost = b_lo_supplycost.get_access<access_mode::read>(h);
-
-            auto a_s_hash_table = b_s_hash_table.get_access<access_mode::read>(h);
-            auto a_c_hash_table = b_c_hash_table.get_access<access_mode::read>(h);
-            auto a_p_hash_table = b_p_hash_table.get_access<access_mode::read>(h);
-            auto a_d_hash_table = b_d_hash_table.get_access<access_mode::read>(h);
-
-            auto a_result = b_result.get_access<access_mode::write>(h);
-
+                                                                        
+                                                
+            
             int num_tiles = (LO_LEN + TILE_SIZE - 1)/TILE_SIZE;
             size_t local = BLOCK_THREADS;
             size_t global = num_tiles*BLOCK_THREADS;
@@ -257,33 +290,33 @@ int main() {
 
                 InitFlags<BLOCK_THREADS,ITEMS_PER_THREAD>(flags);
 
-                BlockLoad<decltype(a_lo_suppkey),BLOCK_THREADS,ITEMS_PER_THREAD>(a_lo_suppkey,tid,tile_offset,items,num_tile_items);
-                BlockProbeAndPHT_1<decltype(a_s_hash_table),BLOCK_THREADS,ITEMS_PER_THREAD>(tid,items,flags,a_s_hash_table,S_LEN,num_tile_items);
+                BlockLoad<int,BLOCK_THREADS,ITEMS_PER_THREAD>(d_lo_suppkey + tile_offset,tid,tile_offset,items,num_tile_items);
+                BlockProbeAndPHT_1<int,BLOCK_THREADS,ITEMS_PER_THREAD>(tid,items,flags,d_s_hash_table,S_LEN,num_tile_items);
 
-                BlockLoad<decltype(a_lo_custkey),BLOCK_THREADS,ITEMS_PER_THREAD>(a_lo_custkey,tid,tile_offset,items,num_tile_items);
-                BlockProbeAndPHT_2<decltype(a_c_hash_table),BLOCK_THREADS,ITEMS_PER_THREAD>(tid,items,c_nation,flags,a_c_hash_table,C_LEN,num_tile_items);
+                BlockLoad<int,BLOCK_THREADS,ITEMS_PER_THREAD>(d_lo_custkey + tile_offset,tid,tile_offset,items,num_tile_items);
+                BlockProbeAndPHT_2<int,int,BLOCK_THREADS,ITEMS_PER_THREAD>(tid,items,c_nation,flags,d_c_hash_table,C_LEN,num_tile_items);
 
-                BlockLoad<decltype(a_lo_partkey),BLOCK_THREADS,ITEMS_PER_THREAD>(a_lo_partkey,tid,tile_offset,items,num_tile_items);
-                BlockProbeAndPHT_1<decltype(a_p_hash_table),BLOCK_THREADS,ITEMS_PER_THREAD>(tid,items,flags,a_p_hash_table,P_LEN,num_tile_items);
+                BlockLoad<int,BLOCK_THREADS,ITEMS_PER_THREAD>(d_lo_partkey + tile_offset,tid,tile_offset,items,num_tile_items);
+                BlockProbeAndPHT_1<int,BLOCK_THREADS,ITEMS_PER_THREAD>(tid,items,flags,d_p_hash_table,P_LEN,num_tile_items);
 
-                BlockLoad<decltype(a_lo_orderdate),BLOCK_THREADS,ITEMS_PER_THREAD>(a_lo_orderdate,tid,tile_offset,items,num_tile_items);
-                BlockProbeAndPHT_2<decltype(a_d_hash_table),BLOCK_THREADS,ITEMS_PER_THREAD>(tid,items,year,flags,a_d_hash_table,d_val_len,19920101,num_tile_items);
+                BlockLoad<int,BLOCK_THREADS,ITEMS_PER_THREAD>(d_lo_orderdate + tile_offset,tid,tile_offset,items,num_tile_items);
+                BlockProbeAndPHT_2<int,int,BLOCK_THREADS,ITEMS_PER_THREAD>(tid,items,year,flags,d_d_hash_table,d_val_len,19920101,num_tile_items);
 
-                BlockLoad<decltype(a_lo_revenue),BLOCK_THREADS,ITEMS_PER_THREAD>(a_lo_revenue,tid,tile_offset,revenue,num_tile_items);
-                BlockLoad<decltype(a_lo_supplycost),BLOCK_THREADS,ITEMS_PER_THREAD>(a_lo_supplycost,tid,tile_offset,items,num_tile_items);
+                BlockLoad<int,BLOCK_THREADS,ITEMS_PER_THREAD>(d_lo_revenue + tile_offset,tid,tile_offset,revenue,num_tile_items);
+                BlockLoad<int,BLOCK_THREADS,ITEMS_PER_THREAD>(d_lo_supplycost + tile_offset,tid,tile_offset,items,num_tile_items);
 
                 #pragma unroll
                 for (int i = 0; i < ITEMS_PER_THREAD; ++i) {
                     if(flags[i] && (tid + BLOCK_THREADS * i < num_tile_items)){
                         int hash = (c_nation[i] * 7 + (year[i] - 1992)) % ((1998-1992+1) * 25);
-                        a_result[hash*4]= year[i];
-                        a_result[hash*4+1]= c_nation[i];
+                        d_result[hash*4]= year[i];
+                        d_result[hash*4+1]= c_nation[i];
                         sycl::atomic_ref<
                             unsigned long long,
                             sycl::memory_order::relaxed,
                             sycl::memory_scope::device,
                             sycl::access::address_space::global_space>
-                            atomic_revenue(a_result[hash*4+2]);
+                            atomic_revenue(d_result[hash*4+2]);
                         atomic_revenue.fetch_add(revenue[i]-items[i]);
                     }
                 }
@@ -294,7 +327,8 @@ int main() {
         std::chrono::duration<double> diff = finish - start;
         if(t>0) mean+=diff;
         {
-            auto host_res = b_result.get_host_access();
+            q.memcpy(h_result, d_result, res_array_size * sizeof(unsigned long long)).wait();
+            unsigned long long* host_res = h_result;
             int res_count = 0;
             for (int i=0; i<res_size; i++) {
                 if (host_res[4*i] != 0) {
@@ -308,5 +342,48 @@ int main() {
         
     }
     std::cout << "Mean time: " << mean.count()/3 * 1000 << " ms\n";
+    // Free memory
+    free(h_lo_orderdate, q);
+    free(d_lo_orderdate, q);
+    free(h_lo_suppkey, q);
+    free(d_lo_suppkey, q);
+    free(h_lo_custkey, q);
+    free(d_lo_custkey, q);
+    free(h_lo_partkey, q);
+    free(d_lo_partkey, q);
+    free(h_lo_revenue, q);
+    free(d_lo_revenue, q);
+    free(h_lo_supplycost, q);
+    free(d_lo_supplycost, q);
+    free(h_d_datekey, q);
+    free(d_d_datekey, q);
+    free(h_d_year, q);
+    free(d_d_year, q);
+    free(h_d_yearmonthnum, q);
+    free(d_d_yearmonthnum, q);
+    free(h_s_suppkey, q);
+    free(d_s_suppkey, q);
+    free(h_s_region, q);
+    free(d_s_region, q);
+    free(h_p_partkey, q);
+    free(d_p_partkey, q);
+    free(h_p_mfgr, q);
+    free(d_p_mfgr, q);
+    free(h_c_custkey, q);
+    free(d_c_custkey, q);
+    free(h_c_region, q);
+    free(d_c_region, q);
+    free(h_c_nation, q);
+    free(d_c_nation, q);
+    free(h_s_hash_table, q);
+    free(d_s_hash_table, q);
+    free(h_c_hash_table, q);
+    free(d_c_hash_table, q);
+    free(h_p_hash_table, q);
+    free(d_p_hash_table, q);
+    free(h_d_hash_table, q);
+    free(d_d_hash_table, q);
+    free(h_result, q);
+    free(d_result, q);
     return 0;
 }
