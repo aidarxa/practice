@@ -1,10 +1,7 @@
 #include <sycl/sycl.hpp>
 #include <iostream>
 #include <chrono>
-#include <vector>
-#include "crystal/utils.h"
-#include "crystal/load.h"
-#include "crystal/pred.h"
+#include "crystal/crystal.h"
 
 using namespace sycl;
 
@@ -137,4 +134,3 @@ int main() {
 
     return 0;
 }
-

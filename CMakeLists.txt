@@ -26,15 +26,21 @@ FORCE)
   endif()
 endif()
 
-include_directories(${ACPP_BINARY_ROOT} ${ACPP_SOURCE_ROOT})
+include_directories(${ACPP_BINARY_ROOT} ${ACPP_SOURCE_ROOT} ${CMAKE_SOURCE_DIR}/deps/include)
 
-file(GLOB TEST_CPP_FILES CONFIGURE_DEPENDS "${CMAKE_SOURCE_DIR}/test/*.cpp")
+add_executable(practice src/main.cpp)
 
-foreach(cpp_file IN LISTS TEST_CPP_FILES)
-  get_filename_component(target_name "${cpp_file}" NAME_WE)
+target_include_directories(practice PRIVATE 
+    "${CMAKE_SOURCE_DIR}/include" 
+    "${CMAKE_SOURCE_DIR}/deps/include"
+)
 
-  add_executable(${target_name} "${cpp_file}")
-  target_include_directories(${target_name} PRIVATE "${CMAKE_SOURCE_DIR}/include")
+target_link_directories(practice PRIVATE 
+    "${CMAKE_SOURCE_DIR}/deps/lib"
+)
 
-  add_sycl_to_target(TARGET ${target_name} SOURCES "${cpp_file}")
-endforeach()
+target_link_libraries(practice PRIVATE 
+    sqlparser
+)
+
+add_sycl_to_target(TARGET practice SOURCES src/main.cpp)

@@ -79,10 +79,6 @@ int main() {
 
     std::cout << "** LOADING DATA **" << "\n";
 
-                
-        
-        
-        
     int res_size = ((1998-1992+1) * 250 * 250);
     int res_array_size = res_size * 4;
     unsigned long long* h_result = malloc_host<unsigned long long>(res_array_size, q);
