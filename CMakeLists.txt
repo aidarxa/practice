@@ -44,3 +44,22 @@ target_link_libraries(practice PRIVATE
 )
 
 add_sycl_to_target(TARGET practice SOURCES src/main.cpp)
+
+# Test target (no SYCL needed — tests only AST→CodeGen logic)
+add_executable(test_optimizer
+    test/test_optimizer.cpp
+    src/core/optimizer.cpp
+)
+
+target_include_directories(test_optimizer PRIVATE
+    "${CMAKE_SOURCE_DIR}/include"
+    "${CMAKE_SOURCE_DIR}/deps/include"
+)
+
+target_link_directories(test_optimizer PRIVATE
+    "${CMAKE_SOURCE_DIR}/deps/lib"
+)
+
+target_link_libraries(test_optimizer PRIVATE
+    sqlparser
+)

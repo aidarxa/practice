@@ -9,6 +9,8 @@
 #include <memory>
 #include <sstream>
 #include <stdexcept>
+#include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace db {
@@ -93,6 +95,15 @@ public:
   uint8_t tuple_size_;
   void accept(ICodeGeneratorVisitor &visitor) const override;
 };
+// Скалярная агрегация для Q1x-запросов (без GROUP BY)
+// Использует reduce_over_group + atomic_ref в d_result[0]
+class OpBlockScalarAggregate : public IPhysicalOperator {
+public:
+  std::string flags_;    // "flags"
+  std::string agg_expr_; // "(unsigned long long)items2[i] * items[i]"
+  std::string res_ptr_;  // "d_result"
+  void accept(ICodeGeneratorVisitor &visitor) const override;
+};
 class ICodeGeneratorVisitor {
 public:
   virtual void visit(const OpBlockLoad &op) = 0;
@@ -100,13 +111,21 @@ public:
   virtual void visit(const OpBlockBuildHashtable &op) = 0;
   virtual void visit(const OpBlockProbeHashtable &op) = 0;
   virtual void visit(const OpBlockAggregate &op) = 0;
+  virtual void visit(const OpBlockScalarAggregate &op) = 0;
 };
-// Описание одного буфера (malloc_device / malloc_host)
+// Область видимости буфера в JIT-коде
+enum class BufferScope {
+  EXTERNAL_INPUT,  // Передается как аргумент (колонки таблиц)
+  EXTERNAL_OUTPUT, // Передается как аргумент (буфер результата)
+  INTERNAL_TEMP    // Выделяется и освобождается внутри функции (хеш-таблицы)
+};
+// Описание одного буфера устройства
 struct DeviceBuffer {
   std::string name_;   // "d_lo_orderdate"
   std::string type_;   // "int", "unsigned long long"
   std::string size_;   // "LO_LEN"
   bool needs_zeroing_; // true для хеш-таблиц и result
+  BufferScope scope_;  // область видимости в JIT-коде
 };
 class Kernel {
 public:
@@ -125,10 +144,9 @@ public:
 class PhysicalPlan {
 public:
   // 1. Выделение памяти (до запуска ядер)
-  std::vector<DeviceBuffer> data_columns_; // Колонки таблиц
-  std::vector<DeviceBuffer> hash_tables_;  // Хеш-таблицы (d_s_hash_table, etc)
-  DeviceBuffer host_result_buffer_;        // Буфер ответа хоста (h_result)
-  DeviceBuffer device_result_buffer_;      // Буфер ответа устройства (d_result)
+  std::vector<DeviceBuffer> data_columns_; // Колонки таблиц (EXTERNAL_INPUT)
+  std::vector<DeviceBuffer> hash_tables_;  // Хеш-таблицы (INTERNAL_TEMP)
+  DeviceBuffer device_result_buffer_;      // Буфер ответа устройства (EXTERNAL_OUTPUT)
 
   // 2. Ядра (выполняются последовательно)
   std::vector<Kernel> kernels;
@@ -136,9 +154,17 @@ public:
 // Builder для планов
 class Planner {
 public:
+  explicit Planner(std::shared_ptr<Catalog> catalog);
   std::shared_ptr<LogicalPlan> buildLogicalPlan(hsql::SelectStatement *ast);
   std::shared_ptr<PhysicalPlan>
   buildPhysicalPlan(std::shared_ptr<LogicalPlan> lp);
+
+private:
+  std::shared_ptr<Catalog> catalog_;
+  // Рекурсивно транслирует AST математики в C++ строку с именами регистров
+  std::string translateMathExpression(
+      hsql::Expr *expr,
+      const std::unordered_map<std::string, std::string> &col_to_reg) const;
 };
 // Выполняет оптимизации LogicalPlan на месте
 class QueryOptimizer {
@@ -150,7 +176,7 @@ private:
   std::shared_ptr<Catalog> catalog_;
 };
 
-// Просто генерирует код
+// Генерирует JIT SYCL код (extern "C" void execute_query(...))
 class CodeGenerator : public ICodeGeneratorVisitor {
 public:
   std::string generate(const PhysicalPlan &plan);
@@ -162,8 +188,10 @@ private:
   void visit(const OpBlockBuildHashtable &op) override;
   void visit(const OpBlockProbeHashtable &op) override;
   void visit(const OpBlockAggregate &op) override;
+  void visit(const OpBlockScalarAggregate &op) override;
 
 private:
   std::stringstream code;
+  bool first_filter_in_kernel_ = true;
 };
 } // namespace db
