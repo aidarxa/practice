@@ -53,6 +53,7 @@ static std::string predTypeToString(PredType pt) {
 std::string CodeGenerator::generate(const PhysicalPlan &plan) {
   code.str("");
   code.clear();
+  code << "#include \"core/execution.h\"\n";
   code << "#include <sycl/sycl.hpp>\n";
   code << "#include \"crystal/load.h\"\n";
   code << "#include \"crystal/pred.h\"\n";
@@ -64,14 +65,18 @@ std::string CodeGenerator::generate(const PhysicalPlan &plan) {
   code << "constexpr int TILE_SIZE = BLOCK_THREADS * ITEMS_PER_THREAD;\n\n";
   for (const auto &k : plan.kernels)
     code << "class " << k.name_ << ";\n";
-  code << "\nextern \"C\" void execute_query(\n    sycl::queue& q";
-  for (const auto &buf : plan.data_columns_)
-    if (buf.scope_ == BufferScope::EXTERNAL_INPUT)
-      code << ",\n    " << buf.type_ << "* " << buf.name_;
-  if (plan.device_result_buffer_.scope_ == BufferScope::EXTERNAL_OUTPUT)
-    code << ",\n    " << plan.device_result_buffer_.type_ << "* "
-         << plan.device_result_buffer_.name_;
-  code << "\n) {\n";
+  code << "\nextern \"C\" void execute_query(db::ExecutionContext* ctx) {\n";
+  code << "    sycl::queue& q = *(ctx->q_);\n";
+  for (const auto &buf : plan.data_columns_) {
+    if (buf.scope_ == BufferScope::EXTERNAL_INPUT) {
+      code << "    " << buf.type_ << "* " << buf.name_
+           << " = ctx->getBuffer<" << buf.type_ << ">(\"" << buf.name_ << "\");\n";
+    }
+  }
+  if (plan.device_result_buffer_.scope_ == BufferScope::EXTERNAL_OUTPUT) {
+    code << "    " << plan.device_result_buffer_.type_ << "* "
+         << plan.device_result_buffer_.name_ << " = ctx->getResultPointer();\n";
+  }
   for (const auto &ht : plan.hash_tables_) {
     if (ht.scope_ == BufferScope::INTERNAL_TEMP) {
       code << "    " << ht.type_ << "* " << ht.name_

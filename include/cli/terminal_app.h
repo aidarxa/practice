@@ -1,13 +1,14 @@
 #pragma once
 
 #include "session_context.h"
-#include "db/query_engine.h"
+#include "db/database_instance.h"
+#include <memory>
 
 namespace db::cli {
 
 class TerminalApp {
 public:
-    TerminalApp() = default;
+    TerminalApp(std::shared_ptr<db::DatabaseInstance> db);
 
     /// Запускает REPL-цикл. Блокирующий вызов — возвращает управление
     /// только после команды выхода (.exit / \q) или EOF (Ctrl-D).
@@ -15,9 +16,9 @@ public:
 
 private:
     SessionContext ctx_;
-    db::QueryEngine engine_;
+    std::shared_ptr<db::DatabaseInstance> db_;
 
-    /// Выполняет SQL-запрос через engine_ и выводит результат
+    /// Выполняет SQL-запрос через db_ и выводит результат
     /// согласно текущему ctx_ (stdout или файл).
     void executeQuery(const std::string& sql);
 

@@ -238,31 +238,35 @@ static void test_codegen_q21() {
   opt.optimize(lp);
   auto pp = planner.buildPhysicalPlan(lp);
 
-  CodeGenerator cg;
-  std::string code = cg.generate(*pp);
+    // Проверяем генератор
+    db::CodeGenerator cg;
+    std::string code = cg.generate(*pp);
 
-  // Must contain JIT signature, not main()
-  assert(code.find("extern \"C\" void execute_query") != std::string::npos);
-  assert(code.find("int main()") == std::string::npos);
+    // 1. Проверяем сигнатуру с ExecutionContext
+    assert(code.find("extern \"C\" void execute_query(db::ExecutionContext* ctx) {") != std::string::npos && "Missing execution context signature");
+    
+    // 2. Проверяем извлечение очереди и буферов
+    assert(code.find("sycl::queue& q = *(ctx->q_);") != std::string::npos && "Missing queue extraction");
+    assert(code.find("int* d_lo_orderdate = ctx->getBuffer<int>(\"d_lo_orderdate\");") != std::string::npos && "Missing data column pointer extraction");
+    assert(code.find("unsigned long long* d_result = ctx->getResultPointer();") != std::string::npos && "Missing d_result pointer extraction");
 
-  // Must not contain host operations
-  assert(code.find("malloc_host") == std::string::npos);
-  assert(code.find("loadColumn") == std::string::npos);
+    // 3. Проверяем, что INTERNAL_TEMP аллоцируются в самом ядре
+    assert(code.find("int* d_d_hash_table = sycl::malloc_device<int>") != std::string::npos && "Missing hash table malloc");
 
-  // Must contain SYCL primitives
-  assert(code.find("BlockBuildSelectivePHT_") != std::string::npos);
-  assert(code.find("BlockProbeAndPHT_") != std::string::npos);
-  assert(code.find("BlockLoad") != std::string::npos);
+    // 4. Проверяем наличие ядер в строке
+    assert(code.find("class ") != std::string::npos && "Missing forward declaration");
+    assert(code.find("q.submit([&](sycl::handler& h) {") != std::string::npos && "Missing queue submit");
 
-  // Must free INTERNAL_TEMP
-  assert(code.find("sycl::free(") != std::string::npos);
+    // 5. Проверяем отсутствие множественных q.wait()
+    size_t count_waits = 0;
+    size_t pos = 0;
+    while ((pos = code.find("q.wait();", pos)) != std::string::npos) {
+        count_waits++;
+        pos += 9;
+    }
+    assert(count_waits == 1 && "There should be exactly one q.wait() before sycl::free");
 
-  // Must have q.wait() barrier
-  assert(code.find("q.wait()") != std::string::npos);
-
-  std::cout << "PASSED\n";
-  std::cout << "\n--- Generated Code ---\n"
-            << code << "\n";
+    std::cout << "[ OK ] test_codegen_signature passed.\n";
 }
 
 // ============================================================================

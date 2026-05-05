@@ -27,6 +27,9 @@ bool containsSemicolon(const std::string& s) {
 
 } // anonymous namespace
 
+TerminalApp::TerminalApp(std::shared_ptr<db::DatabaseInstance> db)
+    : db_(std::move(db)) {}
+
 void TerminalApp::run() {
     // Настраиваем linenoise
     linenoiseSetMultiLine(1);
@@ -91,22 +94,43 @@ void TerminalApp::run() {
 
 void TerminalApp::executeQuery(const std::string& sql) {
     try {
-        std::string code = engine_.processQuery(sql);
-
-        if (ctx_.output_file.empty()) {
-            // Вывод в консоль с разделителями
-            std::cout << "--- Generated Code ---\n"
-                      << code
-                      << "--- End ---\n";
-        } else {
-            // Дописываем в файл
-            std::ofstream ofs(ctx_.output_file, std::ios::app);
-            if (!ofs.is_open()) {
-                std::cerr << "[ERROR] Cannot open file: " << ctx_.output_file << "\n";
-                return;
+        if (ctx_.dump_code) {
+            std::string code = db_->generateQueryCode(sql);
+            if (ctx_.output_file.empty()) {
+                std::cout << "--- Generated Code ---\n"
+                          << code
+                          << "--- End ---\n";
+            } else {
+                std::ofstream ofs(ctx_.output_file, std::ios::app);
+                if (!ofs.is_open()) {
+                    std::cerr << "[ERROR] Cannot open file: " << ctx_.output_file << "\n";
+                    return;
+                }
+                ofs << code;
+                std::cout << "Code saved to " << ctx_.output_file << "\n";
             }
-            ofs << code;
-            std::cout << "Code saved to " << ctx_.output_file << "\n";
+        } else {
+            // Выполняем реальный запрос
+            std::vector<unsigned long long> result = db_->executeQuery(sql);
+            
+            // Простой вывод результата
+            std::cout << "--- Result ---\n";
+            // В Q2.x возвращается 3 элемента на группу (year, brand, revenue)
+            // Мы выведем все ненулевые значения
+            bool has_results = false;
+            for (size_t i = 0; i < result.size(); i += 3) {
+                if (result[i] == 0 && result[i+1] == 0 && result[i+2] == 0) continue;
+                std::cout << "Row " << (i/3) << ": " 
+                          << result[i] << " | " 
+                          << result[i+1] << " | " 
+                          << result[i+2] << "\n";
+                has_results = true;
+            }
+            if (!has_results) {
+                // Если нет групп (скалярная агрегация) или пустой ответ
+                std::cout << result[0] << "\n";
+            }
+            std::cout << "--- End ---\n";
         }
     } catch (const std::exception& e) {
         std::cerr << "[ERROR] " << e.what() << "\n";

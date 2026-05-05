@@ -68,6 +68,25 @@ bool MetaCommandHandler::handle(const std::string& command, SessionContext& ctx)
         return false;
     }
 
+    // --- Dump Code echo ---
+    if (cmd == "\\dump") {
+        std::string arg;
+        if (iss >> arg) {
+            if (arg == "on") {
+                ctx.dump_code = true;
+                std::cout << "Dump code: ON\n";
+            } else if (arg == "off") {
+                ctx.dump_code = false;
+                std::cout << "Dump code: OFF\n";
+            } else {
+                std::cerr << "Usage: \\dump on|off\n";
+            }
+        } else {
+            std::cerr << "Usage: \\dump on|off\n";
+        }
+        return false;
+    }
+
     // --- Справка ---
     if (cmd == "help") {
         printHelp();
@@ -88,6 +107,7 @@ void MetaCommandHandler::printHelp() {
         "  help              Show this help message\n"
         "  .exit  | \\q       Exit the program\n"
         "  \\o [filename]     Redirect generated code to file (no arg = stdout)\n"
+        "  \\dump on|off      Toggle generated code output instead of execution\n"
         "  \\ast on|off       Toggle AST echo\n"
         "  \\logical on|off   Toggle logical plan echo\n"
         "\n"
