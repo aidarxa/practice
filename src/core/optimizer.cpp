@@ -261,13 +261,15 @@ Planner::Planner(std::shared_ptr<Catalog> catalog) : catalog_(std::move(catalog)
 
 std::string Planner::translateMathExpression(
     hsql::Expr *expr,
-    const std::unordered_map<std::string, std::string> &col_to_reg) const {
+    const std::unordered_map<std::string, std::string> &col_to_reg,
+    bool cast_to_ull) const {
   if (!expr) return "";
   if (expr->isType(hsql::kExprColumnRef)) {
     std::string col = expr->name;
     auto it = col_to_reg.find(col);
-    if (it != col_to_reg.end()) return it->second + "[i]";
-    return col + "[i]";
+    std::string res = (it != col_to_reg.end()) ? it->second + "[i]" : col + "[i]";
+    if (cast_to_ull) return "(unsigned long long)" + res;
+    return res;
   }
   if (expr->isType(hsql::kExprLiteralInt)) {
     return std::to_string(expr->ival);
@@ -276,8 +278,9 @@ std::string Planner::translateMathExpression(
     return std::to_string(expr->fval);
   }
   if (expr->isType(hsql::kExprOperator)) {
-    std::string left = translateMathExpression(expr->expr, col_to_reg);
-    std::string right = translateMathExpression(expr->expr2, col_to_reg);
+    // Cast the left operand to ULL if it's the top level or requested
+    std::string left = translateMathExpression(expr->expr, col_to_reg, cast_to_ull);
+    std::string right = translateMathExpression(expr->expr2, col_to_reg, false);
     std::string op;
     switch (expr->opType) {
     case hsql::kOpPlus:     op = " + "; break;
@@ -290,7 +293,7 @@ std::string Planner::translateMathExpression(
   }
   if (expr->isType(hsql::kExprFunctionRef)) {
     if (expr->exprList && !expr->exprList->empty())
-      return translateMathExpression((*expr->exprList)[0], col_to_reg);
+      return translateMathExpression((*expr->exprList)[0], col_to_reg, cast_to_ull);
   }
   return "0";
 }
@@ -602,6 +605,58 @@ std::shared_ptr<PhysicalPlan> Planner::buildPhysicalPlan(std::shared_ptr<Logical
     }
   }
 
+  // Fact-table filters (before probes for Predicate Pushdown)
+  {
+    // Collect FILTER conditions belonging to the fact table
+    std::vector<Expression*> fact_filters;
+    for (auto &cond : lp->conditions_) {
+      if (cond.type != ExpressionType::FILTER) continue;
+      hsql::Expr *col_expr = nullptr;
+      if (cond.expr->expr && cond.expr->expr->isType(hsql::kExprColumnRef))
+        col_expr = cond.expr->expr;
+      if (!col_expr && cond.expr->expr2 && cond.expr->expr2->isType(hsql::kExprColumnRef))
+        col_expr = cond.expr->expr2;
+      if (col_expr && getTableName(col_expr->name) == fact_table_name)
+        fact_filters.push_back(&cond);
+    }
+
+    // Sort by column name to group filters on the same column together
+    std::sort(fact_filters.begin(), fact_filters.end(),
+      [](Expression* a, Expression* b) {
+        auto getCol = [](Expression* e) -> std::string {
+          if (e->expr->expr && e->expr->expr->isType(hsql::kExprColumnRef))
+            return e->expr->expr->name;
+          if (e->expr->expr2 && e->expr->expr2->isType(hsql::kExprColumnRef))
+            return e->expr->expr2->name;
+          return "";
+        };
+        return getCol(a) < getCol(b);
+      });
+
+    // Emit Load + Filter(s) for each column group
+    std::string current_col;
+    for (auto *fp : fact_filters) {
+      hsql::Expr *col_e = fp->expr->expr->isType(hsql::kExprColumnRef)
+        ? fp->expr->expr : fp->expr->expr2;
+      hsql::Expr *val_e = fp->expr->expr->isType(hsql::kExprLiteralInt)
+        ? fp->expr->expr : fp->expr->expr2;
+      std::string fcol = col_e->name;
+      if (current_col.empty() || fcol != current_col) {
+        auto load = std::make_unique<OpBlockLoad>();
+        load->column_device_pointer_ = "d_" + fcol;
+        load->reg_ = "items";
+        sk.operations_.push_back(std::move(load));
+        current_col = fcol;
+      }
+      auto filt = std::make_unique<OpBlockFilter>();
+      filt->reg_ = "items";
+      filt->flags_reg_ = "flags";
+      filt->pred_type = opTypeToPredType(fp->expr->opType);
+      filt->value = std::to_string(val_e->ival);
+      sk.operations_.push_back(std::move(filt));
+    }
+  }
+
   // Probe ops for each dimension
   for (size_t di = 0; di < dim_table_names.size(); ++di) {
     const auto &dim_name = dim_table_names[di];
@@ -695,7 +750,7 @@ std::shared_ptr<PhysicalPlan> Planner::buildPhysicalPlan(std::shared_ptr<Logical
       if (a.expr_ && a.expr_->isType(hsql::kExprColumnRef))
         agg_op->agg_values_.push_back(std::string(a.expr_->name));
       else if (a.expr_)
-        agg_op->agg_values_.push_back(translateMathExpression(a.expr_, col_to_reg));
+        agg_op->agg_values_.push_back(translateMathExpression(a.expr_, col_to_reg, true));
     }
     agg_op->tuple_size_ = static_cast<uint8_t>(agg_op->group_regs_.size() + agg_op->agg_values_.size());
 
@@ -736,8 +791,7 @@ std::shared_ptr<PhysicalPlan> Planner::buildPhysicalPlan(std::shared_ptr<Logical
     sagg->flags_ = "flags";
     sagg->res_ptr_ = "d_result";
     if (!lp->aggregations_.empty() && lp->aggregations_[0].expr_) {
-      sagg->agg_expr_ = "(unsigned long long)" +
-        translateMathExpression(lp->aggregations_[0].expr_, col_to_reg);
+      sagg->agg_expr_ = translateMathExpression(lp->aggregations_[0].expr_, col_to_reg, true);
     } else {
       sagg->agg_expr_ = "0";
     }

@@ -277,9 +277,11 @@ static void test_scalar_aggregation() {
   std::string sql =
       "SELECT SUM(lo_extendedprice * lo_discount) "
       "FROM lineorder "
-      "WHERE lo_quantity < 25 "
+      "WHERE lo_orderdate >= 19930101 "
+      "AND lo_orderdate < 19940101 "
       "AND lo_discount >= 1 "
-      "AND lo_discount <= 3";
+      "AND lo_discount <= 3 "
+      "AND lo_quantity < 25";
 
   hsql::SQLParserResult result;
   auto *ast = parseSQL(sql, result);
@@ -293,12 +295,12 @@ static void test_scalar_aggregation() {
   assert(lp->group_by_.empty());
   // 1 aggregation
   assert(lp->aggregations_.size() == 1);
-  // 3 FILTERs, 0 JOINs
+  // 5 FILTERs, 0 JOINs
   int filters = 0;
   for (auto &c : lp->conditions_) {
     if (c.type == ExpressionType::FILTER) filters++;
   }
-  assert(filters == 3);
+  assert(filters == 5);
 
   auto pp = planner.buildPhysicalPlan(lp);
 
@@ -315,6 +317,20 @@ static void test_scalar_aggregation() {
   // Should have reduce_over_group for scalar agg
   assert(code.find("reduce_over_group") != std::string::npos);
   assert(code.find("atomic_result") != std::string::npos);
+
+  // Check fact table filters
+  assert(code.find("BlockPredGTE<int, BLOCK_THREADS, ITEMS_PER_THREAD>(tid, items, flags, 1, num_tile_items);") != std::string::npos);
+  assert(code.find("BlockPredALTE<int, BLOCK_THREADS, ITEMS_PER_THREAD>(tid, items, flags, 3, num_tile_items);") != std::string::npos);
+  assert(code.find("BlockPredAGTE<int, BLOCK_THREADS, ITEMS_PER_THREAD>(tid, items, flags, 19930101, num_tile_items);") != std::string::npos);
+  assert(code.find("BlockPredALT<int, BLOCK_THREADS, ITEMS_PER_THREAD>(tid, items, flags, 19940101, num_tile_items);") != std::string::npos);
+  assert(code.find("BlockPredALT<int, BLOCK_THREADS, ITEMS_PER_THREAD>(tid, items, flags, 25, num_tile_items);") != std::string::npos);
+
+  // Check named registers for aggregation
+  assert(code.find("int lo_extendedprice[ITEMS_PER_THREAD];") != std::string::npos);
+  assert(code.find("int lo_discount[ITEMS_PER_THREAD];") != std::string::npos);
+  
+  // Check that aggregation uses the named registers and cast
+  assert(code.find("sum += ((unsigned long long)lo_extendedprice[i] * lo_discount[i]);") != std::string::npos);
 
   std::cout << "PASSED\n";
 }

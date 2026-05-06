@@ -164,7 +164,8 @@ private:
   // Рекурсивно транслирует AST математики в C++ строку с именами регистров
   std::string translateMathExpression(
       hsql::Expr *expr,
-      const std::unordered_map<std::string, std::string> &col_to_reg) const;
+      const std::unordered_map<std::string, std::string> &col_to_reg,
+      bool cast_to_ull = false) const;
 };
 // Выполняет оптимизации LogicalPlan на месте
 class QueryOptimizer {
