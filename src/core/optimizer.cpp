@@ -99,6 +99,8 @@ std::string CodeGenerator::generate(const PhysicalPlan &plan) {
   for (const auto &ht : plan.hash_tables_)
     if (ht.scope_ == BufferScope::INTERNAL_TEMP)
       code << "    sycl::free(" << ht.name_ << ", q);\n";
+  
+  code << "    ctx->tuple_size_ = " << std::to_string(plan.tuple_size_) << ";\n";
   code << "}\n";
   return code.str();
 }
@@ -195,7 +197,7 @@ void CodeGenerator::visit(const OpBlockAggregate &op) {
          << std::to_string(op.tuple_size_) << "+"
          << std::to_string(slot) << "]);\n";
     code << "                    atomic_agg_" << std::to_string(a)
-         << ".fetch_add(" << op.agg_values_[a] << "[i]);\n";
+         << ".fetch_add(" << op.agg_values_[a] << ");\n";
   }
   code << "                }\n            }\n";
 }
@@ -358,77 +360,17 @@ static PredType opTypeToPredType(hsql::OperatorType op) {
   }
 }
 
-std::shared_ptr<PhysicalPlan> Planner::buildPhysicalPlan(std::shared_ptr<LogicalPlan> lp) {
-  auto pp = std::make_shared<PhysicalPlan>();
-  // Identify fact and dimension tables
-  std::string fact_table_name;
-  std::vector<std::string> dim_table_names;
-  for (auto *tref : lp->tables_) {
-    std::string tname = tref->name ? toLower(std::string(tref->name)) : "";
-    std::string canonical = getTableName(getTablePrefix(tname) + "_dummy");
-    if (canonical.empty()) canonical = tname;
-    try {
-      const auto &meta = catalog_->getTableMetadata(canonical);
-      if (meta.isFactTable()) fact_table_name = canonical;
-      else dim_table_names.push_back(canonical);
-    } catch (...) {
-      // Try uppercase
-      std::string upper = tname;
-      std::transform(upper.begin(), upper.end(), upper.begin(), ::toupper);
-      try {
-        const auto &meta = catalog_->getTableMetadata(upper);
-        if (meta.isFactTable()) fact_table_name = upper;
-        else dim_table_names.push_back(upper);
-      } catch (...) {}
-    }
-  }
-
-  // Collect columns needed per table, and build register maps
-  std::set<std::string> all_columns;
-  std::unordered_map<std::string, std::string> col_to_reg;
-  int reg_counter = 0;
-
-  // Gather all referenced columns
-  auto addCol = [&](const std::string &col) { all_columns.insert(col); };
-  for (auto *c : lp->columns_) if (c->name) addCol(c->name);
-  for (auto &agg : lp->aggregations_) {
-    if (agg.expr_) {
-      std::function<void(hsql::Expr*)> walk = [&](hsql::Expr* e) {
-        if (!e) return;
-        if (e->isType(hsql::kExprColumnRef) && e->name) addCol(e->name);
-        walk(e->expr); walk(e->expr2);
-        if (e->exprList) for (auto *x : *e->exprList) walk(x);
-      };
-      walk(agg.expr_);
-    }
-  }
-  for (auto &cond : lp->conditions_) {
-    if (cond.expr && cond.expr->expr && cond.expr->expr->isType(hsql::kExprColumnRef))
-      addCol(cond.expr->expr->name);
-    if (cond.expr && cond.expr->expr2 && cond.expr->expr2->isType(hsql::kExprColumnRef))
-      addCol(cond.expr->expr2->name);
-  }
-  for (auto *g : lp->group_by_) if (g->name) addCol(g->name);
-
-  // Create device buffers for all columns
-  for (const auto &col : all_columns) {
-    DeviceBuffer db;
-    db.name_ = "d_" + col;
-    db.type_ = "int";
-    db.size_ = getSizeMacro(getTableName(col));
-    db.needs_zeroing_ = false;
-    db.scope_ = BufferScope::EXTERNAL_INPUT;
-    pp->data_columns_.push_back(db);
-  }
-
-  // For each dimension, find JOIN condition, filters, and build kernel
+void Planner::buildDimensionKernels(
+    std::shared_ptr<LogicalPlan> lp, 
+    std::shared_ptr<PhysicalPlan> pp,
+    const std::vector<std::string> &dim_table_names,
+    std::unordered_map<std::string, std::string> &col_to_reg) const {
   for (const auto &dim_name : dim_table_names) {
     const auto &dim_meta = catalog_->getTableMetadata(dim_name);
     std::string prefix = getTablePrefix(dim_name);
     std::string pk_col, fk_col, val_col;
     uint8_t variant = 1;
 
-    // Find JOIN condition for this dimension
     for (auto &cond : lp->conditions_) {
       if (cond.type != ExpressionType::JOIN) continue;
       std::string lc = cond.expr->expr->name;
@@ -443,7 +385,6 @@ std::shared_ptr<PhysicalPlan> Planner::buildPhysicalPlan(std::shared_ptr<Logical
     }
     if (pk_col.empty()) continue;
 
-    // Find value column for PHT_2 (GROUP BY or SELECT referencing this dim)
     for (auto *g : lp->group_by_) {
       if (g->name && getTableName(g->name) == dim_name) {
         std::string gn = g->name;
@@ -459,7 +400,6 @@ std::shared_ptr<PhysicalPlan> Planner::buildPhysicalPlan(std::shared_ptr<Logical
       }
     }
 
-    // Determine hash table sizing
     std::string ht_name = "d_" + prefix + "_hash_table";
     std::string ht_size, key_mins = "0";
     if (dim_meta.hasColumnStats(pk_col)) {
@@ -482,7 +422,6 @@ std::shared_ptr<PhysicalPlan> Planner::buildPhysicalPlan(std::shared_ptr<Logical
     ht_buf.scope_ = BufferScope::INTERNAL_TEMP;
     pp->hash_tables_.push_back(ht_buf);
 
-    // Build kernel
     Kernel bk;
     bk.name_ = "build_hashtable_" + prefix;
     bk.iteration_size_ = getSizeMacro(dim_name);
@@ -490,7 +429,6 @@ std::shared_ptr<PhysicalPlan> Planner::buildPhysicalPlan(std::shared_ptr<Logical
     bk.registers_.push_back("flags");
     if (variant == 2) bk.registers_.push_back("items2");
 
-    // Find FILTER conditions for this dimension
     std::vector<Expression*> dim_filters;
     for (auto &cond : lp->conditions_) {
       if (cond.type != ExpressionType::FILTER) continue;
@@ -507,7 +445,6 @@ std::shared_ptr<PhysicalPlan> Planner::buildPhysicalPlan(std::shared_ptr<Logical
         dim_filters.push_back(&cond);
     }
 
-    // Emit: Load filter col -> Filter -> Load PK -> [Load val] -> Build HT
     if (!dim_filters.empty()) {
       std::string first_filter_col;
       for (auto *fp : dim_filters) {
@@ -530,17 +467,13 @@ std::shared_ptr<PhysicalPlan> Planner::buildPhysicalPlan(std::shared_ptr<Logical
         filt->value = std::to_string(val_e->ival);
         bk.operations_.push_back(std::move(filt));
       }
-    } else {
-      // No filters — InitFlags handles it (all 1s)
     }
 
-    // Load PK
     auto load_pk = std::make_unique<OpBlockLoad>();
     load_pk->column_device_pointer_ = "d_" + pk_col;
     load_pk->reg_ = "items";
     bk.operations_.push_back(std::move(load_pk));
 
-    // Load value for PHT_2
     if (variant == 2) {
       auto load_val = std::make_unique<OpBlockLoad>();
       load_val->column_device_pointer_ = "d_" + val_col;
@@ -548,7 +481,6 @@ std::shared_ptr<PhysicalPlan> Planner::buildPhysicalPlan(std::shared_ptr<Logical
       bk.operations_.push_back(std::move(load_val));
     }
 
-    // Build hashtable op
     auto build_op = std::make_unique<OpBlockBuildHashtable>();
     build_op->reg_ = "items";
     build_op->flags_reg_ = "flags";
@@ -560,19 +492,229 @@ std::shared_ptr<PhysicalPlan> Planner::buildPhysicalPlan(std::shared_ptr<Logical
     bk.operations_.push_back(std::move(build_op));
     pp->kernels.push_back(std::move(bk));
 
-    // Store FK->HT mapping for probe phase
     col_to_reg[fk_col] = "items";
     if (variant == 2) col_to_reg[val_col] = val_col;
   }
+}
 
-  // SELECT kernel (probe + aggregate)
+void Planner::buildProbePhase(
+    std::shared_ptr<LogicalPlan> lp,
+    std::shared_ptr<PhysicalPlan> pp,
+    Kernel &sk,
+    const std::string &fact_table_name,
+    std::unordered_map<std::string, std::string> &col_to_reg) const {
+  
+  std::vector<Expression*> fact_filters;
+  for (auto &cond : lp->conditions_) {
+    if (cond.type != ExpressionType::FILTER) continue;
+    hsql::Expr *col_expr = nullptr;
+    if (cond.expr->expr && cond.expr->expr->isType(hsql::kExprColumnRef))
+      col_expr = cond.expr->expr;
+    else if (cond.expr->expr2 && cond.expr->expr2->isType(hsql::kExprColumnRef))
+      col_expr = cond.expr->expr2;
+    if (col_expr && getTableName(col_expr->name) == fact_table_name)
+      fact_filters.push_back(&cond);
+  }
+
+  std::sort(fact_filters.begin(), fact_filters.end(), [](Expression* a, Expression* b) {
+    auto ca = a->expr->expr->isType(hsql::kExprColumnRef) ? a->expr->expr : a->expr->expr2;
+    auto cb = b->expr->expr->isType(hsql::kExprColumnRef) ? b->expr->expr : b->expr->expr2;
+    return std::string(ca->name) < std::string(cb->name);
+  });
+
+  std::string current_col;
+  for (auto *fp : fact_filters) {
+    hsql::Expr *col_e = fp->expr->expr->isType(hsql::kExprColumnRef) ? fp->expr->expr : fp->expr->expr2;
+    hsql::Expr *val_e = fp->expr->expr->isType(hsql::kExprLiteralInt) ? fp->expr->expr : fp->expr->expr2;
+    std::string fcol = col_e->name;
+    
+    if (current_col.empty() || fcol != current_col) {
+      auto load = std::make_unique<OpBlockLoad>();
+      load->column_device_pointer_ = "d_" + fcol;
+      load->reg_ = "items";
+      sk.operations_.push_back(std::move(load));
+      current_col = fcol;
+    }
+    auto filt = std::make_unique<OpBlockFilter>();
+    filt->reg_ = "items";
+    filt->flags_reg_ = "flags";
+    filt->pred_type = opTypeToPredType(fp->expr->opType);
+    filt->value = std::to_string(val_e->ival);
+    sk.operations_.push_back(std::move(filt));
+  }
+
+  for (auto &ht : pp->hash_tables_) {
+    std::string dim_prefix = ht.name_.substr(2, ht.name_.find("_hash_table") - 2);
+    std::string fk_col, val_col;
+    for (auto &cond : lp->conditions_) {
+      if (cond.type == ExpressionType::JOIN) {
+        std::string lc = cond.expr->expr->name;
+        std::string rc = cond.expr->expr2->name;
+        if (getTablePrefix(getTableName(lc)) == dim_prefix) fk_col = rc;
+        if (getTablePrefix(getTableName(rc)) == dim_prefix) fk_col = lc;
+      }
+    }
+    
+    uint8_t variant = 1;
+    for (auto const& [key, val] : col_to_reg) {
+      if (getTablePrefix(getTableName(key)) == dim_prefix && key != getTableName(key)+"_dummy_pk") {
+         if(val != "items") {
+             val_col = val;
+             variant = 2;
+         }
+      }
+    }
+
+    auto load_fk = std::make_unique<OpBlockLoad>();
+    load_fk->column_device_pointer_ = "d_" + fk_col;
+    load_fk->reg_ = "items";
+    sk.operations_.push_back(std::move(load_fk));
+
+    auto probe_op = std::make_unique<OpBlockProbeHashtable>();
+    probe_op->reg_ = "items";
+    probe_op->flags_reg_ = "flags";
+    probe_op->hashtable_pointer_ = ht.name_;
+    probe_op->table_len_ = ht.size_;
+    std::string key_mins = "0";
+    try {
+      std::string dim_table = getTableName(dim_prefix + "_dummy");
+      std::string pk_col = "";
+      for (auto &cond : lp->conditions_) {
+        if (cond.type == ExpressionType::JOIN) {
+          std::string lc = cond.expr->expr->name;
+          std::string rc = cond.expr->expr2->name;
+          if (getTablePrefix(getTableName(lc)) == dim_prefix) pk_col = lc;
+          if (getTablePrefix(getTableName(rc)) == dim_prefix) pk_col = rc;
+        }
+      }
+      if (!pk_col.empty() && catalog_->getTableMetadata(dim_table).hasColumnStats(pk_col)) {
+        key_mins = std::to_string(catalog_->getTableMetadata(dim_table).getColumnStats(pk_col).min_value_);
+      }
+    } catch(...) {}
+    
+    probe_op->key_mins_ = key_mins;
+    probe_op->variant_ = variant;
+    if (variant == 2) probe_op->val_reg_ = val_col;
+    sk.operations_.push_back(std::move(probe_op));
+  }
+
+  for (auto const& [col, reg] : col_to_reg) {
+    if (getTableName(col) == fact_table_name && reg != "items") {
+      auto load = std::make_unique<OpBlockLoad>();
+      load->column_device_pointer_ = "d_" + col;
+      load->reg_ = reg;
+      sk.operations_.push_back(std::move(load));
+    }
+  }
+}
+
+std::pair<std::string, uint64_t> Planner::generatePerfectHashExpression(
+    const std::vector<hsql::Expr*> &group_by) const {
+    
+    std::string hash_expr = "";
+    uint64_t total_size = 1;
+
+    for (size_t i = 0; i < group_by.size(); ++i) {
+        std::string col_name = group_by[i]->name;
+        std::string table_name = getTableName(col_name);
+        
+        uint64_t min_val = 0;
+        uint64_t card = 1;
+        
+        try {
+            const auto &meta = catalog_->getTableMetadata(table_name);
+            if (meta.hasColumnStats(col_name)) {
+                const auto &stats = meta.getColumnStats(col_name);
+                min_val = stats.min_value_;
+                card = stats.cardinality_;
+            }
+        } catch (...) {}
+
+        std::string term = "(" + col_name + "[i] - " + std::to_string(min_val) + ")";
+
+        if (i == 0) {
+            hash_expr = term;
+        } else {
+            hash_expr = "(" + hash_expr + " * " + std::to_string(card) + " + " + term + ")";
+        }
+        
+        total_size *= card;
+    }
+
+    if (!hash_expr.empty()) {
+        hash_expr = "(" + hash_expr + ") % " + std::to_string(total_size);
+    } else {
+        hash_expr = "0";
+    }
+
+    return {hash_expr, total_size};
+}
+
+std::shared_ptr<PhysicalPlan> Planner::buildPhysicalPlan(std::shared_ptr<LogicalPlan> lp) {
+  auto pp = std::make_shared<PhysicalPlan>();
+  std::string fact_table_name;
+  std::vector<std::string> dim_table_names;
+  for (auto *tref : lp->tables_) {
+    std::string tname = tref->name ? toLower(std::string(tref->name)) : "";
+    std::string canonical = getTableName(getTablePrefix(tname) + "_dummy");
+    if (canonical.empty()) canonical = tname;
+    try {
+      const auto &meta = catalog_->getTableMetadata(canonical);
+      if (meta.isFactTable()) fact_table_name = canonical;
+      else dim_table_names.push_back(canonical);
+    } catch (...) {
+      std::string upper = tname;
+      std::transform(upper.begin(), upper.end(), upper.begin(), ::toupper);
+      try {
+        const auto &meta = catalog_->getTableMetadata(upper);
+        if (meta.isFactTable()) fact_table_name = upper;
+        else dim_table_names.push_back(upper);
+      } catch (...) {}
+    }
+  }
+
+  std::set<std::string> all_columns;
+  std::unordered_map<std::string, std::string> col_to_reg;
+
+  auto addCol = [&](const std::string &col) { all_columns.insert(col); };
+  for (auto *c : lp->columns_) if (c->name) addCol(c->name);
+  for (auto &agg : lp->aggregations_) {
+    if (agg.expr_) {
+      std::function<void(hsql::Expr*)> walk = [&](hsql::Expr* e) {
+        if (!e) return;
+        if (e->isType(hsql::kExprColumnRef) && e->name) addCol(e->name);
+        walk(e->expr); walk(e->expr2);
+        if (e->exprList) for (auto *x : *e->exprList) walk(x);
+      };
+      walk(agg.expr_);
+    }
+  }
+  for (auto &cond : lp->conditions_) {
+    if (cond.expr && cond.expr->expr && cond.expr->expr->isType(hsql::kExprColumnRef))
+      addCol(cond.expr->expr->name);
+    if (cond.expr && cond.expr->expr2 && cond.expr->expr2->isType(hsql::kExprColumnRef))
+      addCol(cond.expr->expr2->name);
+  }
+  for (auto *g : lp->group_by_) if (g->name) addCol(g->name);
+
+  for (const auto &col : all_columns) {
+    DeviceBuffer db;
+    db.name_ = "d_" + col;
+    db.type_ = "int";
+    db.size_ = getSizeMacro(getTableName(col));
+    db.needs_zeroing_ = false;
+    db.scope_ = BufferScope::EXTERNAL_INPUT;
+    pp->data_columns_.push_back(db);
+  }
+
+  buildDimensionKernels(lp, pp, dim_table_names, col_to_reg);
+
   Kernel sk;
   sk.name_ = "select_kernel";
   sk.iteration_size_ = fact_table_name.empty() ? "LO_LEN" : getSizeMacro(fact_table_name);
   sk.registers_.push_back("items");
   sk.registers_.push_back("flags");
 
-  // Register named regs for group-by value columns
   std::set<std::string> named_regs;
   for (auto *g : lp->group_by_) {
     if (g->name) {
@@ -585,7 +727,6 @@ std::shared_ptr<PhysicalPlan> Planner::buildPhysicalPlan(std::shared_ptr<Logical
     }
   }
 
-  // Add revenue/agg column registers
   for (auto &agg : lp->aggregations_) {
     if (agg.expr_) {
       std::function<void(hsql::Expr*)> walk = [&](hsql::Expr *e) {
@@ -605,140 +746,8 @@ std::shared_ptr<PhysicalPlan> Planner::buildPhysicalPlan(std::shared_ptr<Logical
     }
   }
 
-  // Fact-table filters (before probes for Predicate Pushdown)
-  {
-    // Collect FILTER conditions belonging to the fact table
-    std::vector<Expression*> fact_filters;
-    for (auto &cond : lp->conditions_) {
-      if (cond.type != ExpressionType::FILTER) continue;
-      hsql::Expr *col_expr = nullptr;
-      if (cond.expr->expr && cond.expr->expr->isType(hsql::kExprColumnRef))
-        col_expr = cond.expr->expr;
-      if (!col_expr && cond.expr->expr2 && cond.expr->expr2->isType(hsql::kExprColumnRef))
-        col_expr = cond.expr->expr2;
-      if (col_expr && getTableName(col_expr->name) == fact_table_name)
-        fact_filters.push_back(&cond);
-    }
+  buildProbePhase(lp, pp, sk, fact_table_name, col_to_reg);
 
-    // Sort by column name to group filters on the same column together
-    std::sort(fact_filters.begin(), fact_filters.end(),
-      [](Expression* a, Expression* b) {
-        auto getCol = [](Expression* e) -> std::string {
-          if (e->expr->expr && e->expr->expr->isType(hsql::kExprColumnRef))
-            return e->expr->expr->name;
-          if (e->expr->expr2 && e->expr->expr2->isType(hsql::kExprColumnRef))
-            return e->expr->expr2->name;
-          return "";
-        };
-        return getCol(a) < getCol(b);
-      });
-
-    // Emit Load + Filter(s) for each column group
-    std::string current_col;
-    for (auto *fp : fact_filters) {
-      hsql::Expr *col_e = fp->expr->expr->isType(hsql::kExprColumnRef)
-        ? fp->expr->expr : fp->expr->expr2;
-      hsql::Expr *val_e = fp->expr->expr->isType(hsql::kExprLiteralInt)
-        ? fp->expr->expr : fp->expr->expr2;
-      std::string fcol = col_e->name;
-      if (current_col.empty() || fcol != current_col) {
-        auto load = std::make_unique<OpBlockLoad>();
-        load->column_device_pointer_ = "d_" + fcol;
-        load->reg_ = "items";
-        sk.operations_.push_back(std::move(load));
-        current_col = fcol;
-      }
-      auto filt = std::make_unique<OpBlockFilter>();
-      filt->reg_ = "items";
-      filt->flags_reg_ = "flags";
-      filt->pred_type = opTypeToPredType(fp->expr->opType);
-      filt->value = std::to_string(val_e->ival);
-      sk.operations_.push_back(std::move(filt));
-    }
-  }
-
-  // Probe ops for each dimension
-  for (size_t di = 0; di < dim_table_names.size(); ++di) {
-    const auto &dim_name = dim_table_names[di];
-    std::string prefix = getTablePrefix(dim_name);
-    std::string fk_col_probe, val_col_probe;
-    uint8_t pv = 1;
-    std::string ht_name_probe = "d_" + prefix + "_hash_table";
-    std::string key_mins_probe = "0";
-    std::string ht_len_probe;
-
-    for (auto &cond : lp->conditions_) {
-      if (cond.type != ExpressionType::JOIN) continue;
-      std::string lc = cond.expr->expr->name, rc = cond.expr->expr2->name;
-      std::string lt = getTableName(lc), rt = getTableName(rc);
-      if (lt == dim_name) { fk_col_probe = rc; break; }
-      if (rt == dim_name) { fk_col_probe = lc; break; }
-    }
-
-    // Find matching hash table
-    for (auto &ht : pp->hash_tables_) {
-      if (ht.name_ == ht_name_probe) {
-        ht_len_probe = ht.size_;
-        break;
-      }
-    }
-
-    // Determine variant and val_col for probe
-    for (auto *g : lp->group_by_) {
-      if (g->name && getTableName(g->name) == dim_name) {
-        std::string gn = g->name;
-        // Check it's not the PK
-        for (auto &cond : lp->conditions_) {
-          if (cond.type != ExpressionType::JOIN) continue;
-          std::string lc = cond.expr->expr->name, rc = cond.expr->expr2->name;
-          if ((getTableName(lc) == dim_name && lc != gn) ||
-              (getTableName(rc) == dim_name && rc != gn)) {
-            val_col_probe = gn; pv = 2; break;
-          }
-        }
-        if (pv == 2) break;
-      }
-    }
-
-    // Get key_mins from catalog
-    const auto &dm = catalog_->getTableMetadata(dim_name);
-    for (auto &cond : lp->conditions_) {
-      if (cond.type != ExpressionType::JOIN) continue;
-      std::string lc = cond.expr->expr->name, rc = cond.expr->expr2->name;
-      std::string pk = (getTableName(lc) == dim_name) ? lc : rc;
-      if (dm.hasColumnStats(pk)) {
-        key_mins_probe = std::to_string(dm.getColumnStats(pk).min_value_);
-      }
-      break;
-    }
-
-    auto load_fk = std::make_unique<OpBlockLoad>();
-    load_fk->column_device_pointer_ = "d_" + fk_col_probe;
-    load_fk->reg_ = "items";
-    sk.operations_.push_back(std::move(load_fk));
-
-    auto probe = std::make_unique<OpBlockProbeHashtable>();
-    probe->reg_ = "items";
-    probe->flags_reg_ = "flags";
-    probe->hashtable_pointer_ = ht_name_probe;
-    probe->table_len_ = ht_len_probe;
-    probe->key_mins_ = key_mins_probe;
-    probe->variant_ = pv;
-    if (pv == 2) probe->val_reg_ = val_col_probe;
-    sk.operations_.push_back(std::move(probe));
-  }
-
-  // Load aggregation columns in select kernel
-  for (const auto &rn : named_regs) {
-    if (getTableName(rn) == fact_table_name || fact_table_name.empty()) {
-      auto ld = std::make_unique<OpBlockLoad>();
-      ld->column_device_pointer_ = "d_" + rn;
-      ld->reg_ = rn;
-      sk.operations_.push_back(std::move(ld));
-    }
-  }
-
-  // Aggregate or ScalarAggregate
   bool has_group_by = !lp->group_by_.empty();
   if (has_group_by) {
     auto agg_op = std::make_unique<OpBlockAggregate>();
@@ -747,38 +756,16 @@ std::shared_ptr<PhysicalPlan> Planner::buildPhysicalPlan(std::shared_ptr<Logical
     for (auto *g : lp->group_by_)
       agg_op->group_regs_.push_back(std::string(g->name));
     for (auto &a : lp->aggregations_) {
-      if (a.expr_ && a.expr_->isType(hsql::kExprColumnRef))
-        agg_op->agg_values_.push_back(std::string(a.expr_->name));
-      else if (a.expr_)
+      if (a.expr_)
         agg_op->agg_values_.push_back(translateMathExpression(a.expr_, col_to_reg, true));
     }
     agg_op->tuple_size_ = static_cast<uint8_t>(agg_op->group_regs_.size() + agg_op->agg_values_.size());
+    pp->tuple_size_ = agg_op->tuple_size_;
 
-    // Build hash_expr from group-by cardinalities
-    std::string hash_expr = "(";
-    uint64_t res_size = 1;
-    for (size_t i = 0; i < lp->group_by_.size(); ++i) {
-      std::string gn = lp->group_by_[i]->name;
-      std::string gt = getTableName(gn);
-      uint64_t card = 7;
-      try {
-        const auto &gm = catalog_->getTableMetadata(gt);
-        if (gm.hasColumnStats(gn)) card = gm.getColumnStats(gn).cardinality_;
-      } catch (...) {}
-      if (i > 0) hash_expr += " + ";
-      hash_expr += gn + "[i]";
-      if (gn.find("year") != std::string::npos) {
-        hash_expr += " - 1992";
-        card = 7; // 1992-1998
-      }
-      if (i < lp->group_by_.size() - 1) hash_expr += ") * " + std::to_string(card);
-      res_size *= card;
-    }
-    hash_expr += ") % " + std::to_string(res_size);
+    auto [hash_expr, total_size] = generatePerfectHashExpression(lp->group_by_);
     agg_op->hash_expr_ = hash_expr;
 
-    // Result buffer
-    uint64_t res_array_size = res_size * agg_op->tuple_size_;
+    uint64_t res_array_size = total_size * agg_op->tuple_size_;
     pp->device_result_buffer_.name_ = "d_result";
     pp->device_result_buffer_.type_ = "unsigned long long";
     pp->device_result_buffer_.size_ = std::to_string(res_array_size);
@@ -795,6 +782,7 @@ std::shared_ptr<PhysicalPlan> Planner::buildPhysicalPlan(std::shared_ptr<Logical
     } else {
       sagg->agg_expr_ = "0";
     }
+    pp->tuple_size_ = 1;
     pp->device_result_buffer_.name_ = "d_result";
     pp->device_result_buffer_.type_ = "unsigned long long";
     pp->device_result_buffer_.size_ = "1";

@@ -147,6 +147,7 @@ public:
   std::vector<DeviceBuffer> data_columns_; // Колонки таблиц (EXTERNAL_INPUT)
   std::vector<DeviceBuffer> hash_tables_;  // Хеш-таблицы (INTERNAL_TEMP)
   DeviceBuffer device_result_buffer_;      // Буфер ответа устройства (EXTERNAL_OUTPUT)
+  uint8_t tuple_size_ = 1;
 
   // 2. Ядра (выполняются последовательно)
   std::vector<Kernel> kernels;
@@ -166,6 +167,25 @@ private:
       hsql::Expr *expr,
       const std::unordered_map<std::string, std::string> &col_to_reg,
       bool cast_to_ull = false) const;
+
+  // Формирует ядра для сборки хеш-таблиц (Build Phase)
+  void buildDimensionKernels(
+      std::shared_ptr<LogicalPlan> lp, 
+      std::shared_ptr<PhysicalPlan> pp,
+      const std::vector<std::string> &dim_table_names,
+      std::unordered_map<std::string, std::string> &col_to_reg) const;
+
+  // Формирует фазу поиска и фильтрации фактовой таблицы (Probe Phase)
+  void buildProbePhase(
+      std::shared_ptr<LogicalPlan> lp,
+      std::shared_ptr<PhysicalPlan> pp,
+      Kernel &sk,
+      const std::string &fact_table_name,
+      std::unordered_map<std::string, std::string> &col_to_reg) const;
+
+  // Генерирует сбалансированное C++ выражение для Perfect Hash без хардкода
+  std::pair<std::string, uint64_t> generatePerfectHashExpression(
+      const std::vector<hsql::Expr*> &group_by) const;
 };
 // Выполняет оптимизации LogicalPlan на месте
 class QueryOptimizer {

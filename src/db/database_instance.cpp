@@ -117,7 +117,7 @@ void DatabaseInstance::loadData() {
     std::cout << "\nData loading complete!" << std::endl;
 }
 
-std::vector<unsigned long long> DatabaseInstance::executeQuery(const std::string& sql) {
+std::pair<std::vector<unsigned long long>, size_t> DatabaseInstance::executeQuery(const std::string& sql) {
     // Очищаем буфер результатов перед каждым запуском
     ctx_->result_buffer_->ensureCapacity(21000);
     ctx_->result_buffer_->zero();
@@ -132,7 +132,7 @@ std::vector<unsigned long long> DatabaseInstance::executeQuery(const std::string
     std::vector<unsigned long long> h_result;
     ctx_->result_buffer_->copyToHost(h_result, 21000);
 
-    return h_result;
+    return {h_result, ctx_->tuple_size_};
 }
 
 std::string DatabaseInstance::generateQueryCode(const std::string& sql) {

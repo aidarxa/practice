@@ -111,24 +111,40 @@ void TerminalApp::executeQuery(const std::string& sql) {
             }
         } else {
             // Выполняем реальный запрос
-            std::vector<unsigned long long> result = db_->executeQuery(sql);
+            auto res_pair = db_->executeQuery(sql);
+            const std::vector<unsigned long long>& result = res_pair.first;
+            size_t tuple_size = res_pair.second;
             
             // Простой вывод результата
             std::cout << "--- Result ---\n";
-            // В Q2.x возвращается 3 элемента на группу (year, brand, revenue)
-            // Мы выведем все ненулевые значения
             bool has_results = false;
-            for (size_t i = 0; i < result.size(); i += 3) {
-                if (result[i] == 0 && result[i+1] == 0 && result[i+2] == 0) continue;
-                std::cout << "Row " << (i/3) << ": " 
-                          << result[i] << " | " 
-                          << result[i+1] << " | " 
-                          << result[i+2] << "\n";
+            
+            if (tuple_size <= 1) {
+                // Скалярная агрегация
+                std::cout << result[0] << "\n";
                 has_results = true;
+            } else {
+                for (size_t i = 0; i < result.size(); i += tuple_size) {
+                    bool all_zero = true;
+                    for (size_t j = 0; j < tuple_size; ++j) {
+                        if (result[i + j] != 0) {
+                            all_zero = false;
+                            break;
+                        }
+                    }
+                    if (all_zero) continue;
+                    
+                    std::cout << "Row " << (i / tuple_size) << ": ";
+                    for (size_t j = 0; j < tuple_size; ++j) {
+                        std::cout << result[i + j];
+                        if (j < tuple_size - 1) std::cout << " | ";
+                    }
+                    std::cout << "\n";
+                    has_results = true;
+                }
             }
             if (!has_results) {
-                // Если нет групп (скалярная агрегация) или пустой ответ
-                std::cout << result[0] << "\n";
+                std::cout << "0\n";
             }
             std::cout << "--- End ---\n";
         }

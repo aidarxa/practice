@@ -15,6 +15,7 @@ struct ExecutionContext {
     sycl::queue* q_ = nullptr;
     std::unique_ptr<DynamicDeviceBuffer<unsigned long long>> result_buffer_;
     std::unordered_map<std::string, void*> buffers_;
+    size_t tuple_size_ = 1;
 
     template<typename T>
     T* getBuffer(const std::string& name) {
