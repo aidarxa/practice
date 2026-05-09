@@ -32,6 +32,8 @@ struct JITContext {
     // Counter for unique temporary OR-mask names ("mask_1", "mask_2", …)
     int mask_counter = 0;
 
+    std::string current_items_col;
+    
     // Counter used to generate unique kernel class names.
     int build_kernel_count = 0;
 

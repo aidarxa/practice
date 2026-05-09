@@ -267,19 +267,18 @@ std::unique_ptr<OperatorNode> QueryTranslator::translateFrom(const hsql::TableRe
         //   JOIN(JOIN(t1, t2), t3)
         case hsql::kTableCrossProduct: {
             if (!ref->list || ref->list->empty()) {
-                throw std::runtime_error(
-                    "QueryTranslator: kTableCrossProduct with empty list");
+                throw std::runtime_error("QueryTranslator: kTableCrossProduct with empty list");
             }
 
-            // Транслируем первую таблицу
+            // Транслируем первую таблицу (обычно это таблица фактов, например LINEORDER)
             std::unique_ptr<OperatorNode> root = translateFrom((*ref->list)[0]);
 
-            // Добавляем остальные через HashJoinNode (без условий, наивная фаза)
+            // Строим Right-Deep Tree: измерения всегда слева (build-side), факты справа (probe-side)
             for (std::size_t i = 1; i < ref->list->size(); ++i) {
                 auto rhs = translateFrom((*ref->list)[i]);
                 auto join = std::make_unique<HashJoinNode>(nullptr);
-                join->addChild(std::move(root));  // build-side (левый)
-                join->addChild(std::move(rhs));   // probe-side (правый)
+                join->addChild(std::move(rhs));   // build-side (левый потомок) - Измерение
+                join->addChild(std::move(root));  // probe-side (правый потомок) - Таблица фактов / поддерево
                 root = std::move(join);
             }
             return root;

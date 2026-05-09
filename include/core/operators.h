@@ -143,7 +143,6 @@ public:
             if (g->getType() != ExprType::COLUMN_REF) continue;
             const auto* col = static_cast<const ColumnRefExpr*>(g.get());
             const std::string& col_name = col->column_name;
-
             // Определяем таблицу по первому символу имени колонки (как в crystal/utils.h)
             std::string table_name = getTableName(col_name);
 

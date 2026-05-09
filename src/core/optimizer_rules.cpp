@@ -14,8 +14,11 @@ static void extractTableNamesImpl(const ExprNode* expr,
     switch (expr->getType()) {
         case ExprType::COLUMN_REF: {
             const auto* col = static_cast<const ColumnRefExpr*>(expr);
-            if (!col->table_name.empty())
-                out.insert(col->table_name);
+            std::string tbl = col->table_name;
+            if (tbl.empty()) {
+                tbl = getTableName(col->column_name); // МАГИЯ: Автоматическое определение таблицы
+            }
+            if (!tbl.empty()) out.insert(tbl);
             break;
         }
         case ExprType::OP_AND:
@@ -173,8 +176,38 @@ void PredicatePushdownRule::tryPushdown(std::unique_ptr<OperatorNode>& node) {
         }
     }
 
+    // НОВОЕ: Извлекаем кросс-табличные условия JOIN из remaining_preds
+    // НОВОЕ: Извлекаем кросс-табличные условия JOIN из remaining_preds
+    std::vector<std::unique_ptr<ExprNode>> new_remaining;
+    for (auto& cond : remaining_preds) {
+        if (cond && cond->getType() == ExprType::OP_EQ) {
+            auto* bin = static_cast<BinaryExpr*>(cond.get());
+            if (bin->left->getType() == ExprType::COLUMN_REF && bin->right->getType() == ExprType::COLUMN_REF) {
+                auto* left_col = static_cast<ColumnRefExpr*>(bin->left.get());
+                auto* right_col = static_cast<ColumnRefExpr*>(bin->right.get());
+                std::string lt = left_col->table_name.empty() ? getTableName(left_col->column_name) : left_col->table_name;
+                std::string rt = right_col->table_name.empty() ? getTableName(right_col->column_name) : right_col->table_name;
+
+                bool is_join = (left_tables.count(lt) && right_tables.count(rt)) ||
+                               (left_tables.count(rt) && right_tables.count(lt));
+
+                if (is_join) {
+                    if (join->join_condition) {
+                        join->join_condition = std::make_unique<BinaryExpr>(
+                            ExprType::OP_AND, std::move(join->join_condition), std::move(cond));
+                    } else {
+                        join->join_condition = std::move(cond);
+                    }
+                    continue; // Перенесено в HashJoinNode!
+                }
+            }
+        }
+        new_remaining.push_back(std::move(cond));
+    }
+    remaining_preds = std::move(new_remaining);
+    
     // If nothing could be pushed, restore and return
-    if (left_preds.empty() && right_preds.empty()) {
+    if (left_preds.empty() && right_preds.empty() && !join->join_condition) {
         // Rebuild predicate from remaining (all conditions)
         filter->predicate = buildAndChain(remaining_preds);
         return;

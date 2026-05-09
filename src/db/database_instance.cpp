@@ -1,4 +1,5 @@
 #include "db/database_instance.h"
+#include "core/catalog_cache.h"
 #include "crystal/utils.h"
 
 #include <iostream>
@@ -37,6 +38,20 @@ DatabaseInstance::~DatabaseInstance() {
 void DatabaseInstance::initCatalog() {
     catalog_ = std::make_shared<Catalog>();
 
+    // Инициализируем кэш (создаст папку meta рядом с исполняемым файлом)
+    db::CatalogCacheManager cache_manager("meta/catalog_cache.txt");
+
+    // Лямбда: берет список колонок и размер таблицы, получает стату и записывает
+    auto applyStats = [&](TableMetadata& table) {
+        int table_size = table.getSize(); // Возвращает LO_LEN, S_LEN и т.д.
+        for (const auto& col_name : table.getColumnNames()) {
+            db::CachedStats stats = cache_manager.getStatsForColumn(col_name, table_size);
+            if (stats.cardinality > 0) {
+                table.setColumnStats(col_name, {stats.min_val, stats.max_val, static_cast<uint64_t>(stats.cardinality)});
+            }
+        }
+    };
+
     // LINEORDER (fact)
     TableMetadata lo("LINEORDER",
                      {"lo_orderkey", "lo_linenumber", "lo_custkey", "lo_partkey",
@@ -45,6 +60,7 @@ void DatabaseInstance::initCatalog() {
                       "lo_ordtotalprice", "lo_discount", "lo_revenue",
                       "lo_supplycost", "lo_tax", "lo_commitdate", "lo_shipmode"},
                      LO_LEN, true);
+    applyStats(lo);
     catalog_->pushTableMetadata(lo);
 
     // SUPPLIER (dimension)
@@ -52,9 +68,7 @@ void DatabaseInstance::initCatalog() {
                     {"s_suppkey", "s_name", "s_address", "s_city", "s_nation",
                      "s_region", "s_phone"},
                     S_LEN, false);
-    s.setColumnStats("s_suppkey", {1, S_LEN, S_LEN});
-    s.setColumnStats("s_region", {0, 4, 5});
-    s.setColumnStats("s_nation", {0, 24, 25});
+    applyStats(s);
     catalog_->pushTableMetadata(s);
 
     // CUSTOMER (dimension)
@@ -62,9 +76,7 @@ void DatabaseInstance::initCatalog() {
                     {"c_custkey", "c_name", "c_address", "c_city", "c_nation",
                      "c_region", "c_phone", "c_mktsegment"},
                     C_LEN, false);
-    c.setColumnStats("c_custkey", {1, C_LEN, C_LEN});
-    c.setColumnStats("c_region", {0, 4, 5});
-    c.setColumnStats("c_nation", {0, 24, 25});
+    applyStats(c);
     catalog_->pushTableMetadata(c);
 
     // PART (dimension)
@@ -72,9 +84,7 @@ void DatabaseInstance::initCatalog() {
                     {"p_partkey", "p_name", "p_mfgr", "p_category", "p_brand1",
                      "p_color", "p_type", "p_size", "p_container"},
                     P_LEN, false);
-    p.setColumnStats("p_partkey", {1, P_LEN, P_LEN});
-    p.setColumnStats("p_category", {1, 25, 25});
-    p.setColumnStats("p_brand1", {1, 1000, 1000});
+    applyStats(p);
     catalog_->pushTableMetadata(p);
 
     // DDATE (dimension)
@@ -85,8 +95,7 @@ void DatabaseInstance::initCatalog() {
                      "d_lastdayinweekfl", "d_lastdayinmonthfl", "d_holidayfl",
                      "d_weekdayfl"},
                     D_LEN, false);
-    d.setColumnStats("d_datekey", {19920101, 19981230, D_LEN});
-    d.setColumnStats("d_year", {1992, 1998, 7});
+    applyStats(d);
     catalog_->pushTableMetadata(d);
 }
 
