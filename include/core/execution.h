@@ -17,6 +17,10 @@ struct ExecutionContext {
     std::unordered_map<std::string, void*> buffers_;
     size_t tuple_size_ = 1;
 
+    // Размер буфера результатов в элементах (устанавливается QueryEngine перед выполнением).
+    // DatabaseInstance использует это значение для copyToHost вместо хардкода 21000.
+    size_t expected_result_size_{0};
+
     template<typename T>
     T* getBuffer(const std::string& name) {
         auto it = buffers_.find(name);

@@ -20,9 +20,10 @@ DatabaseInstance::DatabaseInstance()
         std::make_unique<DynamicLibraryExecutor>()
     );
 
-    // Выделяем память для результатов
-    // 21000 - достаточный размер для SSB (7000 групп * 3 элемента)
-    ctx_->result_buffer_ = std::make_unique<DynamicDeviceBuffer<unsigned long long>>(q_, 21000);
+    // Создаём буфер с нулевой начальной ёмкостью.
+    // QueryEngine::executeQuery вызовет ensureCapacity с точным размером
+    // перед запуском каждого ядра (через expected_result_size_).
+    ctx_->result_buffer_ = std::make_unique<DynamicDeviceBuffer<unsigned long long>>(q_, 0);
 }
 
 DatabaseInstance::~DatabaseInstance() {
@@ -118,19 +119,21 @@ void DatabaseInstance::loadData() {
 }
 
 std::pair<std::vector<unsigned long long>, size_t> DatabaseInstance::executeQuery(const std::string& sql) {
-    // Очищаем буфер результатов перед каждым запуском
-    ctx_->result_buffer_->ensureCapacity(21000);
-    ctx_->result_buffer_->zero();
-
-    // Запускаем JIT и ядро
+    // QueryEngine::executeQuery самостоятельно вызовет ensureCapacity и zero
+    // на основе рассчитанного expected_result_size_.
     engine_->executeQuery(sql, ctx_.get());
 
-    // Ждем завершения всех GPU операций
+    // Ждём завершения всех GPU операций перед копированием на хост.
     q_.wait();
+
+    // Определяем фактическое количество элементов для копирования.
+    // expected_result_size_ устанавливается QueryEngine до запуска ядра.
+    size_t copy_size = ctx_->expected_result_size_;
+    if (copy_size == 0) copy_size = 1; // защита от нулевого размера
 
     // Копируем результаты на хост
     std::vector<unsigned long long> h_result;
-    ctx_->result_buffer_->copyToHost(h_result, 21000);
+    ctx_->result_buffer_->copyToHost(h_result, copy_size);
 
     return {h_result, ctx_->tuple_size_};
 }

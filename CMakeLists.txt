@@ -26,8 +26,10 @@ add_executable(db_cli
     src/main.cpp
     src/cli/meta_command_handler.cpp
     src/cli/terminal_app.cpp
-    src/core/optimizer.cpp
     src/core/execution.cpp
+    src/core/translator.cpp
+    src/core/optimizer_rules.cpp
+    src/core/visitor.cpp
     src/db/database_instance.cpp
 )
 
@@ -51,7 +53,9 @@ add_sycl_to_target(TARGET db_cli)
 # --- Test target (AST → CodeGen, no SYCL) ---
 add_executable(test_optimizer
     test/test_optimizer.cpp
-    src/core/optimizer.cpp
+    src/core/translator.cpp
+    src/core/optimizer_rules.cpp
+    src/core/visitor.cpp
 )
 
 target_include_directories(test_optimizer PRIVATE
@@ -68,3 +72,22 @@ target_link_libraries(test_optimizer PRIVATE
 )
 
 add_sycl_to_target(TARGET test_optimizer)
+
+# --- Test target (Expression Tree + Operator Tree + Translator) ---
+add_executable(test_translator
+    test/test_translator.cpp
+    src/core/translator.cpp
+)
+
+target_include_directories(test_translator PRIVATE
+    "${CMAKE_SOURCE_DIR}/include"
+    "${CMAKE_SOURCE_DIR}/deps/include"
+)
+
+target_link_directories(test_translator PRIVATE
+    "${CMAKE_SOURCE_DIR}/deps/lib"
+)
+
+target_link_libraries(test_translator PRIVATE
+    sqlparser
+)

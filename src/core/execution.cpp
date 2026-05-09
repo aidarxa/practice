@@ -1,5 +1,7 @@
 #include "core/execution.h"
-#include "core/optimizer.h"
+#include "core/optimizer_rules.h"
+#include "core/translator.h"
+#include "core/visitor.h"
 
 #include <cstdlib>
 #include <dlfcn.h>
@@ -91,47 +93,109 @@ QueryEngine::QueryEngine(std::shared_ptr<Catalog> catalog,
       compiler_(std::move(compiler)),
       executor_(std::move(executor)) {}
 
-std::string QueryEngine::generateQueryCode(const std::string& sql) {
-    hsql::SQLParserResult result;
+// ============================================================================
+// Helpers
+// ============================================================================
+
+// Рекурсивный поиск AggregateNode в корне дерева (глубина ≤ 2, он всегда сверху).
+static const AggregateNode* findAggregateNode(const OperatorNode* node) {
+    if (!node) return nullptr;
+    if (node->getType() == OperatorType::AGGREGATE) {
+        return static_cast<const AggregateNode*>(node);
+    }
+    // AggregateNode всегда является корнем, но на случай вложенности — проверяем детей
+    for (const auto& child : node->getChildren()) {
+        const AggregateNode* found = findAggregateNode(child.get());
+        if (found) return found;
+    }
+    return nullptr;
+}
+
+// Парсинг SQL → SelectStatement. Бросает runtime_error при ошибке.
+static hsql::SelectStatement* parseSql(const std::string& sql,
+                                        hsql::SQLParserResult& result) {
     hsql::SQLParser::parse(sql, &result);
     if (!result.isValid() || result.size() == 0) {
         throw std::runtime_error("SQL syntax error: " + std::string(result.errorMsg()));
     }
-
-    auto* ast = const_cast<hsql::SelectStatement*>(
+    return const_cast<hsql::SelectStatement*>(
         static_cast<const hsql::SelectStatement*>(result.getStatement(0)));
-
-    Planner planner(catalog_);
-    auto lp = planner.buildLogicalPlan(ast);
-
-    QueryOptimizer optimizer(catalog_);
-    optimizer.optimize(lp);
-
-    auto pp = planner.buildPhysicalPlan(lp);
-
-    CodeGenerator cg;
-    return cg.generate(*pp);
 }
 
+// Трансляция + оптимизация AST → оптимизированное дерево операторов.
+static std::unique_ptr<OperatorNode> buildOptimizedTree(
+        const hsql::SelectStatement* ast) {
+    QueryTranslator translator;
+    auto naive_tree = translator.translate(ast);
+    Optimizer optimizer;
+    return optimizer.optimize(std::move(naive_tree));
+}
+
+// ============================================================================
+// generateQueryCode — новый конвейер (Translator → Optimizer → JITVisitor)
+// ============================================================================
+std::string QueryEngine::generateQueryCode(const std::string& sql) {
+    hsql::SQLParserResult parse_result;
+    auto* ast = parseSql(sql, parse_result);
+
+    auto optimized_tree = buildOptimizedTree(ast);
+
+    JITContext jit_ctx;
+    JITOperatorVisitor visitor(jit_ctx, *catalog_);
+    optimized_tree->accept(visitor);
+
+    return visitor.generateCode();
+}
+
+// ============================================================================
+// executeQuery — новый конвейер
+// ============================================================================
 void QueryEngine::executeQuery(const std::string& sql, ExecutionContext* ctx) {
     if (sql.empty()) {
         throw std::runtime_error("Empty query");
     }
 
-    // Hash the query for caching
-    std::string query_hash = "query_" + std::to_string(std::hash<std::string>{}(sql));
+    // ШАГ 1: Парсинг SQL
+    hsql::SQLParserResult parse_result;
+    auto* ast = parseSql(sql, parse_result);
 
+    // ШАГ 2-3: Трансляция + оптимизация (всегда, включая cache hit — дёшево)
+    auto optimized_tree = buildOptimizedTree(ast);
+
+    // ШАГ 4: Расчёт expected_result_size (нужен до выполнения для ensureCapacity)
+    const AggregateNode* agg_node = findAggregateNode(optimized_tree.get());
+    if (agg_node) {
+        ctx->expected_result_size_ = agg_node->calculateResultSize(*catalog_);
+    } else {
+        ctx->expected_result_size_ = 1;
+    }
+
+    // Гарантируем достаточную ёмкость буфера и обнуляем его перед запуском ядра.
+    // DynamicDeviceBuffer::ensureCapacity реаллоцирует только при нехватке места.
+    ctx->result_buffer_->ensureCapacity(ctx->expected_result_size_);
+    ctx->result_buffer_->zero();            // ctx->result_buffer_ почему-то имеет capacity 31500 при expected_result_size_ = 21000
+
+
+    // ШАГ 5: Проверка кеша
+    std::string query_hash = "query_" + std::to_string(std::hash<std::string>{}(sql));
     auto cached_lib = cache_->get(query_hash);
     if (cached_lib.has_value()) {
+        // Cache HIT: размер уже рассчитан, буфер подготовлен — просто выполняем
         executor_->execute(cached_lib.value(), ctx);
         return;
     }
 
-    // Cache MISS: generate, compile, then execute
-    std::string source_code = generateQueryCode(sql);
+    // ШАГ 6: Cache MISS — JIT генерация кода
+    JITContext jit_ctx;
+    JITOperatorVisitor visitor(jit_ctx, *catalog_);
+    optimized_tree->accept(visitor);
+    std::string source_code = visitor.generateCode();
+
+    // ШАГ 7: Компиляция → .so
     std::string lib_path = compiler_->compile(source_code, query_hash);
     cache_->put(query_hash, lib_path);
 
+    // ШАГ 8: Выполнение
     executor_->execute(lib_path, ctx);
 }
 
