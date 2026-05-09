@@ -60,6 +60,14 @@ inline void InitFlags(int (&flags)[ITEMS_PER_THREAD]) {
     }
 }
 
+template <int BLOCK_THREADS, int ITEMS_PER_THREAD>
+inline void InitFlagsZero(int (&flags)[ITEMS_PER_THREAD]) {
+    #pragma unroll
+    for (int i = 0; i < ITEMS_PER_THREAD; ++i) {
+        flags[i] = 0;
+    }
+}
+
 template <typename T,typename Predicate, int BLOCK_THREADS, int ITEMS_PER_THREAD>
 inline void BlockPredDirect(size_t tid, T (&items)[ITEMS_PER_THREAD],int (&flags)[ITEMS_PER_THREAD], Predicate pred) {
     #pragma unroll
@@ -250,5 +258,20 @@ inline void BlockPredOrNEq(size_t tid, T (&items)[ITEMS_PER_THREAD],int (&flags)
     NotEqual<T> pred(compare);
     BlockPredOr<T,NotEqual<T>,BLOCK_THREADS,ITEMS_PER_THREAD>(
         tid,items,flags,pred,num_items);
+}
+template <int BLOCK_THREADS, int ITEMS_PER_THREAD>
+inline void BlockApplyMaskOr(size_t tid, int (&target_mask)[ITEMS_PER_THREAD], int (&source_mask)[ITEMS_PER_THREAD]) {
+    #pragma unroll
+    for (int i = 0; i < ITEMS_PER_THREAD; ++i) {
+        target_mask[i] = target_mask[i] || source_mask[i];
+    }
+}
+
+template <int BLOCK_THREADS, int ITEMS_PER_THREAD>
+inline void BlockApplyMaskAnd(size_t tid, int (&target_mask)[ITEMS_PER_THREAD], int (&source_mask)[ITEMS_PER_THREAD]) {
+    #pragma unroll
+    for (int i = 0; i < ITEMS_PER_THREAD; ++i) {
+        target_mask[i] = target_mask[i] && source_mask[i];
+    }
 }
 // -------------------------------------------PREDICATE----------------------------------------------

@@ -1,0 +1,1 @@
+test_optimizer_v2: /home/aidar/practice/test/test_optimizer.cpp:392: void test_optimizer_v2_pushdown(): Assertion `found_pushed_filter' failed.

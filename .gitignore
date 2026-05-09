@@ -2,3 +2,6 @@ build/
 .vscode/
 data/10/
 .cache
+deps/
+sql-parser/*
+test/queries/result/

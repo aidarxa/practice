@@ -1,0 +1,9 @@
+Result: 4474878955766
+Total time: 335.112 ms
+Result: 4474878955766
+Total time: 2.36995 ms
+Result: 4474878955766
+Total time: 2.37175 ms
+Result: 4474878955766
+Total time: 2.37645 ms
+Mean time: 2.37272 ms

@@ -29,6 +29,15 @@ inline int index_of(std::string *arr, int len, std::string val) {
   return -1;
 }
 
+inline std::string getTableName(std::string col_name) {
+  if(col_name[0] == 'l') return "LINEORDER";
+  if(col_name[0] == 's') return "SUPPLIER";
+  if(col_name[0] == 'c') return "CUSTOMER";
+  if(col_name[0] == 'p') return "PART";
+  if(col_name[0] == 'd') return "DDATE";
+  return "";
+}
+
 inline std::string lookup(std::string col_name) {
   std::string lineorder[] = {
       "lo_orderkey", "lo_linenumber",    "lo_custkey",       "lo_partkey",
