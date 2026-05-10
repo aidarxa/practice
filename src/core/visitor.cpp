@@ -113,6 +113,51 @@ void JITExprVisitor::ensureLoaded(const std::string& col, const std::string& reg
 // ============================================================================
 
 void JITExprVisitor::visitComparison(const BinaryExpr& node) {
+    // ===== ВЕТКА: Theta Join (COLUMN OP COLUMN) =====
+    if (node.left && node.left->getType() == ExprType::COLUMN_REF &&
+        node.right && node.right->getType() == ExprType::COLUMN_REF) {
+
+        const auto* left_col  = static_cast<const ColumnRefExpr*>(node.left.get());
+        const auto* right_col = static_cast<const ColumnRefExpr*>(node.right.get());
+        const std::string col1_name = left_col->column_name;
+        const std::string col2_name = right_col->column_name;
+
+        bool is_build = (&stream_ != &ctx_.probe_kernel);
+
+        auto load_col_if_needed = [&](const std::string& cname, const std::string& reg) {
+            if (!ctx_.loaded_in_probe.count(cname)) {
+                ctx_.loaded_in_probe.insert(cname);
+                ctx_.col_to_reg[cname] = reg;
+                ctx_.external_columns.insert("d_" + cname);
+                stream_ << "            BlockLoad<int, BLOCK_THREADS, ITEMS_PER_THREAD>("
+                        << "d_" << cname << " + tile_offset, tid, tile_offset, "
+                        << reg << ", num_tile_items);\n";
+            }
+        };
+
+        // Загрузка обеих колонок
+        load_col_if_needed(col1_name, col1_name);
+        load_col_if_needed(col2_name, col2_name);
+
+        // Выбор префикса BlockPred / BlockPredA / BlockPredOr
+        std::string prefix;
+        if (is_or_context_) {
+            prefix = *first_pred_ ? "BlockPred" : "BlockPredOr";
+        } else {
+            prefix = *first_pred_ ? "BlockPred" : "BlockPredA";
+        }
+        if (*first_pred_) *first_pred_ = false;
+
+        // Генерация вызова
+        stream_ << "            " << prefix << predSuffix(node.op_type) << "_Cols"
+                << "<int, BLOCK_THREADS, ITEMS_PER_THREAD>(tid, " 
+                << col1_name << ", " << col2_name << ", "
+                << target_mask_ << ", num_tile_items);\n";
+        
+        return;
+    }
+
+    // ===== ВЕТКА: COLUMN OP LITERAL =====
     const ExprNode* col_node = nullptr;
     const ExprNode* lit_node = nullptr;
 
@@ -172,31 +217,45 @@ void JITExprVisitor::visitComparison(const BinaryExpr& node) {
 
 void JITExprVisitor::visit(const BinaryExpr& node) {
     if (node.op_type == ExprType::OP_AND) {
-        // AND: both children accumulate into the same target_mask_
-        if (node.left)  node.left->accept(*this);
-        if (node.right) node.right->accept(*this);
-
+        if (!is_or_context_) {
+            node.left->accept(*this);
+            node.right->accept(*this);
+        } else {
+            // AND внутри OR: создаем новую маску и применяем ее
+            std::string new_mask = ctx_.getNewMask();
+            stream_ << "            int " << new_mask << "[ITEMS_PER_THREAD];\n";
+            stream_ << "            InitFlags<BLOCK_THREADS, ITEMS_PER_THREAD>(" << new_mask << ");\n";
+            
+            bool first_pred = true;
+            JITExprVisitor and_visitor(ctx_, stream_, new_mask, false, &first_pred);
+            node.left->accept(and_visitor);
+            node.right->accept(and_visitor);
+            
+            stream_ << "            BlockApplyMaskOr<BLOCK_THREADS, ITEMS_PER_THREAD>(tid, " 
+                    << target_mask_ << ", " << new_mask << ");\n";
+            if (first_pred_ && *first_pred_) *first_pred_ = false;
+        }
     } else if (node.op_type == ExprType::OP_OR) {
-        // OR: create a new temporary mask, visit children into it,
-        // then AND the temp mask into target_mask_.
-        std::string new_mask = ctx_.getNewMask();
-        stream_ << "            int " << new_mask << "[ITEMS_PER_THREAD];\n";
-        stream_ << "            InitFlagsZero<BLOCK_THREADS, ITEMS_PER_THREAD>("
-                << new_mask << ");\n";
-
-        // Children write into new_mask using OR-accumulation
-        JITExprVisitor or_visitor(ctx_, stream_, new_mask,
-                                  /*is_or_context=*/true,
-                                  /*first_pred=*/nullptr);
-        if (node.left)  node.left->accept(or_visitor);
-        if (node.right) node.right->accept(or_visitor);
-
-        // Apply the OR-mask to our parent mask
-        stream_ << "            BlockApplyMaskAnd<BLOCK_THREADS, ITEMS_PER_THREAD>(tid, "
-                << target_mask_ << ", " << new_mask << ");\n";
-
+        if (is_or_context_) {
+            // OR внутри OR: Сплющиваем! Не создаем новую маску, пишем напрямую в target_mask_
+            node.left->accept(*this);
+            node.right->accept(*this);
+        } else {
+            // OR внутри AND: выделяем один накопитель для всей цепочки OR
+            std::string new_mask = ctx_.getNewMask();
+            stream_ << "            int " << new_mask << "[ITEMS_PER_THREAD];\n";
+            stream_ << "            InitFlagsZero<BLOCK_THREADS, ITEMS_PER_THREAD>(" << new_mask << ");\n";
+            
+            bool first_pred = true;
+            JITExprVisitor or_visitor(ctx_, stream_, new_mask, true, &first_pred);
+            node.left->accept(or_visitor);
+            node.right->accept(or_visitor);
+            
+            stream_ << "            BlockApplyMaskAnd<BLOCK_THREADS, ITEMS_PER_THREAD>(tid, " 
+                    << target_mask_ << ", " << new_mask << ");\n";
+            if (first_pred_ && *first_pred_) *first_pred_ = false;
+        }
     } else {
-        // Comparison operator (EQ, LT, GT, GTE, LTE, NEQ)
         visitComparison(node);
     }
 }
@@ -401,8 +460,9 @@ void JITOperatorVisitor::visit(const HashJoinNode& node) {
     if (!left_tables.empty()) dim_table = *left_tables.begin();
 
     std::string pk_col, fk_col;
+    std::vector<const ExprNode*> secondary_conditions;
+
     if (node.join_condition) {
-        auto tables = extractTableNames(node.join_condition.get());
         std::function<void(const ExprNode*)> findCols = [&](const ExprNode* e) {
             if (!e) return;
             if (e->getType() == ExprType::OP_EQ) {
@@ -413,16 +473,47 @@ void JITOperatorVisitor::visit(const HashJoinNode& node) {
                     const auto* rc = static_cast<const ColumnRefExpr*>(bin->right.get());
                     std::string lt = getTableName(lc->column_name);
                     std::string rt = getTableName(rc->column_name);
-                    if (lt == dim_table) { pk_col = lc->column_name; fk_col = rc->column_name; }
-                    else if (rt == dim_table) { pk_col = rc->column_name; fk_col = lc->column_name; }
+
+                    bool is_primary = false;
+                    // ИСПРАВЛЕНИЕ: Главный ключ для Hash Table ДОЛЖЕН содержать слово "key"
+                    if (lt == dim_table && lc->column_name.find("key") != std::string::npos) {
+                        pk_col = lc->column_name; fk_col = rc->column_name; is_primary = true;
+                    } else if (rt == dim_table && rc->column_name.find("key") != std::string::npos) {
+                        pk_col = rc->column_name; fk_col = lc->column_name; is_primary = true;
+                    }
+                    
+                    if (!is_primary) {
+                        secondary_conditions.push_back(e); // Это Theta Join!
+                    }
+                } else {
+                    secondary_conditions.push_back(e);
                 }
             } else if (e->getType() == ExprType::OP_AND) {
                 const auto* bin = static_cast<const BinaryExpr*>(e);
                 findCols(bin->left.get());
                 findCols(bin->right.get());
+            } else {
+                secondary_conditions.push_back(e);
             }
         };
         findCols(node.join_condition.get());
+    }
+
+    // ВАЖНО: Регистрируем колонки из вторичных условий ДО генерации Build-фазы,
+    // чтобы emitBuildKernel знал, что s_nation и c_nation нужно вытащить через Variant 2!
+    std::function<void(const ExprNode*)> extract_probe_cols = [&](const ExprNode* e) {
+        if (!e) return;
+        if (e->getType() == ExprType::COLUMN_REF) {
+            const auto* col = static_cast<const ColumnRefExpr*>(e);
+            ctx_.col_to_reg[col->column_name] = col->column_name;
+        } else if (e->getType() >= ExprType::OP_AND) {
+            const auto* bin = static_cast<const BinaryExpr*>(e);
+            extract_probe_cols(bin->left.get());
+            extract_probe_cols(bin->right.get());
+        }
+    };
+    for (const auto* cond : secondary_conditions) {
+        extract_probe_cols(cond);
     }
 
     const FilterNode* filter = nullptr;
@@ -453,13 +544,11 @@ void JITOperatorVisitor::visit(const HashJoinNode& node) {
         ctx_.build_kernels << temp_build.str();
     }
 
-    // ИСПРАВЛЕНИЕ: Запоминаем индекс хеш-таблицы ПЕРЕД обходом правой ветви (Right-Deep)
     size_t build_idx = build_infos_.size() - 1;
 
     active_stream_ = &ctx_.probe_kernel;
     right_child->accept(*this);
 
-    // ИСПРАВЛЕНИЕ: Используем сохраненный индекс для Probe
     if (build_idx < build_infos_.size()) {
         const auto& bi = build_infos_[build_idx];
         if (!bi.fk_col.empty()) {
@@ -468,7 +557,6 @@ void JITOperatorVisitor::visit(const HashJoinNode& node) {
                               << "d_" << bi.fk_col << " + tile_offset, tid, tile_offset, items, num_tile_items);\n";
 
             if (bi.variant == 2 && !bi.val_col.empty()) {
-                // Отмечаем колонку как загруженную, чтобы AggregateNode не грузил её повторно!
                 ctx_.loaded_in_probe.insert(bi.val_col);
                 ctx_.col_to_reg[bi.val_col] = bi.val_col;
 
@@ -481,6 +569,12 @@ void JITOperatorVisitor::visit(const HashJoinNode& node) {
                                   << "tid, items, flags, "
                                   << bi.ht_name << ", " << bi.ht_size_expr
                                   << ", " << bi.key_mins << ", num_tile_items);\n";
+            }
+            // ИСПРАВЛЕНИЕ: ВЫПОЛНЯЕМ ВТОРИЧНЫЕ УСЛОВИЯ (THETA JOIN) НАПРЯМУЮ ПОСЛЕ PROBE!
+            for (const auto* cond : secondary_conditions) {
+                bool first_pred = false; // Важно: мы накладываем AND поверх существующих flags
+                JITExprVisitor expr_vis(ctx_, ctx_.probe_kernel, "flags", false, &first_pred);
+                cond->accept(expr_vis);
             }
         }
     }
