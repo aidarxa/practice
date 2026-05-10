@@ -101,6 +101,9 @@ public:
     void visit(const LiteralFloatExpr& node) override;
     void visit(const BinaryExpr&      node) override;
 
+    // Translates AST expressions into inline C++ code
+    std::string translateInlineExpr(const ExprNode* expr, bool is_probe);
+
 private:
     JITContext&        ctx_;
     std::stringstream& stream_;

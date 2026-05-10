@@ -109,6 +109,50 @@ void JITExprVisitor::ensureLoaded(const std::string& col, const std::string& reg
 }
 */
 // ============================================================================
+// JITExprVisitor — translateInlineExpr
+// ============================================================================
+
+std::string JITExprVisitor::translateInlineExpr(const ExprNode* expr, bool is_probe) {
+    if (!expr) return "";
+
+    switch (expr->getType()) {
+        case ExprType::COLUMN_REF: {
+            const auto* col = static_cast<const ColumnRefExpr*>(expr);
+            std::string col_name = col->column_name;
+            
+            if (is_probe && !ctx_.loaded_in_probe.count(col_name)) {
+                ctx_.loaded_in_probe.insert(col_name);
+                ctx_.col_to_reg[col_name] = col_name;
+                ctx_.external_columns.insert("d_" + col_name);
+                stream_ << "            BlockLoad<int, BLOCK_THREADS, ITEMS_PER_THREAD>("
+                        << "d_" << col_name << " + tile_offset, tid, tile_offset, "
+                        << col_name << ", num_tile_items);\n";
+            }
+            return col_name + "[i]";
+        }
+        case ExprType::LITERAL_INT:
+            return std::to_string(static_cast<const LiteralIntExpr*>(expr)->value);
+        case ExprType::LITERAL_FLOAT:
+            return std::to_string(static_cast<const LiteralFloatExpr*>(expr)->value);
+            
+        case ExprType::OP_ADD:
+            return "db::safe_add(" + translateInlineExpr(static_cast<const BinaryExpr*>(expr)->left.get(), is_probe) + ", " 
+                                   + translateInlineExpr(static_cast<const BinaryExpr*>(expr)->right.get(), is_probe) + ")";
+        case ExprType::OP_SUB:
+            return "db::safe_sub(" + translateInlineExpr(static_cast<const BinaryExpr*>(expr)->left.get(), is_probe) + ", " 
+                                   + translateInlineExpr(static_cast<const BinaryExpr*>(expr)->right.get(), is_probe) + ")";
+        case ExprType::OP_MUL:
+            return "db::safe_mul(" + translateInlineExpr(static_cast<const BinaryExpr*>(expr)->left.get(), is_probe) + ", " 
+                                   + translateInlineExpr(static_cast<const BinaryExpr*>(expr)->right.get(), is_probe) + ")";
+        case ExprType::OP_DIV:
+            return "db::safe_div(" + translateInlineExpr(static_cast<const BinaryExpr*>(expr)->left.get(), is_probe) + ", " 
+                                   + translateInlineExpr(static_cast<const BinaryExpr*>(expr)->right.get(), is_probe) + ")";
+        default: 
+            return "";
+    }
+}
+
+// ============================================================================
 // JITExprVisitor — visitComparison
 // ============================================================================
 
@@ -158,6 +202,51 @@ void JITExprVisitor::visitComparison(const BinaryExpr& node) {
     }
 
     // ===== ВЕТКА: COLUMN OP LITERAL =====
+    bool is_build = (&stream_ != &ctx_.probe_kernel);
+
+    // ВЕТКА: Probe Phase Inline Math
+    if (!is_build) {
+        std::string left_expr = translateInlineExpr(node.left.get(), true);
+        std::string right_expr = translateInlineExpr(node.right.get(), true);
+        
+        std::string func;
+        switch(node.op_type) {
+            case ExprType::OP_LT:  func = "db::safe_lt"; break;
+            case ExprType::OP_GT:  func = "db::safe_gt"; break;
+            case ExprType::OP_LTE: func = "db::safe_lte"; break;
+            case ExprType::OP_GTE: func = "db::safe_gte"; break;
+            case ExprType::OP_EQ:  func = "db::safe_eq"; break;
+            case ExprType::OP_NEQ: func = "db::safe_neq"; break;
+            default: return;
+        }
+
+        std::string condition = func + "(" + left_expr + ", " + right_expr + ")";
+
+        stream_ << "            #pragma unroll\n"
+                << "            for (int i = 0; i < ITEMS_PER_THREAD; ++i) {\n"
+                << "                if (tid + BLOCK_THREADS * i < num_tile_items) {\n";
+        
+        if (is_or_context_) {
+            if (*first_pred_) {
+                stream_ << "                    " << target_mask_ << "[i] = " << condition << ";\n";
+                *first_pred_ = false;
+            } else {
+                stream_ << "                    " << target_mask_ << "[i] = " << target_mask_ << "[i] || " << condition << ";\n";
+            }
+        } else {
+            if (*first_pred_) {
+                stream_ << "                    " << target_mask_ << "[i] = " << condition << ";\n";
+                *first_pred_ = false;
+            } else {
+                stream_ << "                    " << target_mask_ << "[i] = " << target_mask_ << "[i] && " << condition << ";\n";
+            }
+        }
+        
+        stream_ << "                }\n            }\n";
+        return;
+    }
+
+    // ВЕТКА: Build Phase (COLUMN OP LITERAL ONLY)
     const ExprNode* col_node = nullptr;
     const ExprNode* lit_node = nullptr;
 
@@ -175,27 +264,15 @@ void JITExprVisitor::visitComparison(const BinaryExpr& node) {
         lit_value = std::to_string(static_cast<const LiteralIntExpr*>(lit_node)->value);
     } else { lit_value = std::to_string(static_cast<const LiteralFloatExpr*>(lit_node)->value); }
 
-    bool is_build = (&stream_ != &ctx_.probe_kernel);
-    std::string reg_name = is_build ? "items" : col_name;
+    std::string reg_name = "items";
 
-    if (is_build) {
-        // ОПТИМИЗАЦИЯ: Избегаем повторных загрузок в items
-        if (ctx_.current_items_col != col_name) {
-            ctx_.external_columns.insert("d_" + col_name);
-            stream_ << "            BlockLoad<int, BLOCK_THREADS, ITEMS_PER_THREAD>("
-                    << "d_" << col_name << " + tile_offset, tid, tile_offset, "
-                    << reg_name << ", num_tile_items);\n";
-            ctx_.current_items_col = col_name; // Запоминаем!
-        }
-    } else {
-        if (!ctx_.loaded_in_probe.count(col_name)) {
-            ctx_.loaded_in_probe.insert(col_name);
-            ctx_.col_to_reg[col_name] = col_name;
-            ctx_.external_columns.insert("d_" + col_name);
-            stream_ << "            BlockLoad<int, BLOCK_THREADS, ITEMS_PER_THREAD>("
-                    << "d_" << col_name << " + tile_offset, tid, tile_offset, "
-                    << reg_name << ", num_tile_items);\n";
-        }
+    // ОПТИМИЗАЦИЯ: Избегаем повторных загрузок в items
+    if (ctx_.current_items_col != col_name) {
+        ctx_.external_columns.insert("d_" + col_name);
+        stream_ << "            BlockLoad<int, BLOCK_THREADS, ITEMS_PER_THREAD>("
+                << "d_" << col_name << " + tile_offset, tid, tile_offset, "
+                << reg_name << ", num_tile_items);\n";
+        ctx_.current_items_col = col_name; // Запоминаем!
     }
 
     std::string prefix;
@@ -297,12 +374,28 @@ void JITOperatorVisitor::visit(const TableScanNode& /*node*/) {
 // ============================================================================
 
 void JITOperatorVisitor::visit(const FilterNode& node) {
-    // 1. Generate code for children first (TableScan, sub-joins, etc.)
+    // 1. Предварительная регистрация колонок для Variant 2
+    if (node.predicate) {
+        std::function<void(const ExprNode*)> extract_cols = [&](const ExprNode* e) {
+            if (!e) return;
+            if (e->getType() == ExprType::COLUMN_REF) {
+                const auto* col = static_cast<const ColumnRefExpr*>(e);
+                ctx_.col_to_reg[col->column_name] = col->column_name;
+            } else if (e->getType() >= ExprType::OP_AND) {
+                const auto* bin = static_cast<const BinaryExpr*>(e);
+                extract_cols(bin->left.get());
+                extract_cols(bin->right.get());
+            }
+        };
+        extract_cols(node.predicate.get());
+    }
+
+    // 2. Generate code for children first (TableScan, sub-joins, etc.)
     for (const auto& child : node.getChildren()) {
         child->accept(*this);
     }
 
-    // 2. Generate predicate filtering code using JITExprVisitor
+    // 3. Generate predicate filtering code using JITExprVisitor
     if (node.predicate) {
         bool* first_flag = nullptr;
         if (!in_build_kernel_) {
@@ -570,6 +663,7 @@ void JITOperatorVisitor::visit(const HashJoinNode& node) {
                                   << bi.ht_name << ", " << bi.ht_size_expr
                                   << ", " << bi.key_mins << ", num_tile_items);\n";
             }
+            probe_first_pred_ = false; // JOIN обновил флаги!
             // ИСПРАВЛЕНИЕ: ВЫПОЛНЯЕМ ВТОРИЧНЫЕ УСЛОВИЯ (THETA JOIN) НАПРЯМУЮ ПОСЛЕ PROBE!
             for (const auto* cond : secondary_conditions) {
                 bool first_pred = false; // Важно: мы накладываем AND поверх существующих flags
@@ -780,8 +874,16 @@ void JITOperatorVisitor::visit(const AggregateNode& node) {
             
             // Транслируем математику агрегации с флагом cast_to_ull = true
             // Это защищает нас от 32-битного Integer Overflow перед умножением
-            std::string agg_val = translateMathExpr(
-                node.aggregates[a].agg_expr.get(), ctx_.col_to_reg, true);
+            std::string agg_val = "1";
+            // Проверяем тип функции. Если это SUM и есть выражение - генерируем математику.
+            if (node.aggregates[a].func_name == "SUM" && node.aggregates[a].agg_expr) {
+                agg_val = translateMathExpr(node.aggregates[a].agg_expr.get(), ctx_.col_to_reg, true);
+            } 
+            // Если это COUNT, agg_val остается "1" независимо от наличия аргумента 
+            // (предполагается, что на данном этапе мы не фильтруем NULL значения).
+            else if (node.aggregates[a].func_name == "COUNT") {
+                agg_val = "1";
+            }
 
             *active_stream_ << "                    sycl::atomic_ref<unsigned long long, "
                             << "sycl::memory_order::relaxed, sycl::memory_scope::device, "
@@ -813,9 +915,13 @@ void JITOperatorVisitor::visit(const AggregateNode& node) {
             }
         }
 
-        std::string agg_expr = "0";
-        if (!node.aggregates.empty() && node.aggregates[0].agg_expr) {
-            agg_expr = translateMathExpr(node.aggregates[0].agg_expr.get(), ctx_.col_to_reg, true);
+        std::string agg_expr = "1";
+        if (!node.aggregates.empty()) {
+            if (node.aggregates[0].func_name == "SUM" && node.aggregates[0].agg_expr) {
+                agg_expr = translateMathExpr(node.aggregates[0].agg_expr.get(), ctx_.col_to_reg, true);
+            } else if (node.aggregates[0].func_name == "COUNT") {
+                agg_expr = "1";
+            }
         }
 
         *active_stream_ << "\n            unsigned long long sum = 0;\n";
@@ -857,7 +963,8 @@ std::string JITOperatorVisitor::generateCode() const {
     code << "#include \"crystal/load.h\"\n";
     code << "#include \"crystal/pred.h\"\n";
     code << "#include \"crystal/join.h\"\n";
-    code << "#include \"crystal/utils.h\"\n\n";
+    code << "#include \"crystal/utils.h\"\n";
+    code << "#include \"core/inline_math.h\"\n\n";
     code << "using namespace sycl;\n\n";
     code << "constexpr int BLOCK_THREADS = 128;\n";
     code << "constexpr int ITEMS_PER_THREAD = 4;\n";

@@ -359,7 +359,7 @@ std::unique_ptr<OperatorNode> QueryTranslator::translate(const hsql::SelectState
                 if (!sel || !sel->isType(hsql::kExprFunctionRef)) continue;
 
                 std::string func = sel->name ? std::string(sel->name) : "SUM";
-
+                std::transform(func.begin(), func.end(), func.begin(), ::toupper);
                 // Аргумент агрегатной функции
                 std::unique_ptr<ExprNode> agg_expr;
                 if (sel->exprList && !sel->exprList->empty()) {

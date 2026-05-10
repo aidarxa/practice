@@ -1,111 +1,102 @@
-Техническое Задание (Часть 3/3): Интеграция Конвейера и Динамическое Управление Памятью
+TODO 3: Conditional Probe и Поздняя Фильтрация (Уровень 3)
 
-Роль и задача:
-Это финальный этап архитектурного рефакторинга нашей СУБД. У нас уже готовы абстрактные деревья (Expression Tree, Operator Tree), Транслятор, Оптимизатор с правилом Predicate Pushdown и JIT-кодогенератор (паттерн Visitor).
+Цель: Поддержать кросс-табличные условия внутри OR (Запрос 2) и соединения таблиц, где условие JOIN само является OR-выражением (Запрос 1: lo_orderdate = d_datekey OR lo_commitdate = d_datekey).
 
-Твоя задача на этом этапе — собрать все эти модули в единый рабочий конвейер в QueryEngine::processQuery и решить критическую проблему управления памятью (из-за которой мы ловили исключения кучи AdaptiveCPP в сложных запросах типа SSB Q4.3).
-Глава 6. Расчет размера буфера результатов (Dynamic Sizing)
+Суть проблемы: 1. Классический HashJoinNode умеет делать только строгое зондирование (Probe) по одному внешнему ключу (fk_col).
+2. Сложные OR-предикаты, затрагивающие несколько измерений сразу, не могут быть спущены (Pushdown) ни в одну из веток. Они остаются "висеть" наверху дерева и должны вычисляться после того, как все хеш-таблицы пробиты, но до агрегации.
+Шаг 3.1: Адаптация FilterNode для "Поздней фильтрации" (Post-Probe)
 
-Раньше мы выделяли жестко захардкоженные 21000 * 4 байт, что приводило к Segfault на GPU при больших группировках. Теперь размер должен вычисляться динамически на основе метаданных Каталога и структуры AggregateNode.
-6.1 Модификация AggregateNode
+Благодаря тому, что вы грамотно спроектировали JITOperatorVisitor, этот шаг почти готов, если вы реализовали TODO 2 (Inline JIT).
 
-Добавь в класс AggregateNode (в operators.h) метод для точного расчета кардинальности результата:
+Когда PredicatePushdownRule видит условие (c_mktsegment = 1 AND d_year = 1998) OR ..., оно не сможет протолкнуть его ни в CUSTOMER, ни в DDATE (так как требуются обе таблицы). Условие останется в FilterNode на самом верху select_kernel.
+
+Вам нужно убедиться, что метод visit(const FilterNode& node) в visitor.cpp корректно обрабатывает этот случай:
 C++
 
-uint64_t calculateResultSize(const Catalog& catalog) const {
-    uint64_t total_size = 1;
-    for (const auto& group_expr : group_by_exprs_) {
-        // Если это ColumnRefExpr, извлекаем имя колонки и таблицы
-        // Ищем статистику в catalog.getTableMetadata(...)
-        // Если статистика есть, умножаем total_size на stats.cardinality_
-        // Если статистики нет или это сложное выражение, используем фолбэк (например, берем общий размер таблицы)
-        // ВАЖНО: Никакого хардкода `card = 7` для городов! Города должны брать свою реальную кардинальность.
-    }
-    return total_size;
-}
-
-6.2 Модификация ExecutionContext
-
-В файле include/core/execution.h добавь поле для передачи размера в DatabaseInstance:
-C++
-
-struct ExecutionContext {
-    sycl::queue* q_;
-    std::unordered_map<std::string, void*> buffers_;
-    void* result_buffer_ = nullptr;
-    
-    // НОВОЕ ПОЛЕ:
-    size_t expected_result_size_{0}; 
-    
-    // ...
-};
-
-Глава 7. Интеграция главного конвейера (QueryEngine::processQuery)
-
-Теперь нам нужно выбросить старый монолитный buildPhysicalPlan из QueryEngine и заменить его на элегантный вызов новых подсистем.
-
-Измени метод processQuery (в execution.cpp или optimizer.cpp в зависимости от твоей структуры):
-C++
-
-void QueryEngine::processQuery(hsql::SelectStatement* stmt, ExecutionContext* ctx) {
-    // ШАГ 1: Трансляция (AST -> Naive Operator Tree)
-    QueryTranslator translator(catalog_);
-    auto naive_tree = translator.translate(stmt);
-
-    // ШАГ 2: Оптимизация (Naive Tree -> Optimized Operator Tree)
-    Optimizer optimizer;
-    auto optimized_tree = optimizer.optimize(std::move(naive_tree));
-
-    // ШАГ 3: Расчет памяти
-    // Ищем AggregateNode в корне или под корнем
-    const AggregateNode* agg_node = findAggregateNode(optimized_tree.get());
-    if (agg_node) {
-        uint64_t tuples = agg_node->calculateResultSize(*catalog_);
-        uint64_t tuple_size = agg_node->group_by_exprs_.size() + agg_node->aggregations_.size();
-        ctx->expected_result_size_ = tuples * tuple_size;
-    } else {
-        ctx->expected_result_size_ = 1; // Скалярная агрегация
+void JITOperatorVisitor::visit(const FilterNode& node) {
+    // 1. Сначала обходим детей (это сгенерирует все загрузки фактов и Hash Probes!)
+    for (const auto& child : node.getChildren()) {
+        child->accept(*this);
     }
 
-    // ШАГ 4: JIT Генерация (Optimized Tree -> C++ Code)
-    JITContext jit_ctx;
-    JITOperatorVisitor visitor(jit_ctx);
-    optimized_tree->accept(visitor);
-
-    std::string final_code = assembleFinalKernel(jit_ctx);
-
-    // ШАГ 5: Динамическая компиляция (.so)
-    auto lib_path = compiler_->compile(final_code);
-
-    // ШАГ 6: Выполнение
-    // ВНИМАНИЕ: Вызов выделения памяти должен происходить именно ЗДЕСЬ,
-    // когда мы точно знаем ctx->expected_result_size_!
-    db_instance_->ensureCapacity(ctx->expected_result_size_);
-    db_instance_->zeroResultBuffer();
-
-    auto executor = std::make_unique<JITExecutor>(lib_path);
-    executor->execute(ctx);
+    // 2. Теперь применяем фильтр "на лету" к уже пробитым данным
+    // Если вы сделали TODO 2, JITExprVisitor сгенерирует Inline C++ код 
+    // прямо здесь, используя переменные, которые уже лежат в регистрах.
+    if (node.predicate) {
+        bool first_pred = false; // Важно: мы не перезаписываем flags, мы их срезаем (AND)
+        JITExprVisitor expr_vis(ctx_, *active_stream_, "flags", false, &first_pred);
+        node.predicate->accept(expr_vis);
+    }
 }
 
-(Примечание: Убедись, что метод сборки финального C++ файла assembleFinalKernel правильно склеивает jit_ctx.includes_and_globals, jit_ctx.build_kernels и jit_ctx.probe_kernel в единую функцию extern "C" void execute_query(db::ExecutionContext* ctx)).
-Глава 8. Финальный План Действий (Action Plan) для тебя
+Шаг 3.2: Поддержка OR-джойнов в HashJoinNode
 
-Твоя задача — завершить рефакторинг движка. Выдай мне готовый production-ready код в следующем порядке:
+Теперь решаем проблему Запроса 1 (lo_orderdate = d_datekey OR lo_commitdate = d_datekey).
+Нам нужно научить HashJoinNode извлекать оба ключа и генерировать двойной Probe с объединением результатов.
 
-Шаг 1: AggregateNode и Управление Памятью
+Обновите логику поиска ключей в JITOperatorVisitor::visit(const HashJoinNode& node):
+C++
 
-    Реализуй метод calculateResultSize в AggregateNode с правильным обращением к Catalog.
+    std::vector<std::string> fk_cols; // Теперь это массив ключей!
+    
+    // ... внутри findCols ...
+    if (e->getType() == ExprType::OP_EQ) {
+        // ... старая логика определения fk_col ...
+        fk_cols.push_back(rc->column_name); // или lc->column_name
+    } else if (e->getType() == ExprType::OP_AND || e->getType() == ExprType::OP_OR) {
+        // Рекурсивно спускаемся и ищем все OP_EQ
+        findCols(bin->left.get());
+        findCols(bin->right.get());
+    }
 
-    Добавь expected_result_size_ в ExecutionContext.
+А в конце метода visit, при генерации кода в probe_kernel, добавьте ветвление:
+C++
 
-    Обнови логику в DatabaseInstance, чтобы он НЕ аллоцировал буфер слепо в начале, а ждал точного размера от QueryEngine.
+    if (build_idx < build_infos_.size()) {
+        const auto& bi = build_infos_[build_idx];
+        
+        if (fk_cols.size() == 1) {
+            // СТАНДАРТНЫЙ JOIN (Один ключ)
+            // ... ваш текущий код с BlockLoad и BlockProbeAndPHT ...
+        } 
+        else if (fk_cols.size() > 1) {
+            // OR-JOIN (Несколько ключей к одной таблице)
+            std::string combined_mask = ctx_.getNewMask();
+            ctx_.probe_kernel << "            int " << combined_mask << "[ITEMS_PER_THREAD];\n";
+            ctx_.probe_kernel << "            InitFlagsZero<BLOCK_THREADS, ITEMS_PER_THREAD>(" << combined_mask << ");\n";
+            
+            for (size_t k = 0; k < fk_cols.size(); ++k) {
+                std::string fk = fk_cols[k];
+                std::string temp_flags = ctx_.getNewMask();
+                
+                // 1. Копируем текущие валидные флаги во временную маску
+                ctx_.probe_kernel << "            int " << temp_flags << "[ITEMS_PER_THREAD];\n";
+                ctx_.probe_kernel << "            BlockApplyMaskAnd<...>(tid, " << temp_flags << ", flags);\n";
+                
+                // 2. Загружаем очередной внешний ключ
+                ctx_.external_columns.insert("d_" + fk);
+                ctx_.probe_kernel << "            BlockLoad<...>(d_" << fk << " + tile_offset, tid, tile_offset, items, num_tile_items);\n";
+                
+                // 3. Делаем Probe в temp_flags (а не в главные flags!)
+                ctx_.probe_kernel << "            BlockProbeAndPHT_1<...>(tid, items, " << temp_flags << ", " << bi.ht_name << ", ...);\n";
+                
+                // 4. Добавляем результат в комбинированную маску (OR)
+                ctx_.probe_kernel << "            BlockApplyMaskOr<...>(tid, " << combined_mask << ", " << temp_flags << ");\n";
+            }
+            
+            // Наконец, применяем комбинированный результат к главным флагам потока
+            ctx_.probe_kernel << "            BlockApplyMaskAnd<...>(tid, flags, " << combined_mask << ");\n";
+        }
+    }
 
-Шаг 2: QueryEngine::processQuery
+Результат TODO 3
 
-    Напиши полную, обновленную версию processQuery, реализующую все 6 шагов конвейера (Трансляция -> Оптимизация -> Память -> Visitor -> Компиляция -> Выполнение).
+С этим кодом движок сможет элегантно переварить двойной OR-джойн. Он сгенерирует код, который:
 
-Шаг 3: Сборка JIT-кода
+    Создаст пустую маску combined.
 
-    Покажи код функции assembleFinalKernel, которая склеивает результаты работы JITOperatorVisitor в валидный C++ файл, готовый для компилятора LLVM/SYCL.
+    Попробует пробить lo_orderdate. Если найдет совпадение в DDATE, запишет 1 в combined.
 
-Убедись, что нигде не осталось следов старого buildPhysicalPlan. Наша новая архитектура: Дерево -> Оптимизатор -> Visitor.
+    Попробует пробить lo_commitdate. Если найдет, добавит 1 в combined.
+
+    Оставит активными только те треды, где хотя бы одна из дат совпала!
