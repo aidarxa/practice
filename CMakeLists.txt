@@ -37,6 +37,20 @@ target_include_directories(linenoise_lib PUBLIC ${linenoise_SOURCE_DIR})
 
 find_package(AdaptiveCpp REQUIRED)
 
+set(CRYSTAL_INCLUDE_DIR "${CMAKE_SOURCE_DIR}/include" CACHE PATH
+    "Include directory with Crystal project headers for JIT compilation.")
+set(CRYSTAL_DEPS_INCLUDE_DIR "${CMAKE_SOURCE_DIR}/deps/include" CACHE PATH
+    "Include directory with Crystal third-party headers for JIT compilation.")
+
+foreach(path_var CRYSTAL_INCLUDE_DIR CRYSTAL_DEPS_INCLUDE_DIR)
+    if("${${path_var}}" STREQUAL "")
+        message(FATAL_ERROR "${path_var} must not be empty.")
+    endif()
+    if(NOT IS_DIRECTORY "${${path_var}}")
+        message(FATAL_ERROR "${path_var} does not exist or is not a directory: ${${path_var}}")
+    endif()
+endforeach()
+
 # --- REPL executable ---
 add_executable(db_cli
     src/main.cpp
@@ -65,6 +79,10 @@ target_link_libraries(db_cli PRIVATE
 )
 
 add_sycl_to_target(TARGET db_cli)
+target_compile_definitions(db_cli PRIVATE
+    CRYSTAL_INCLUDE_DIR_DEFAULT="${CRYSTAL_INCLUDE_DIR}"
+    CRYSTAL_DEPS_INCLUDE_DIR_DEFAULT="${CRYSTAL_DEPS_INCLUDE_DIR}"
+)
 
 # --- Test target (AST → CodeGen, no SYCL) ---
 add_executable(test_optimizer
@@ -88,6 +106,10 @@ target_link_libraries(test_optimizer PRIVATE
 )
 
 add_sycl_to_target(TARGET test_optimizer)
+target_compile_definitions(test_optimizer PRIVATE
+    CRYSTAL_INCLUDE_DIR_DEFAULT="${CRYSTAL_INCLUDE_DIR}"
+    CRYSTAL_DEPS_INCLUDE_DIR_DEFAULT="${CRYSTAL_DEPS_INCLUDE_DIR}"
+)
 
 # --- Test target (Expression Tree + Operator Tree + Translator) ---
 add_executable(test_translator
@@ -106,4 +128,9 @@ target_link_directories(test_translator PRIVATE
 
 target_link_libraries(test_translator PRIVATE
     sqlparser
+)
+
+target_compile_definitions(test_translator PRIVATE
+    CRYSTAL_INCLUDE_DIR_DEFAULT="${CRYSTAL_INCLUDE_DIR}"
+    CRYSTAL_DEPS_INCLUDE_DIR_DEFAULT="${CRYSTAL_DEPS_INCLUDE_DIR}"
 )
