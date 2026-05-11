@@ -533,7 +533,7 @@ void JITOperatorVisitor::emitBuildKernel(const std::string& dim_table,
     ctx_.build_kernels << "        });\n    });\n\n";
     std::string ht_size = (bi.variant == 2) ? "2*" + bi.ht_size_expr : bi.ht_size_expr;
     ctx_.hash_tables.push_back({bi.ht_name, "int", ht_size});
-    bi.fk_col = "";
+    bi.fk_cols.clear();
     build_infos_.push_back(bi);
 }
 
@@ -552,12 +552,14 @@ void JITOperatorVisitor::visit(const HashJoinNode& node) {
     std::string dim_table;
     if (!left_tables.empty()) dim_table = *left_tables.begin();
 
-    std::string pk_col, fk_col;
+    std::string pk_col; 
+    std::vector<std::string> fk_cols;
     std::vector<const ExprNode*> secondary_conditions;
 
     if (node.join_condition) {
-        std::function<void(const ExprNode*)> findCols = [&](const ExprNode* e) {
-            if (!e) return;
+        // 1. Функция-хелпер: проверяет, состоит ли поддерево ИСКЛЮЧИТЕЛЬНО из ключей JOIN (EQ или N-way OR)
+        std::function<bool(const ExprNode*)> isPureJoinKey = [&](const ExprNode* e) -> bool {
+            if (!e) return false;
             if (e->getType() == ExprType::OP_EQ) {
                 const auto* bin = static_cast<const BinaryExpr*>(e);
                 if (bin->left && bin->left->getType() == ExprType::COLUMN_REF &&
@@ -566,30 +568,59 @@ void JITOperatorVisitor::visit(const HashJoinNode& node) {
                     const auto* rc = static_cast<const ColumnRefExpr*>(bin->right.get());
                     std::string lt = getTableName(lc->column_name);
                     std::string rt = getTableName(rc->column_name);
-
-                    bool is_primary = false;
-                    // ИСПРАВЛЕНИЕ: Главный ключ для Hash Table ДОЛЖЕН содержать слово "key"
-                    if (lt == dim_table && lc->column_name.find("key") != std::string::npos) {
-                        pk_col = lc->column_name; fk_col = rc->column_name; is_primary = true;
-                    } else if (rt == dim_table && rc->column_name.find("key") != std::string::npos) {
-                        pk_col = rc->column_name; fk_col = lc->column_name; is_primary = true;
-                    }
-                    
-                    if (!is_primary) {
-                        secondary_conditions.push_back(e); // Это Theta Join!
-                    }
-                } else {
-                    secondary_conditions.push_back(e);
+                    if (lt == dim_table && lc->column_name.find("key") != std::string::npos) return true;
+                    if (rt == dim_table && rc->column_name.find("key") != std::string::npos) return true;
                 }
-            } else if (e->getType() == ExprType::OP_AND) {
+                return false;
+            } else if (e->getType() == ExprType::OP_OR) {
                 const auto* bin = static_cast<const BinaryExpr*>(e);
-                findCols(bin->left.get());
-                findCols(bin->right.get());
+                return isPureJoinKey(bin->left.get()) && isPureJoinKey(bin->right.get());
+            }
+            return false;
+        };
+
+        // 2. Функция безопасного извлечения: не разрушает AST фильтров!
+        std::function<void(const ExprNode*)> extractConditions = [&](const ExprNode* e) {
+            if (!e) return;
+            
+            // Если это AND, безопасно спускаемся (верхнеуровневый AND можно разбить на плоский список)
+            if (e->getType() == ExprType::OP_AND) {
+                const auto* bin = static_cast<const BinaryExpr*>(e);
+                extractConditions(bin->left.get());
+                extractConditions(bin->right.get());
+                return;
+            }
+
+            // Если это чистые ключи JOIN, безопасно извлекаем их в fk_cols
+            if (isPureJoinKey(e)) {
+                std::function<void(const ExprNode*)> extractKeys = [&](const ExprNode* node) {
+                    if (!node) return;
+                    if (node->getType() == ExprType::OP_EQ) {
+                        const auto* bin = static_cast<const BinaryExpr*>(node);
+                        const auto* lc = static_cast<const ColumnRefExpr*>(bin->left.get());
+                        const auto* rc = static_cast<const ColumnRefExpr*>(bin->right.get());
+                        std::string lt = getTableName(lc->column_name);
+                        std::string rt = getTableName(rc->column_name);
+                        if (lt == dim_table && lc->column_name.find("key") != std::string::npos) {
+                            pk_col = lc->column_name; fk_cols.push_back(rc->column_name);
+                        } else {
+                            pk_col = rc->column_name; fk_cols.push_back(lc->column_name);
+                        }
+                    } else if (node->getType() == ExprType::OP_OR) {
+                        const auto* bin = static_cast<const BinaryExpr*>(node);
+                        extractKeys(bin->left.get());
+                        extractKeys(bin->right.get());
+                    }
+                };
+                extractKeys(e);
             } else {
+                // ЭТО И ЕСТЬ ФИКС! Если это сложный фильтр (OR с числами и т.д.), 
+                // мы НЕ спускаемся внутрь. Мы сохраняем весь AST-узел целиком.
                 secondary_conditions.push_back(e);
             }
         };
-        findCols(node.join_condition.get());
+        
+        extractConditions(node.join_condition.get());
     }
 
     // ВАЖНО: Регистрируем колонки из вторичных условий ДО генерации Build-фазы,
@@ -622,8 +653,8 @@ void JITOperatorVisitor::visit(const HashJoinNode& node) {
 
     if (scan) {
         emitBuildKernel(dim_table, filter, *scan);
-        if (!build_infos_.empty() && !fk_col.empty()) {
-            build_infos_.back().fk_col = fk_col;
+        if (!build_infos_.empty() && !fk_cols.empty()) {
+            build_infos_.back().fk_cols = fk_cols;
         }
     } else {
         std::stringstream temp_build;
@@ -644,29 +675,82 @@ void JITOperatorVisitor::visit(const HashJoinNode& node) {
 
     if (build_idx < build_infos_.size()) {
         const auto& bi = build_infos_[build_idx];
-        if (!bi.fk_col.empty()) {
-            ctx_.external_columns.insert("d_" + bi.fk_col);
-            ctx_.probe_kernel << "            BlockLoad<int, BLOCK_THREADS, ITEMS_PER_THREAD>("
-                              << "d_" << bi.fk_col << " + tile_offset, tid, tile_offset, items, num_tile_items);\n";
+        if (!bi.fk_cols.empty()) {
+            
+            if (bi.fk_cols.size() == 1) {
+                // --- СТАНДАРТНЫЙ JOIN (Один ключ) ---
+                std::string fk = bi.fk_cols[0];
+                ctx_.external_columns.insert("d_" + fk);
+                ctx_.probe_kernel << "            BlockLoad<int, BLOCK_THREADS, ITEMS_PER_THREAD>("
+                                  << "d_" << fk << " + tile_offset, tid, tile_offset, items, num_tile_items);\n";
 
-            if (bi.variant == 2 && !bi.val_col.empty()) {
-                ctx_.loaded_in_probe.insert(bi.val_col);
-                ctx_.col_to_reg[bi.val_col] = bi.val_col;
-
-                ctx_.probe_kernel << "            BlockProbeAndPHT_2<int, int, BLOCK_THREADS, ITEMS_PER_THREAD>("
-                                  << "tid, items, " << bi.val_col << ", flags, "
-                                  << bi.ht_name << ", " << bi.ht_size_expr
-                                  << ", " << bi.key_mins << ", num_tile_items);\n";
+                if (bi.variant == 2 && !bi.val_col.empty()) {
+                    ctx_.loaded_in_probe.insert(bi.val_col);
+                    ctx_.col_to_reg[bi.val_col] = bi.val_col;
+                    ctx_.probe_kernel << "            BlockProbeAndPHT_2<int, int, BLOCK_THREADS, ITEMS_PER_THREAD>("
+                                      << "tid, items, " << bi.val_col << ", flags, "
+                                      << bi.ht_name << ", " << bi.ht_size_expr
+                                      << ", " << bi.key_mins << ", num_tile_items);\n";
+                } else {
+                    ctx_.probe_kernel << "            BlockProbeAndPHT_1<int, BLOCK_THREADS, ITEMS_PER_THREAD>("
+                                      << "tid, items, flags, "
+                                      << bi.ht_name << ", " << bi.ht_size_expr
+                                      << ", " << bi.key_mins << ", num_tile_items);\n";
+                }
             } else {
-                ctx_.probe_kernel << "            BlockProbeAndPHT_1<int, BLOCK_THREADS, ITEMS_PER_THREAD>("
-                                  << "tid, items, flags, "
-                                  << bi.ht_name << ", " << bi.ht_size_expr
-                                  << ", " << bi.key_mins << ", num_tile_items);\n";
+                // --- OR-JOIN (Универсальный N-way Probe с оптимизацией регистров) ---
+                std::string combined_mask = ctx_.getNewMask();
+                std::string temp_flags = ctx_.getNewMask(); // Выделяем temp_flags ОДИН РАЗ до цикла!
+                
+                ctx_.probe_kernel << "            int " << combined_mask << "[ITEMS_PER_THREAD];\n";
+                ctx_.probe_kernel << "            InitFlagsZero<BLOCK_THREADS, ITEMS_PER_THREAD>(" << combined_mask << ");\n";
+                
+                // Единый буфер для всех Probe в этом джойне, чтобы не допустить Register Spilling
+                ctx_.probe_kernel << "            int " << temp_flags << "[ITEMS_PER_THREAD];\n";
+
+                for (const auto& fk : bi.fk_cols) {
+                    // Копируем исходные флаги (active rows) в общий temp_flags перед каждым зондированием
+                    ctx_.probe_kernel << "            #pragma unroll\n"
+                                      << "            for (int i = 0; i < ITEMS_PER_THREAD; ++i) { " << temp_flags << "[i] = flags[i]; }\n";
+
+                    ctx_.external_columns.insert("d_" + fk);
+                    ctx_.probe_kernel << "            BlockLoad<int, BLOCK_THREADS, ITEMS_PER_THREAD>("
+                                      << "d_" << fk << " + tile_offset, tid, tile_offset, items, num_tile_items);\n";
+
+                    if (bi.variant == 2 && !bi.val_col.empty()) {
+                        ctx_.loaded_in_probe.insert(bi.val_col);
+                        ctx_.col_to_reg[bi.val_col] = bi.val_col;
+                        std::string temp_val = "val_" + ctx_.getNewMask(); 
+                        ctx_.probe_kernel << "            int " << temp_val << "[ITEMS_PER_THREAD];\n";
+                        ctx_.probe_kernel << "            BlockProbeAndPHT_2<int, int, BLOCK_THREADS, ITEMS_PER_THREAD>("
+                                          << "tid, items, " << temp_val << ", " << temp_flags << ", "
+                                          << bi.ht_name << ", " << bi.ht_size_expr
+                                          << ", " << bi.key_mins << ", num_tile_items);\n";
+                        
+                        // НОВОЕ: Обновляем основной регистр только если этот ключ нашел совпадение!
+                        ctx_.probe_kernel << "            #pragma unroll\n"
+                                          << "            for (int i = 0; i < ITEMS_PER_THREAD; ++i) {\n"
+                                          << "                if (" << temp_flags << "[i]) " << bi.val_col << "[i] = " << temp_val << "[i];\n"
+                                          << "            }\n";
+                    } else {
+                        ctx_.probe_kernel << "            BlockProbeAndPHT_1<int, BLOCK_THREADS, ITEMS_PER_THREAD>("
+                                          << "tid, items, " << temp_flags << ", "
+                                          << bi.ht_name << ", " << bi.ht_size_expr
+                                          << ", " << bi.key_mins << ", num_tile_items);\n";
+                    }
+
+                    // Добавляем результаты зондирования текущего ключа в общую OR-маску
+                    ctx_.probe_kernel << "            BlockApplyMaskOr<BLOCK_THREADS, ITEMS_PER_THREAD>(tid, " << combined_mask << ", " << temp_flags << ");\n";
+                }
+
+                // Применяем объединенный результат (OR) к главным флагам потока (AND)
+                ctx_.probe_kernel << "            BlockApplyMaskAnd<BLOCK_THREADS, ITEMS_PER_THREAD>(tid, flags, " << combined_mask << ");\n";
             }
-            probe_first_pred_ = false; // JOIN обновил флаги!
-            // ИСПРАВЛЕНИЕ: ВЫПОЛНЯЕМ ВТОРИЧНЫЕ УСЛОВИЯ (THETA JOIN) НАПРЯМУЮ ПОСЛЕ PROBE!
+
+            // Обновляем состояние JIT-компилятора и накладываем вторичные условия (Theta Joins)
+            probe_first_pred_ = false; 
             for (const auto* cond : secondary_conditions) {
-                bool first_pred = false; // Важно: мы накладываем AND поверх существующих flags
+                bool first_pred = false; // Строго false, так как flags уже инициализированы Probe-фазой
                 JITExprVisitor expr_vis(ctx_, ctx_.probe_kernel, "flags", false, &first_pred);
                 cond->accept(expr_vis);
             }

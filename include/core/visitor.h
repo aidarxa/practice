@@ -164,7 +164,7 @@ private:
         std::string ht_size_expr;  // "20000" or "2*20000"
         std::string key_mins;      // "0" or "1"
         uint8_t     variant;       // 1 = keys only, 2 = key-value pairs
-        std::string fk_col;        // foreign key column in fact table
+        std::vector<std::string> fk_cols; // <--- ИЗМЕНЕНО с std::string fk_col;
         std::string val_col;       // value column (variant 2 only)
         std::string dim_prefix;    // "s", "c", "p", "d"
         std::string size_macro;    // "S_LEN", "C_LEN", etc.
