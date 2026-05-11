@@ -5,6 +5,7 @@
 #include <cassert>
 #include <functional>
 #include <iostream>
+#include <limits>
 #include <stdexcept>
 
 // ============================================================================
@@ -107,8 +108,11 @@ static FilterPredicateSupport validateFilterFastPathPredicate(
 
     const bool col_vs_int = left_type == ExprType::COLUMN_REF && right_type == ExprType::LITERAL_INT;
     const bool col_vs_col = left_type == ExprType::COLUMN_REF && right_type == ExprType::COLUMN_REF;
-    if (col_vs_int || col_vs_col) {
+    if (col_vs_int) {
         return FilterPredicateSupport::FastPathSupported;
+    }
+    if (col_vs_col) {
+        return FilterPredicateSupport::NeedsUniversalPath;
     }
 
     const bool has_math = left_type == ExprType::OP_ADD || left_type == ExprType::OP_SUB ||
@@ -214,14 +218,21 @@ std::string JITExprVisitor::translateInlineExpr(const ExprNode* expr, bool is_pr
         case ExprType::COLUMN_REF: {
             const auto* col = static_cast<const ColumnRefExpr*>(expr);
             std::string col_name = col->column_name;
-            
-            if (is_probe && !ctx_.loaded_in_probe.count(col_name)) {
-                ctx_.loaded_in_probe.insert(col_name);
-                ctx_.col_to_reg[col_name] = col_name;
-                ctx_.external_columns.insert("d_" + col_name);
-                stream_ << "            BlockLoad<int, BLOCK_THREADS, ITEMS_PER_THREAD>("
-                        << "d_" << col_name << " + tile_offset, tid, tile_offset, "
-                        << col_name << ", num_tile_items);\n";
+
+            if (is_probe) {
+                auto mapped = ctx_.col_to_reg.find(col_name);
+                if (mapped != ctx_.col_to_reg.end() && !mapped->second.empty()) {
+                    return mapped->second + "[i]";
+                }
+                if (!ctx_.loaded_in_probe.count(col_name)) {
+                    ctx_.loaded_in_probe.insert(col_name);
+                    ctx_.col_to_reg[col_name] = col_name;
+                    ctx_.external_columns.insert("d_" + col_name);
+                    stream_ << "            BlockLoad<int, BLOCK_THREADS, ITEMS_PER_THREAD>("
+                            << "d_" << col_name << " + tile_offset, tid, tile_offset, "
+                            << col_name << ", num_tile_items);\n";
+                }
+                return ctx_.col_to_reg[col_name] + "[i]";
             }
             return col_name + "[i]";
         }
@@ -264,6 +275,7 @@ void JITExprVisitor::visitComparison(const BinaryExpr& node) {
         bool is_build = false; // push-model: JITExprVisitor always in probe context
 
         auto load_col_if_needed = [&](const std::string& cname, const std::string& reg) {
+            if (ctx_.col_to_reg.count(cname) && !ctx_.col_to_reg[cname].empty()) return;
             if (!ctx_.loaded_in_probe.count(cname)) {
                 ctx_.loaded_in_probe.insert(cname);
                 ctx_.col_to_reg[cname] = reg;
@@ -288,9 +300,11 @@ void JITExprVisitor::visitComparison(const BinaryExpr& node) {
         if (*first_pred_) *first_pred_ = false;
 
         // Генерация вызова
+        const std::string reg1 = ctx_.col_to_reg.count(col1_name) ? ctx_.col_to_reg[col1_name] : col1_name;
+        const std::string reg2 = ctx_.col_to_reg.count(col2_name) ? ctx_.col_to_reg[col2_name] : col2_name;
         stream_ << "            " << prefix << predSuffix(node.op_type) << "_Cols"
                 << "<int, BLOCK_THREADS, ITEMS_PER_THREAD>(tid, " 
-                << col1_name << ", " << col2_name << ", "
+                << reg1 << ", " << reg2 << ", "
                 << target_mask_ << ", num_tile_items);\n";
         
         return;
@@ -705,7 +719,11 @@ void JITOperatorVisitor::consumeFilterVector(const FilterNode* node, JITContext&
         }
 
         if (support == FilterPredicateSupport::NeedsUniversalPath) {
-            bool fp = true;
+            // `flags` already contains the incoming pipeline mask (for example,
+            // successful hash-join probes).  A top-level filter must refine that
+            // mask, not overwrite it.  Start with first_pred=false so the first
+            // generated predicate uses BlockPredA* / `flags && condition`.
+            bool fp = false;
             JITExprVisitor expr_vis(ctx, code, "flags", false, &fp);
             node->predicate->accept(expr_vis);
         } else {
@@ -727,8 +745,8 @@ void JITOperatorVisitor::consumeFilterVector(const FilterNode* node, JITContext&
                     
                     std::string pred_macro;
                     switch(expr->getType()) {
-                        case ExprType::OP_EQ:  pred_macro = first ? "BlockPredEQ"  : "BlockPredAEQ"; break;
-                        case ExprType::OP_NEQ: pred_macro = first ? "BlockPredNEQ" : "BlockPredANEQ"; break;
+                        case ExprType::OP_EQ:  pred_macro = first ? "BlockPredEq"  : "BlockPredAEq"; break;
+                        case ExprType::OP_NEQ: pred_macro = first ? "BlockPredNEq" : "BlockPredANEq"; break;
                         case ExprType::OP_LT:  pred_macro = first ? "BlockPredLT"  : "BlockPredALT"; break;
                         case ExprType::OP_LTE: pred_macro = first ? "BlockPredLTE" : "BlockPredALTE"; break;
                         case ExprType::OP_GT:  pred_macro = first ? "BlockPredGT"  : "BlockPredAGT"; break;
@@ -745,7 +763,9 @@ void JITOperatorVisitor::consumeFilterVector(const FilterNode* node, JITContext&
             return false; // Complex expression, cannot optimize
         };
         
-        bool first_flag = true;
+        // Same rule for the literal fast path: preserve the incoming mask from
+        // scans/joins and only AND additional filter predicates into it.
+        bool first_flag = false;
         bool fully_optimized = process_expr(node->predicate.get(), first_flag);
         if (!fully_optimized) {
             throw std::runtime_error("Internal fast-path mismatch after successful validation in consumeFilterVector");
@@ -1102,22 +1122,45 @@ JITOperatorVisitor::BuildInfo JITOperatorVisitor::computeBuildInfo(
     bi.use_mht     = false;
     bi.key_mins    = "0";
 
-    // Determine HT size from catalog key stats
-    try {
-        const auto& meta = catalog_.getTableMetadata(dim_table);
-        for (const auto& col_name : meta.getColumnNames()) {
-            if (col_name.find("key") != std::string::npos ||
-                col_name.find("Key") != std::string::npos) {
-                if (meta.hasColumnStats(col_name)) {
-                    const auto& stats = meta.getColumnStats(col_name);
-                    int64_t range = stats.max_value_ - stats.min_value_ + 1;
-                    bi.key_mins    = std::to_string(stats.min_value_);
-                    bi.ht_size_expr = std::to_string(range);
-                    break;
+    // SSB dimension keys are used by the hand-written reference kernels with
+    // zero-based perfect-hash domains for PART/SUPPLIER/CUSTOMER.  Keeping the
+    // same domains avoids subtle off-by-one differences for encoded key columns.
+    if (dim_table == "PART") {
+        bi.ht_size_expr = "P_LEN";
+        bi.key_mins = "0";
+    } else if (dim_table == "SUPPLIER") {
+        bi.ht_size_expr = "S_LEN";
+        bi.key_mins = "0";
+    } else if (dim_table == "CUSTOMER") {
+        bi.ht_size_expr = "C_LEN";
+        bi.key_mins = "0";
+    } else if (dim_table == "DDATE") {
+        // Leave one spare slot beyond the historic 19981230 upper bound.  This
+        // prevents modulo aliasing if the loaded SSB date dictionary contains
+        // 19981231, while preserving the same hash values for all earlier dates.
+        bi.ht_size_expr = "61131";
+        bi.key_mins = "19920101";
+    }
+
+    if (bi.ht_size_expr.empty()) {
+        try {
+            const auto& meta = catalog_.getTableMetadata(dim_table);
+            for (const auto& col_name : meta.getColumnNames()) {
+                if (col_name.find("key") != std::string::npos ||
+                    col_name.find("Key") != std::string::npos) {
+                    if (meta.hasColumnStats(col_name)) {
+                        const auto& stats = meta.getColumnStats(col_name);
+                        int64_t range = stats.max_value_ - stats.min_value_ + 1;
+                        if (range > 0) {
+                            bi.key_mins    = std::to_string(stats.min_value_);
+                            bi.ht_size_expr = std::to_string(range);
+                        }
+                        break;
+                    }
                 }
             }
-        }
-    } catch (...) {}
+        } catch (...) {}
+    }
 
     if (bi.ht_size_expr.empty()) bi.ht_size_expr = bi.size_macro;
 
@@ -1225,73 +1268,151 @@ std::string JITOperatorVisitor::emitBuildFilter(
         JITContext& ctx) const {
     if (!filter || !filter->predicate) return "";
 
-    // Flatten AND into leaves
-    std::vector<const ExprNode*> leaves;
-    std::function<void(const ExprNode*)> flatten = [&](const ExprNode* e) {
-        if (!e) return;
-        if (e->getType() == ExprType::OP_AND) {
-            const auto* b = static_cast<const BinaryExpr*>(e);
-            flatten(b->left.get());
-            flatten(b->right.get());
-        } else {
-            leaves.push_back(e);
+    int mask_counter = 0;
+    std::string current_items_col;
+
+    auto comparisonSuffix = [](ExprType op) -> const char* {
+        switch (op) {
+            case ExprType::OP_EQ:  return "Eq";
+            case ExprType::OP_NEQ: return "NEq";
+            case ExprType::OP_LT:  return "LT";
+            case ExprType::OP_LTE: return "LTE";
+            case ExprType::OP_GT:  return "GT";
+            case ExprType::OP_GTE: return "GTE";
+            default:               return "Eq";
         }
     };
-    flatten(filter->predicate.get());
 
-    std::string current_items_col;
-    bool first_pred = true;
+    auto invertComparison = [](ExprType op) -> ExprType {
+        switch (op) {
+            case ExprType::OP_LT:  return ExprType::OP_GT;
+            case ExprType::OP_LTE: return ExprType::OP_GTE;
+            case ExprType::OP_GT:  return ExprType::OP_LT;
+            case ExprType::OP_GTE: return ExprType::OP_LTE;
+            default:               return op;
+        }
+    };
 
-    for (const ExprNode* leaf : leaves) {
-        if (!leaf || leaf->getType() < ExprType::OP_EQ) continue;
-        const auto* cmp = static_cast<const BinaryExpr*>(leaf);
-        if (!cmp->left || !cmp->right) continue;
+    auto loadColumnToItems = [&](const std::string& col_name) {
+        if (current_items_col == col_name) return;
+        ctx.external_columns.insert("d_" + col_name);
+        code << "            BlockLoad<int, BLOCK_THREADS, ITEMS_PER_THREAD>("
+             << "d_" << col_name << " + tile_offset, tid, tile_offset, items, num_tile_items);\n";
+        current_items_col = col_name;
+    };
+
+    std::function<bool(const ExprNode*, const std::string&, bool&, bool)> emitPredicate;
+
+    emitPredicate = [&](const ExprNode* expr,
+                        const std::string& target_mask,
+                        bool& first_predicate,
+                        bool or_context) -> bool {
+        if (!expr) return true;
+
+        if (expr->getType() == ExprType::OP_AND) {
+            const auto* bin = static_cast<const BinaryExpr*>(expr);
+            if (or_context) {
+                const std::string and_mask = "build_and_mask_" + std::to_string(++mask_counter);
+                code << "            int " << and_mask << "[ITEMS_PER_THREAD];\n";
+                code << "            InitFlags<BLOCK_THREADS, ITEMS_PER_THREAD>(" << and_mask << ");\n";
+                bool and_first = true;
+                if (!emitPredicate(bin->left.get(), and_mask, and_first, false)) return false;
+                if (!emitPredicate(bin->right.get(), and_mask, and_first, false)) return false;
+
+                // OR the whole conjunction into the parent OR accumulator.
+                code << "            BlockApplyMaskOr<BLOCK_THREADS, ITEMS_PER_THREAD>(tid, "
+                     << target_mask << ", " << and_mask << ");\n";
+                first_predicate = false;
+                return true;
+            }
+            return emitPredicate(bin->left.get(), target_mask, first_predicate, false) &&
+                   emitPredicate(bin->right.get(), target_mask, first_predicate, false);
+        }
+
+        if (expr->getType() == ExprType::OP_OR) {
+            const auto* bin = static_cast<const BinaryExpr*>(expr);
+            if (or_context) {
+                return emitPredicate(bin->left.get(), target_mask, first_predicate, true) &&
+                       emitPredicate(bin->right.get(), target_mask, first_predicate, true);
+            }
+
+            const std::string or_mask = "build_or_mask_" + std::to_string(++mask_counter);
+            code << "            int " << or_mask << "[ITEMS_PER_THREAD];\n";
+            code << "            InitFlagsZero<BLOCK_THREADS, ITEMS_PER_THREAD>(" << or_mask << ");\n";
+            bool or_first = true;
+            if (!emitPredicate(bin->left.get(), or_mask, or_first, true)) return false;
+            if (!emitPredicate(bin->right.get(), or_mask, or_first, true)) return false;
+            code << "            BlockApplyMaskAnd<BLOCK_THREADS, ITEMS_PER_THREAD>(tid, "
+                 << target_mask << ", " << or_mask << ");\n";
+            first_predicate = false;
+            return true;
+        }
+
+        if (expr->getType() < ExprType::OP_EQ || expr->getType() > ExprType::OP_GTE) {
+            return false;
+        }
+
+        const auto* cmp = static_cast<const BinaryExpr*>(expr);
+        if (!cmp->left || !cmp->right) return false;
 
         const ExprNode* col_node = nullptr;
         const ExprNode* lit_node = nullptr;
-        if (cmp->left->getType()  == ExprType::COLUMN_REF &&
+        ExprType op = cmp->op_type;
+
+        if (cmp->left->getType() == ExprType::COLUMN_REF &&
             (cmp->right->getType() == ExprType::LITERAL_INT ||
              cmp->right->getType() == ExprType::LITERAL_FLOAT)) {
-            col_node = cmp->left.get(); lit_node = cmp->right.get();
+            col_node = cmp->left.get();
+            lit_node = cmp->right.get();
         } else if (cmp->right->getType() == ExprType::COLUMN_REF &&
-                   (cmp->left->getType()  == ExprType::LITERAL_INT ||
-                    cmp->left->getType()  == ExprType::LITERAL_FLOAT)) {
-            col_node = cmp->right.get(); lit_node = cmp->left.get();
-        } else { continue; }
+                   (cmp->left->getType() == ExprType::LITERAL_INT ||
+                    cmp->left->getType() == ExprType::LITERAL_FLOAT)) {
+            col_node = cmp->right.get();
+            lit_node = cmp->left.get();
+            op = invertComparison(op);
+        } else {
+            return false;
+        }
 
         const auto* col = static_cast<const ColumnRefExpr*>(col_node);
-        std::string col_name = col->column_name;
+        const std::string& col_name = col->column_name;
+        loadColumnToItems(col_name);
+
         std::string lit_val;
-        if (lit_node->getType() == ExprType::LITERAL_INT)
+        if (lit_node->getType() == ExprType::LITERAL_INT) {
             lit_val = std::to_string(static_cast<const LiteralIntExpr*>(lit_node)->value);
-        else
+        } else {
             lit_val = std::to_string(static_cast<const LiteralFloatExpr*>(lit_node)->value);
-
-        // Load column into `items` if it changed
-        if (current_items_col != col_name) {
-            ctx.external_columns.insert("d_" + col_name);
-            code << "            BlockLoad<int, BLOCK_THREADS, ITEMS_PER_THREAD>("
-                 << "d_" << col_name << " + tile_offset, tid, tile_offset, items, num_tile_items);\n";
-            current_items_col = col_name;
         }
 
-        // BlockPred / BlockPredA suffix
-        static const char* suffixes[] = {"Eq","NEq","LT","LTE","GT","GTE"};
-        static const ExprType ops[] = {
-            ExprType::OP_EQ, ExprType::OP_NEQ,
-            ExprType::OP_LT, ExprType::OP_LTE,
-            ExprType::OP_GT, ExprType::OP_GTE
-        };
-        std::string suf = "Eq";
-        for (int k = 0; k < 6; ++k) {
-            if (cmp->op_type == ops[k]) { suf = suffixes[k]; break; }
+        const std::string suffix = comparisonSuffix(op);
+        std::string func;
+        if (or_context) {
+            // The OR accumulator is zero-initialised, so the first and later
+            // predicates both have to OR into it.  Using BlockPredOr* for all
+            // leaves avoids accidentally replacing previous OR terms.
+            if (suffix == "Eq")       func = "BlockPredOrEq";
+            else if (suffix == "NEq") func = "BlockPredOrNEq";
+            else                       func = "BlockPredO" + suffix;
+        } else {
+            if (first_predicate) {
+                func = "BlockPred" + suffix;
+            } else {
+                if (suffix == "Eq")       func = "BlockPredAEq";
+                else if (suffix == "NEq") func = "BlockPredANEq";
+                else                       func = "BlockPredA" + suffix;
+            }
         }
-        std::string prefix = first_pred ? "BlockPred" : "BlockPredA";
-        first_pred = false;
 
-        code << "            " << prefix << suf
-             << "<int, BLOCK_THREADS, ITEMS_PER_THREAD>"
-             << "(tid, items, flags, " << lit_val << ", num_tile_items);\n";
+        code << "            " << func << "<int, BLOCK_THREADS, ITEMS_PER_THREAD>"
+             << "(tid, items, " << target_mask << ", " << lit_val << ", num_tile_items);\n";
+        first_predicate = false;
+        return true;
+    };
+
+    bool first = true;
+    if (!emitPredicate(filter->predicate.get(), "flags", first, false)) {
+        throw std::runtime_error("Unsupported build-side filter predicate for block codegen");
     }
     return current_items_col;
 }
@@ -1311,7 +1432,7 @@ void JITOperatorVisitor::emitPHTBuildKernel(
     // HT size: 2× for open-addressing headroom
     std::string ht_size = "2*" + bi.ht_size_expr;
     ctx.hash_tables.push_back({bi.ht_name, "int",
-                               bi.variant == 1 ? ht_size : "2*2*" + bi.ht_size_expr});
+                               bi.variant == 1 ? ht_size : "2*" + bi.ht_size_expr});
 
     // Register PK column as external
     if (!bi.pk_col.empty()) ctx.external_columns.insert("d_" + bi.pk_col);
@@ -1536,15 +1657,6 @@ void JITOperatorVisitor::produceHashJoin(const HashJoinNode* node, JITContext& c
     // --- Compute BuildInfo ---
     BuildInfo bi = computeBuildInfo(dim_table, build_filter, node);
 
-    // Find payload (val) column: any dim column used in GROUP BY / agg that isn't the PK
-    {
-        std::vector<std::string> dim_cols;
-        findAllColumnsForTable(node, dim_table, dim_cols);
-        for (auto& v : dim_cols) {
-            if (v != bi.pk_col) { bi.val_col = v; break; }
-        }
-    }
-
     // --- Route to PHT or MHT ---
     if (!bi.use_mht) {
         bi.variant = bi.val_col.empty() ? 1 : 2;
@@ -1577,38 +1689,80 @@ void JITOperatorVisitor::consumeHashJoinVector(const HashJoinNode* node, JITCont
 
     if (!bi.use_mht) {
         // ---- PHT probe: stays in vector mode ----
-        // Load FK column if not already loaded
-        if (!ctx.loaded_in_probe.count(fk)) {
-            ctx.external_columns.insert("d_" + fk);
-            ctx.loaded_in_probe.insert(fk);
-            code << "            BlockLoad<int, BLOCK_THREADS, ITEMS_PER_THREAD>("
-                 << "d_" << fk << " + tile_offset, tid, tile_offset, items, num_tile_items);\n";
-        } else {
-            // fk was loaded into its own register; copy to items[] for probe
-            code << "            #pragma unroll\n";
-            code << "            for (int i = 0; i < ITEMS_PER_THREAD; ++i) items[i] = " << fk << "[i];\n";
+        // A join condition may contain several fact keys joined to the same
+        // dimension PK, for example:
+        //   lo_orderdate = d_datekey OR lo_commitdate = d_datekey
+        // SQL OR semantics require probing every FK alternative.  If two FK
+        // values are equal, the dimension row must be emitted only once.
+        const std::string payload_reg = bi.val_col.empty() ? "items2" : bi.val_col;
+        if (!bi.val_col.empty()) {
+            ctx.col_to_reg[bi.val_col] = payload_reg;
         }
 
+        if (bi.fk_cols.size() > 1) {
+            const std::string base_flags = "join_base_flags_" + std::to_string(++ctx.mask_counter);
+            code << "            int " << base_flags << "[ITEMS_PER_THREAD];\n";
+            code << "            InitFlags<BLOCK_THREADS, ITEMS_PER_THREAD>(" << base_flags << ");\n";
+            code << "            BlockApplyMaskAnd<BLOCK_THREADS, ITEMS_PER_THREAD>(tid, "
+                 << base_flags << ", flags);\n";
+
+            for (std::size_t fk_idx = 0; fk_idx < bi.fk_cols.size(); ++fk_idx) {
+                const std::string& fk_col = bi.fk_cols[fk_idx];
+                loadIntoReg(fk_col, fk_col, ctx);
+
+                code << "            InitFlags<BLOCK_THREADS, ITEMS_PER_THREAD>(flags);\n";
+                code << "            BlockApplyMaskAnd<BLOCK_THREADS, ITEMS_PER_THREAD>(tid, flags, "
+                     << base_flags << ");\n";
+
+                // Suppress duplicate OR matches.  If the current FK equals any
+                // previous FK for the same fact row, that dimension key was
+                // already probed and should not be aggregated again.
+                for (std::size_t prev = 0; prev < fk_idx; ++prev) {
+                    const std::string& prev_fk = bi.fk_cols[prev];
+                    loadIntoReg(prev_fk, prev_fk, ctx);
+                    code << "            BlockPredANEq_Cols<int, BLOCK_THREADS, ITEMS_PER_THREAD>"
+                         << "(tid, " << fk_col << ", " << prev_fk
+                         << ", flags, num_tile_items);\n";
+                }
+
+                if (bi.variant == 1) {
+                    code << "            BlockProbeAndPHT_1<int, BLOCK_THREADS, ITEMS_PER_THREAD>"
+                         << "(tid, " << fk_col << ", flags, " << bi.ht_name << ", "
+                         << bi.ht_size_expr << ", " << bi.key_mins << ", num_tile_items);\n";
+                } else {
+                    code << "            BlockProbeAndPHT_2<int, int, BLOCK_THREADS, ITEMS_PER_THREAD>"
+                         << "(tid, " << fk_col << ", " << payload_reg << ", flags, "
+                         << bi.ht_name << ", " << bi.ht_size_expr << ", "
+                         << bi.key_mins << ", num_tile_items);\n";
+                }
+
+                if (node->parent_) {
+                    consume_mode_ = ConsumeMode::Vector;
+                    consume(node->parent_, ctx, node, active_vars);
+                }
+            }
+
+            // Leave flags restored to the incoming mask for any code that may
+            // be appended after this join block.
+            code << "            InitFlags<BLOCK_THREADS, ITEMS_PER_THREAD>(flags);\n";
+            code << "            BlockApplyMaskAnd<BLOCK_THREADS, ITEMS_PER_THREAD>(tid, flags, "
+                 << base_flags << ");\n";
+            return;
+        }
+
+        // Single-FK fast path.  Load the FK into a named register and probe
+        // directly from it; do not use items[] as a transient key scratch,
+        // because parent consumers may cache fact columns in items[].
+        loadIntoReg(fk, fk, ctx);
+
         if (bi.variant == 1) {
-            // PHT_1: key-only lookup
             code << "            BlockProbeAndPHT_1<int, BLOCK_THREADS, ITEMS_PER_THREAD>"
-                 << "(tid, items, flags, " << bi.ht_name << ", "
+                 << "(tid, " << fk << ", flags, " << bi.ht_name << ", "
                  << bi.ht_size_expr << ", " << bi.key_mins << ", num_tile_items);\n";
         } else {
-            // PHT_2: key+value — результаты land in items2
-            // ВНИМАНИЕ: Убрано локальное объявление int items2, так как оно теперь в заголовке ядра
             code << "            BlockProbeAndPHT_2<int, int, BLOCK_THREADS, ITEMS_PER_THREAD>"
-                 << "(tid, items, items2, flags, " << bi.ht_name << ", "
+                 << "(tid, " << fk << ", " << payload_reg << ", flags, " << bi.ht_name << ", "
                  << bi.ht_size_expr << ", " << bi.key_mins << ", num_tile_items);\n";
-            // Scatter payload into the val_col register for use by aggregation
-            if (!bi.val_col.empty()) {
-                // РЕГИСТРАЦИЯ: Говорим TableScan, что нужно сгенерировать `int val_col[ITEMS]`;
-                ctx.col_to_reg[bi.val_col] = bi.val_col; 
-                
-                code << "            #pragma unroll\n";
-                code << "            for (int i = 0; i < ITEMS_PER_THREAD; ++i) "
-                     << bi.val_col << "[i] = items2[i];\n";
-            }
         }
 
         // Still in vector mode — pass to parent
@@ -1701,9 +1855,13 @@ std::string JITOperatorVisitor::generateCode() const {
     code << "constexpr int ITEMS_PER_THREAD = 4;\n";
     code << "constexpr int TILE_SIZE = BLOCK_THREADS * ITEMS_PER_THREAD;\n\n";
 
-    // Forward-declare all kernel class names
+    // Forward-declare only kernel classes that are actually used as
+    // parallel_for<class ...> names.  Build_* pipeline labels are internal
+    // bookkeeping and must not leak into generated C++.
     for (const auto& p : ctx_.pipelines) {
-        code << "class " << p.kernel_name << ";\n";
+        if (p.kernel_name.rfind("Scan_", 0) == 0) {
+            code << "class " << p.kernel_name << ";\n";
+        }
     }
     for (const auto& kname : ctx_.kernel_class_names) {
         code << "class " << kname << ";\n";

@@ -4,7 +4,9 @@
 #include "memory.h"
 #include "../crystal/utils.h"
 
+#include <limits>
 #include <memory>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -133,41 +135,50 @@ public:
     OperatorType getType() const override { return OperatorType::AGGREGATE; }
     void accept(OperatorVisitor& visitor) const override;
 
-    // Вычисляет точный размер буфера результатов (в элементах unsigned long long).
-    // Для групповой агрегации: cardinality(group1) * cardinality(group2) * ... * tuple_size
-    // Для скалярной агрегации: 1
-    // Фолбэк (нет статистики): table.getSize() для данной колонки
+    // Вычисляет размер буфера результатов в элементах unsigned long long.
+    // Для GROUP BY: product(cardinality(group_key_i)) * tuple_size.
+    // Для скалярной агрегации: количество агрегатов, но не меньше 1.
     uint64_t calculateResultSize(const Catalog& catalog) const {
+        const uint64_t tuple_size = static_cast<uint64_t>(group_by_exprs.size() + aggregates.size());
         if (group_by_exprs.empty()) {
-            // Скалярная агрегация: один элемент ULL
-            return 1;
+            return tuple_size == 0 ? 1 : tuple_size;
         }
 
         uint64_t total_groups = 1;
         for (const auto& g : group_by_exprs) {
-            if (g->getType() != ExprType::COLUMN_REF) continue;
-            const auto* col = static_cast<const ColumnRefExpr*>(g.get());
-            const std::string& col_name = col->column_name;
-            // Определяем таблицу по первому символу имени колонки (как в crystal/utils.h)
-            std::string table_name = getTableName(col_name);
-
             uint64_t cardinality = 1;
-            try {
-                const auto& meta = catalog.getTableMetadata(table_name);
-                if (meta.hasColumnStats(col_name)) {
-                    cardinality = meta.getColumnStats(col_name).cardinality_;
-                } else {
-                    // Фолбэк: используем размер таблицы как верхнюю оценку
-                    cardinality = meta.getSize();
+
+            if (g && g->getType() == ExprType::COLUMN_REF) {
+                const auto* col = static_cast<const ColumnRefExpr*>(g.get());
+                const std::string& col_name = col->column_name;
+                const std::string table_name = col->table_name.empty()
+                    ? getTableName(col_name)
+                    : col->table_name;
+
+                try {
+                    const auto& meta = catalog.getTableMetadata(table_name);
+                    if (meta.hasColumnStats(col_name)) {
+                        cardinality = meta.getColumnStats(col_name).cardinality_;
+                    }
+                    if (cardinality == 0) {
+                        cardinality = meta.getSize();
+                    }
+                } catch (...) {
+                    cardinality = 1;
                 }
-            } catch (...) {
-                // Таблица не найдена — минимальный фолбэк
-                cardinality = 1;
+            }
+
+            if (cardinality != 0 &&
+                total_groups > std::numeric_limits<uint64_t>::max() / cardinality) {
+                throw std::overflow_error("Aggregate result cardinality overflows uint64_t");
             }
             total_groups *= cardinality;
         }
 
-        uint64_t tuple_size = group_by_exprs.size() + aggregates.size();
+        if (tuple_size != 0 &&
+            total_groups > std::numeric_limits<uint64_t>::max() / tuple_size) {
+            throw std::overflow_error("Aggregate result buffer size overflows uint64_t");
+        }
         return total_groups * tuple_size;
     }
 };

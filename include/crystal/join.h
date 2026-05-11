@@ -14,7 +14,7 @@ inline void BlockProbeDirectAndPHT_1(int tid, K (&items)[ITEMS_PER_THREAD],
     if (flags[i]) {
       int hash = HASH(items[i], ht_len, key_mins);
       K slot = ht[hash];
-      if (slot != 0) {
+      if (slot == items[i]) {
         flags[i] = 1;
       } else {
         flags[i] = 0;
@@ -32,7 +32,7 @@ inline void BlockProbeDirectAndPHT_1(int tid, K (&items)[ITEMS_PER_THREAD],
     if (flags[i] && (i * BLOCK_THREADS + tid < num_items)) {
       int hash = HASH(items[i], ht_len, key_mins);
       K slot = ht[hash];
-      if (slot != 0) {
+      if (slot == items[i]) {
         flags[i] = 1;
       } else {
         flags[i] = 0;
@@ -70,9 +70,9 @@ inline void BlockProbeDirectAndPHT_2(int tid, K (&items)[ITEMS_PER_THREAD],
   for (int i = 0; i < ITEMS_PER_THREAD; ++i) {
     if (flags[i]) {
       int hash = HASH(items[i], ht_len, key_mins);
-      uint64_t slot = *reinterpret_cast<uint64_t*>(&ht[hash << 1]);
-      if (slot != 0) {
-        res[i] = (slot >> 32);
+      K slot_key = ht[hash << 1];
+      if (slot_key == items[i]) {
+        res[i] = static_cast<V>(ht[(hash << 1) + 1]);
       } else {
         flags[i] = 0;
       }
@@ -89,9 +89,9 @@ inline void BlockProbeDirectAndPHT_2(int tid, K (&items)[ITEMS_PER_THREAD],
   for (int i = 0; i < ITEMS_PER_THREAD; ++i) {
     if (flags[i] && (i * BLOCK_THREADS + tid < num_items)) {
       int hash = HASH(items[i], ht_len, key_mins);
-      uint64_t slot = *reinterpret_cast<uint64_t*>(&ht[hash << 1]);
-      if (slot != 0) {
-        res[i] = (slot >> 32);
+      K slot_key = ht[hash << 1];
+      if (slot_key == items[i]) {
+        res[i] = static_cast<V>(ht[(hash << 1) + 1]);
       } else {
         flags[i] = 0;
       }

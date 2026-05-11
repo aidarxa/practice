@@ -47,7 +47,7 @@ struct NotEqual{
     T _compare;
     NotEqual(T compare):_compare(compare){};
     bool operator()(const T& value) const noexcept {
-        return value == _compare;
+        return value != _compare;
     };
 };
 

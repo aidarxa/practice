@@ -116,6 +116,55 @@ static bool allIn(const std::set<std::string>& subset,
     return true;
 }
 
+
+static bool looksLikeHashKeyColumn(const std::string& column_name) {
+    return column_name.find("key") != std::string::npos ||
+           column_name.find("Key") != std::string::npos ||
+           column_name == "lo_orderdate" ||
+           column_name == "lo_commitdate";
+}
+
+static bool isSingleHashJoinEquality(const ExprNode* expr) {
+    if (!expr || expr->getType() != ExprType::OP_EQ) return false;
+    const auto* eq = static_cast<const BinaryExpr*>(expr);
+    if (!eq->left || !eq->right) return false;
+    if (eq->left->getType() != ExprType::COLUMN_REF ||
+        eq->right->getType() != ExprType::COLUMN_REF) {
+        return false;
+    }
+
+    const auto* left = static_cast<const ColumnRefExpr*>(eq->left.get());
+    const auto* right = static_cast<const ColumnRefExpr*>(eq->right.get());
+    const std::string left_table = left->table_name.empty()
+        ? getTableName(left->column_name)
+        : left->table_name;
+    const std::string right_table = right->table_name.empty()
+        ? getTableName(right->column_name)
+        : right->table_name;
+
+    if (left_table.empty() || right_table.empty() || left_table == right_table) {
+        return false;
+    }
+
+    return looksLikeHashKeyColumn(left->column_name) ||
+           looksLikeHashKeyColumn(right->column_name);
+}
+
+static bool isHashJoinPredicate(const ExprNode* expr) {
+    if (!expr) return false;
+    if (isSingleHashJoinEquality(expr)) return true;
+
+    // Keep OR-key joins recognizable for the future MHT/multi-probe path, but
+    // do not classify arbitrary theta predicates as hash joins.
+    if (expr->getType() == ExprType::OP_OR) {
+        const auto* bin = static_cast<const BinaryExpr*>(expr);
+        return isHashJoinPredicate(bin->left.get()) &&
+               isHashJoinPredicate(bin->right.get());
+    }
+
+    return false;
+}
+
 // ============================================================================
 // PredicatePushdownRule::apply
 // ============================================================================
@@ -192,8 +241,11 @@ void PredicatePushdownRule::tryPushdown(std::unique_ptr<OperatorNode>& node) {
             if (right_tables.count(t)) touches_right = true;
         }
 
-        // Если условие требует данных и слева, и справа — это Join Condition!
-        if (touches_left && touches_right) {
+        // Only equi-key predicates belong to HashJoinNode. Non-key theta
+        // predicates, e.g. c_nation = s_nation or lo_quantity >= p_size - 5,
+        // must remain as FilterNode above the join so the push pipeline can
+        // evaluate them after payload columns have been materialized.
+        if (touches_left && touches_right && isHashJoinPredicate(cond.get())) {
             if (join->join_condition) {
                 join->join_condition = std::make_unique<BinaryExpr>(
                     ExprType::OP_AND, std::move(join->join_condition), std::move(cond));
