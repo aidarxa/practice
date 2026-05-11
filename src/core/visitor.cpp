@@ -38,6 +38,101 @@ static std::string sizeMacroFor(const std::string& table_name) {
     return "0";
 }
 
+enum class FilterPredicateSupport {
+    FastPathSupported,
+    NeedsUniversalPath,
+    Unsupported
+};
+
+static const char* exprTypeName(ExprType t) {
+    switch (t) {
+        case ExprType::COLUMN_REF:    return "COLUMN_REF";
+        case ExprType::LITERAL_INT:   return "LITERAL_INT";
+        case ExprType::LITERAL_FLOAT: return "LITERAL_FLOAT";
+        case ExprType::OP_AND:        return "OP_AND";
+        case ExprType::OP_OR:         return "OP_OR";
+        case ExprType::OP_EQ:         return "OP_EQ";
+        case ExprType::OP_NEQ:        return "OP_NEQ";
+        case ExprType::OP_LT:         return "OP_LT";
+        case ExprType::OP_LTE:        return "OP_LTE";
+        case ExprType::OP_GT:         return "OP_GT";
+        case ExprType::OP_GTE:        return "OP_GTE";
+        case ExprType::OP_ADD:        return "OP_ADD";
+        case ExprType::OP_SUB:        return "OP_SUB";
+        case ExprType::OP_MUL:        return "OP_MUL";
+        case ExprType::OP_DIV:        return "OP_DIV";
+        default:                      return "UNKNOWN_EXPR_TYPE";
+    }
+}
+
+static bool isComparisonOp(ExprType t) {
+    return t >= ExprType::OP_EQ && t <= ExprType::OP_GTE;
+}
+
+static FilterPredicateSupport validateFilterFastPathPredicate(
+        const ExprNode* expr,
+        std::string& error_message) {
+    if (!expr) return FilterPredicateSupport::FastPathSupported;
+
+    if (expr->getType() == ExprType::OP_AND) {
+        const auto* bin = static_cast<const BinaryExpr*>(expr);
+        FilterPredicateSupport left = validateFilterFastPathPredicate(bin->left.get(), error_message);
+        if (left == FilterPredicateSupport::Unsupported) return left;
+        FilterPredicateSupport right = validateFilterFastPathPredicate(bin->right.get(), error_message);
+        if (right == FilterPredicateSupport::Unsupported) return right;
+        if (left == FilterPredicateSupport::NeedsUniversalPath ||
+            right == FilterPredicateSupport::NeedsUniversalPath) {
+            return FilterPredicateSupport::NeedsUniversalPath;
+        }
+        return FilterPredicateSupport::FastPathSupported;
+    }
+
+    if (expr->getType() == ExprType::OP_OR) {
+        return FilterPredicateSupport::NeedsUniversalPath;
+    }
+
+    if (!isComparisonOp(expr->getType())) {
+        error_message = std::string("Unsupported filter predicate node: ") + exprTypeName(expr->getType());
+        return FilterPredicateSupport::Unsupported;
+    }
+
+    const auto* cmp = static_cast<const BinaryExpr*>(expr);
+    if (!cmp->left || !cmp->right) {
+        error_message = std::string("Malformed comparison predicate (null child), op=") + exprTypeName(cmp->op_type);
+        return FilterPredicateSupport::Unsupported;
+    }
+
+    const ExprType left_type = cmp->left->getType();
+    const ExprType right_type = cmp->right->getType();
+
+    const bool col_vs_int = left_type == ExprType::COLUMN_REF && right_type == ExprType::LITERAL_INT;
+    const bool col_vs_col = left_type == ExprType::COLUMN_REF && right_type == ExprType::COLUMN_REF;
+    if (col_vs_int || col_vs_col) {
+        return FilterPredicateSupport::FastPathSupported;
+    }
+
+    const bool has_math = left_type == ExprType::OP_ADD || left_type == ExprType::OP_SUB ||
+                          left_type == ExprType::OP_MUL || left_type == ExprType::OP_DIV ||
+                          right_type == ExprType::OP_ADD || right_type == ExprType::OP_SUB ||
+                          right_type == ExprType::OP_MUL || right_type == ExprType::OP_DIV;
+    if (has_math) {
+        return FilterPredicateSupport::NeedsUniversalPath;
+    }
+
+    const bool has_literal_float = left_type == ExprType::LITERAL_FLOAT || right_type == ExprType::LITERAL_FLOAT;
+    if (has_literal_float) {
+        error_message = std::string("Unsupported float literal in fast-path predicate, op=") +
+                        exprTypeName(cmp->op_type) + ", left=" + exprTypeName(left_type) +
+                        ", right=" + exprTypeName(right_type);
+        return FilterPredicateSupport::Unsupported;
+    }
+
+    error_message = std::string("Unsupported comparison shape in fast-path predicate, op=") +
+                    exprTypeName(cmp->op_type) + ", left=" + exprTypeName(left_type) +
+                    ", right=" + exprTypeName(right_type);
+    return FilterPredicateSupport::Unsupported;
+}
+
 // ============================================================================
 // JITExprVisitor — constructor
 // ============================================================================
@@ -602,6 +697,18 @@ void JITOperatorVisitor::consumeFilterVector(const FilterNode* node, JITContext&
                                               const std::vector<std::string>& active_vars) {
     auto& code = ctx.current_pipeline->kernel_body;
     if (node->predicate) {
+        std::string validation_error;
+        const FilterPredicateSupport support =
+            validateFilterFastPathPredicate(node->predicate.get(), validation_error);
+        if (support == FilterPredicateSupport::Unsupported) {
+            throw std::runtime_error("Filter predicate is not translatable before JIT C++ compilation: " + validation_error);
+        }
+
+        if (support == FilterPredicateSupport::NeedsUniversalPath) {
+            bool fp = true;
+            JITExprVisitor expr_vis(ctx, code, "flags", false, &fp);
+            node->predicate->accept(expr_vis);
+        } else {
         // Recursive lambda to handle AND chains and simple binary comparisons
         std::function<bool(const ExprNode*, bool&)> process_expr = [&](const ExprNode* expr, bool& first) -> bool {
             if (!expr) return true;
@@ -640,17 +747,9 @@ void JITOperatorVisitor::consumeFilterVector(const FilterNode* node, JITContext&
         
         bool first_flag = true;
         bool fully_optimized = process_expr(node->predicate.get(), first_flag);
-        
         if (!fully_optimized) {
-            // Fallback for complex expressions
-            code << "            // Fallback for complex expression! Type: " << (int)node->predicate->getType() << "\n";
-            if (node->predicate->getType() >= ExprType::OP_EQ && node->predicate->getType() <= ExprType::OP_NEQ) {
-                const auto* bin = static_cast<const BinaryExpr*>(node->predicate.get());
-                code << "            // Left type: " << (int)bin->left->getType() << ", Right type: " << (int)bin->right->getType() << "\n";
-            }
-            bool fp = true;
-            JITExprVisitor expr_vis(ctx, code, "flags", false, &fp);
-            node->predicate->accept(expr_vis);
+            throw std::runtime_error("Internal fast-path mismatch after successful validation in consumeFilterVector");
+        }
         }
     }
     if (node->parent_) {
