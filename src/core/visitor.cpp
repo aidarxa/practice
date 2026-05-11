@@ -402,6 +402,8 @@ static void findAllColumnsForTable(const OperatorNode* node, const std::string& 
 
 JITOperatorVisitor::JITOperatorVisitor(JITContext& ctx, const Catalog& catalog)
     : ctx_(ctx), catalog_(catalog) {
+    assert(execution_mode_ == ExecutionMode::DataCentric && "Only canonical Data-Centric mode is supported");
+    assert(consume_mode_ == ConsumeMode::Vector && "Initial consume mode must be Vector");
 }
 
 // ============================================================================
@@ -450,11 +452,13 @@ void JITOperatorVisitor::produce(const OperatorNode* node, JITContext& ctx) {
 
 void JITOperatorVisitor::consume(const OperatorNode* node, JITContext& ctx, const OperatorNode* sender, const std::vector<std::string>& active_vars) {
     if (!node) return;
-    switch (node->getType()) {
-        case OperatorType::FILTER: consumeFilter(static_cast<const FilterNode*>(node), ctx, sender, active_vars); break;
-        case OperatorType::HASH_JOIN: consumeHashJoin(static_cast<const HashJoinNode*>(node), ctx, sender, active_vars); break;
-        case OperatorType::AGGREGATE: consumeAggregate(static_cast<const AggregateNode*>(node), ctx, sender, active_vars); break;
-        default: break;
+    assert(execution_mode_ == ExecutionMode::DataCentric && "Legacy execution mode is not supported");
+    if (consume_mode_ == ConsumeMode::Vector) {
+        consumeVector(node, ctx, sender, active_vars);
+    } else if (consume_mode_ == ConsumeMode::Item) {
+        consumeItem(node, ctx, sender, active_vars);
+    } else {
+        assert(false && "Unknown consume mode");
     }
 }
 
@@ -491,7 +495,8 @@ void JITOperatorVisitor::produceTableScan(const TableScanNode* node, JITContext&
 
     // 3. ЗАПУСК КОНВЕЙЕРА (Эта фаза заполнит ctx.col_to_reg)
     if (node->parent_) {
-        consumeVector(node->parent_, ctx, node, active_vars);
+        consume_mode_ = ConsumeMode::Vector;
+        consume(node->parent_, ctx, node, active_vars);
     }
     std::string pipeline_logic = ctx.current_pipeline->kernel_body.str();
 
@@ -528,21 +533,6 @@ void JITOperatorVisitor::produceFilter(const FilterNode* node, JITContext& ctx) 
     }
 }
 
-void JITOperatorVisitor::consumeFilter(const FilterNode* node, JITContext& ctx, const OperatorNode* sender, const std::vector<std::string>& active_vars) {
-    auto& code = ctx.current_pipeline->kernel_body;
-
-    if (node->predicate) {
-        // We are already inside the per-item loop.
-        // Emit a scalar if() guard using inline expression translation.
-        JITExprVisitor expr_visitor(ctx, code, "", false, nullptr);
-        std::string cond = expr_visitor.translateInlineExpr(node->predicate.get(), true);
-        code << "                    if (" << cond << ") {\n";
-        if (node->parent_) consume(node->parent_, ctx, node, active_vars);
-        code << "                    }\n";
-    } else {
-        if (node->parent_) consume(node->parent_, ctx, node, active_vars);
-    }
-}
 
 // ============================================================================
 // loadIntoReg — helper for Vectorized Push Model to reuse registers
@@ -574,6 +564,8 @@ void JITOperatorVisitor::consumeVector(const OperatorNode* node, JITContext& ctx
                                        const OperatorNode* sender,
                                        const std::vector<std::string>& active_vars) {
     if (!node) return;
+    assert(execution_mode_ == ExecutionMode::DataCentric && "Vector consume is only valid in Data-Centric mode");
+    assert(consume_mode_ == ConsumeMode::Vector && "Invalid transition into vector consume");
     switch (node->getType()) {
         case OperatorType::FILTER:
             consumeFilterVector(static_cast<const FilterNode*>(node), ctx, sender, active_vars); break;
@@ -589,6 +581,8 @@ void JITOperatorVisitor::consumeItem(const OperatorNode* node, JITContext& ctx,
                                      const OperatorNode* sender,
                                      const std::vector<std::string>& active_vars) {
     if (!node) return;
+    assert(execution_mode_ == ExecutionMode::DataCentric && "Item consume is only valid in Data-Centric mode");
+    assert(consume_mode_ == ConsumeMode::Item && "consumeItem requires item mode");
     switch (node->getType()) {
         case OperatorType::FILTER:
             consumeFilterItem(static_cast<const FilterNode*>(node), ctx, sender, active_vars); break;
@@ -659,7 +653,10 @@ void JITOperatorVisitor::consumeFilterVector(const FilterNode* node, JITContext&
             node->predicate->accept(expr_vis);
         }
     }
-    if (node->parent_) consumeVector(node->parent_, ctx, node, active_vars);
+    if (node->parent_) {
+        consume_mode_ = ConsumeMode::Vector;
+        consume(node->parent_, ctx, node, active_vars);
+    }
 }
 
 // ============================================================================
@@ -673,10 +670,16 @@ void JITOperatorVisitor::consumeFilterItem(const FilterNode* node, JITContext& c
         JITExprVisitor expr_vis(ctx, code, "", false, nullptr);
         std::string cond = expr_vis.translateInlineExpr(node->predicate.get(), true);
         code << "                        if (" << cond << ") {\n";
-        if (node->parent_) consumeItem(node->parent_, ctx, node, active_vars);
+        if (node->parent_) {
+            consume_mode_ = ConsumeMode::Item;
+            consume(node->parent_, ctx, node, active_vars);
+        }
         code << "                        }\n";
     } else {
-        if (node->parent_) consumeItem(node->parent_, ctx, node, active_vars);
+        if (node->parent_) {
+            consume_mode_ = ConsumeMode::Item;
+            consume(node->parent_, ctx, node, active_vars);
+        }
     }
 }
 
@@ -956,12 +959,6 @@ void JITOperatorVisitor::consumeAggregateItem(const AggregateNode* node, JITCont
     }
 }
 
-// Legacy consume() — routes to consumeVector for backward compat
-void JITOperatorVisitor::consumeAggregate(const AggregateNode* node, JITContext& ctx,
-                                           const OperatorNode* sender,
-                                           const std::vector<std::string>& active_vars) {
-    consumeAggregateVector(node, ctx, sender, active_vars);
-}
 
 JITOperatorVisitor::BuildInfo JITOperatorVisitor::computeBuildInfo(
         const std::string& dim_table,
@@ -1485,7 +1482,10 @@ void JITOperatorVisitor::consumeHashJoinVector(const HashJoinNode* node, JITCont
         }
 
         // Still in vector mode — pass to parent
-        if (node->parent_) consumeVector(node->parent_, ctx, node, active_vars);
+        if (node->parent_) {
+            consume_mode_ = ConsumeMode::Vector;
+            consume(node->parent_, ctx, node, active_vars);
+        }
 
     } else {
         // ---- MHT probe: must expand rows → open scalar loop ----
@@ -1507,7 +1507,10 @@ void JITOperatorVisitor::consumeHashJoinVector(const HashJoinNode* node, JITCont
         }
 
         // Drop to item mode for all parents
-        if (node->parent_) consumeItem(node->parent_, ctx, node, new_vars);
+        if (node->parent_) {
+            consume_mode_ = ConsumeMode::Item;
+            consume(node->parent_, ctx, node, new_vars);
+        }
 
         code << "                    }\n";
         code << "                }\n";
@@ -1540,16 +1543,13 @@ void JITOperatorVisitor::consumeHashJoinItem(const HashJoinNode* node, JITContex
     }
     std::vector<std::string> new_vars = active_vars;
     if (!bi.val_col.empty()) new_vars.push_back(bi.val_col);
-    if (node->parent_) consumeItem(node->parent_, ctx, node, new_vars);
+    if (node->parent_) {
+        consume_mode_ = ConsumeMode::Item;
+        consume(node->parent_, ctx, node, new_vars);
+    }
     code << "                        }\n";
 }
 
-// Legacy consume() — routes to consumeHashJoinVector
-void JITOperatorVisitor::consumeHashJoin(const HashJoinNode* node, JITContext& ctx,
-                                          const OperatorNode* sender,
-                                          const std::vector<std::string>& active_vars) {
-    consumeHashJoinVector(node, ctx, sender, active_vars);
-}
 
 
 // ============================================================================

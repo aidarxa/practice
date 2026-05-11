@@ -147,11 +147,12 @@ private:
 //
 // Entry point: visit(AggregateNode) → produce(root)
 //
-// Push model flow (example Scan → Filter → HashJoin → Agg):
+// Runtime flow (canonical Data-Centric path, no legacy scalar fallback):
 //   produce(Agg) → produce(HashJoin) → produce(Filter) → produce(Scan)
 //   Scan opens a for-loop, then:
-//   consume(Filter) → emits if-guard → consume(HashJoin) → probe/expand →
-//   consume(Agg) → emits atomic_add → closes all brackets bottom-up
+//   consumeVector(Filter) → consumeVector(HashJoin) → consumeVector(Agg)
+//   If a join expands 1-to-N (MHT), control switches to consumeItem(...)
+//   for the remainder of the parent chain in that scope.
 //
 // Pipeline Breakers:
 //   HashBuildNode generates one or more separate build kernels (pipelines)
@@ -159,6 +160,10 @@ private:
 // ============================================================================
 class JITOperatorVisitor : public OperatorVisitor {
 public:
+    enum class ExecutionMode : uint8_t {
+        DataCentric = 0
+    };
+
     explicit JITOperatorVisitor(JITContext& ctx, const Catalog& catalog);
 
     // ---- Legacy OperatorVisitor interface (entry point via accept()) ----
@@ -184,7 +189,10 @@ public:
                      const OperatorNode* sender,
                      const std::vector<std::string>& active_vars);
 
-    // Legacy dispatcher — routes to consumeVector by default.
+    // Canonical dispatcher:
+    //  - called only by produce* entry points.
+    //  - routes into consumeVector/consumeItem according to consume_mode_.
+    //  - legacy scalar consume path is intentionally removed.
     void consume(const OperatorNode* node, JITContext& ctx,
                  const OperatorNode* sender,
                  const std::vector<std::string>& active_vars);
@@ -244,16 +252,13 @@ private:
                               const OperatorNode* sender,
                               const std::vector<std::string>& active_vars);
 
-    // ---- Legacy scalar-mode consume (kept for compat; routes to consumeFilter/etc.) ----
-    void consumeFilter    (const FilterNode*    node, JITContext& ctx,
-                           const OperatorNode* sender,
-                           const std::vector<std::string>& active_vars);
-    void consumeHashJoin  (const HashJoinNode*  node, JITContext& ctx,
-                           const OperatorNode* sender,
-                           const std::vector<std::string>& active_vars);
-    void consumeAggregate (const AggregateNode* node, JITContext& ctx,
-                           const OperatorNode* sender,
-                           const std::vector<std::string>& active_vars);
+    enum class ConsumeMode : uint8_t {
+        Vector = 0,
+        Item
+    };
+
+    ExecutionMode execution_mode_ = ExecutionMode::DataCentric;
+    ConsumeMode   consume_mode_   = ConsumeMode::Vector;
 
     // ---- Build kernel emitters ----
     // PHT: emit one build kernel (with optional filter). Populates hash_tables.
