@@ -212,6 +212,9 @@ private:
         std::string pk_col;        // PK column in the dim table
     };
     std::unordered_map<const OperatorNode*, BuildInfo> build_infos_;
+    std::set<std::string> agg_cols_;    // Columns required for aggregation (high priority for joins)
+    std::set<std::string> filter_cols_; // Columns required for filtering (low priority for joins)
+    void collectAllColumnsFromTree(const OperatorNode* node);
 
     // ---- Produce handlers (top-down) ----
     void produceTableScan (const TableScanNode*  node, JITContext& ctx);

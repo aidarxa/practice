@@ -416,7 +416,6 @@ void JITOperatorVisitor::visit(const AggregateNode& node) {
     // Это необходимо, так как Оптимизатор мог разрушить связи при перестройке плана.
     std::function<void(const OperatorNode*, OperatorNode*)> repairParents = [&](const OperatorNode* current, OperatorNode* parent) {
         if (!current) return;
-        // Снимаем константность, так как это служебная JIT-операция для обеспечения корректности дерева
         const_cast<OperatorNode*>(current)->parent_ = parent;
         for (const auto& child : current->getChildren()) {
             repairParents(child.get(), const_cast<OperatorNode*>(current));
@@ -424,7 +423,12 @@ void JITOperatorVisitor::visit(const AggregateNode& node) {
     };
     repairParents(&node, nullptr);
 
-    // 2. Старт генерации конвейера
+    // 2. СБОР ВСЕХ КОЛОНОК: Обходим все дерево один раз для надежного обнаружения требований
+    agg_cols_.clear();
+    filter_cols_.clear();
+    collectAllColumnsFromTree(&node);
+
+    // 3. Старт генерации конвейера
     produce(&node, ctx_);
 }
 
@@ -437,13 +441,11 @@ void JITOperatorVisitor::visit(const HashJoinNode&  /*node*/) {}
 // ============================================================================
 
 void JITOperatorVisitor::produce(const OperatorNode* node, JITContext& ctx) {
-    if (!node) return;
-    switch (node->getType()) {
-        case OperatorType::TABLE_SCAN: produceTableScan(static_cast<const TableScanNode*>(node), ctx); break;
-        case OperatorType::FILTER: produceFilter(static_cast<const FilterNode*>(node), ctx); break;
-        case OperatorType::HASH_JOIN: produceHashJoin(static_cast<const HashJoinNode*>(node), ctx); break;
-        case OperatorType::AGGREGATE: produceAggregate(static_cast<const AggregateNode*>(node), ctx); break;
-    }
+    // Дерево уже починено в visit(AggregateNode), поэтому здесь просто диспетчеризация
+    if (node->getType() == OperatorType::TABLE_SCAN) produceTableScan(static_cast<const TableScanNode*>(node), ctx);
+    else if (node->getType() == OperatorType::FILTER) produceFilter(static_cast<const FilterNode*>(node), ctx);
+    else if (node->getType() == OperatorType::HASH_JOIN) produceHashJoin(static_cast<const HashJoinNode*>(node), ctx);
+    else if (node->getType() == OperatorType::AGGREGATE) produceAggregate(static_cast<const AggregateNode*>(node), ctx);
 }
 
 void JITOperatorVisitor::consume(const OperatorNode* node, JITContext& ctx, const OperatorNode* sender, const std::vector<std::string>& active_vars) {
@@ -497,11 +499,13 @@ void JITOperatorVisitor::produceTableScan(const TableScanNode* node, JITContext&
     std::stringstream declarations;
     declarations << "            int items[ITEMS_PER_THREAD];\n";
     declarations << "            int flags[ITEMS_PER_THREAD];\n";
+    declarations << "            int items2[ITEMS_PER_THREAD];\n"; // ВСЕГДА объявляем items2
     
     std::set<std::string> emitted;
     for (const auto& pair : ctx.col_to_reg) {
         const std::string& reg = pair.second;
-        if (reg != "items" && reg != "flags" && !emitted.count(reg)) {
+        // Пропускаем уже объявленные базовые регистры
+        if (reg != "items" && reg != "flags" && reg != "items2" && !emitted.count(reg)) {
             declarations << "            int " << reg << "[ITEMS_PER_THREAD];\n";
             emitted.insert(reg);
         }
@@ -546,6 +550,12 @@ void JITOperatorVisitor::consumeFilter(const FilterNode* node, JITContext& ctx, 
 void JITOperatorVisitor::ensureLoaded(const std::string& col_name, JITContext& ctx) const {} // DEPRECATED
 
 static void loadIntoReg(const std::string& col_name, const std::string& reg_name, JITContext& ctx) {
+    // ОГРОМНЫЙ ФИКС: Если колонка УЖЕ является самостоятельным регистром (например, d_year, 
+    // извлеченный из HashJoin), мы НЕ ДОЛЖНЫ пытаться загрузить ее из глобальной памяти фактов!
+    if (ctx.col_to_reg.count(col_name) && ctx.col_to_reg[col_name] == col_name) {
+        return; // Колонка уже доступна локально!
+    }
+
     if (ctx.col_to_reg[col_name] != reg_name) {
         ctx.external_columns.insert("d_" + col_name);
         ctx.col_to_reg[col_name] = reg_name;
@@ -777,7 +787,18 @@ static void extractAllColumns(const ExprNode* e, std::vector<std::string>& cols)
             cols.push_back(col->column_name);
         }
     } 
-    // Безопасный каст: только если это действительно бинарный оператор (тип >= OP_AND)
+    else if (e->getType() >= ExprType::OP_AND) {
+        const auto* bin = static_cast<const BinaryExpr*>(e);
+        if (bin->left) extractAllColumns(bin->left.get(), cols);
+        if (bin->right) extractAllColumns(bin->right.get(), cols);
+    }
+}
+
+static void extractAllColumns(const ExprNode* e, std::set<std::string>& cols) {
+    if (!e) return;
+    if (e->getType() == ExprType::COLUMN_REF) {
+        cols.insert(static_cast<const ColumnRefExpr*>(e)->column_name);
+    } 
     else if (e->getType() >= ExprType::OP_AND) {
         const auto* bin = static_cast<const BinaryExpr*>(e);
         if (bin->left) extractAllColumns(bin->left.get(), cols);
@@ -802,6 +823,10 @@ void JITOperatorVisitor::consumeAggregateVector(const AggregateNode* node, JITCo
     
     int reg_idx = 0;
     for (const auto& col : agg_cols) {
+        // Пропускаем загрузку, если это payload измерения, уже лежащий в своем регистре
+        if (ctx.col_to_reg.count(col) && ctx.col_to_reg[col] == col) {
+            continue; 
+        }
         std::string reg_name = (reg_idx == 0) ? "items" : ("items" + std::to_string(reg_idx + 1));
         loadIntoReg(col, reg_name, ctx);
         reg_idx++;
@@ -996,7 +1021,70 @@ JITOperatorVisitor::BuildInfo JITOperatorVisitor::computeBuildInfo(
         };
         extractKeys(join_node->join_condition.get());
     }
+
+    // 1. Собираем колонки, которые требуются узлам ВЫШЕ джойна
+    // Разделяем на те, что нужны для агрегации (приоритет) и те, что для фильтрации.
+    std::vector<std::string> agg_required;
+    std::vector<std::string> filter_required;
+    const OperatorNode* curr = join_node->parent_;
+    while (curr) {
+        if (curr->getType() == OperatorType::AGGREGATE) {
+            const auto* agg = static_cast<const AggregateNode*>(curr);
+            // Извлекаем колонки из всех агрегатных выражений
+            for (const auto& a : agg->aggregates) {
+                extractAllColumns(a.agg_expr.get(), agg_required);
+            }
+            // Извлекаем колонки из всех выражений группировки
+            for (const auto& gb : agg->group_by_exprs) {
+                extractAllColumns(gb.get(), agg_required);
+            }
+        } else if (curr->getType() == OperatorType::FILTER) {
+            const auto* flt = static_cast<const FilterNode*>(curr);
+            extractAllColumns(flt->predicate.get(), filter_required);
+        }
+        curr = curr->parent_;
+    }
+
+    // 2. Ищем val_col: сначала среди агрегатных, потом среди фильтровых
+    bi.variant = 1;
+    bi.val_col = "";
+
+    auto findMatch = [&](const std::set<std::string>& cols) -> bool {
+        for (const auto& col : cols) {
+            if (getTableName(col) == dim_table && col != bi.pk_col) {
+                bi.val_col = col;
+                bi.variant = 2;
+                return true;
+            }
+        }
+        return false;
+    };
+
+    if (!findMatch(agg_cols_)) {
+        findMatch(filter_cols_);
+    }
+
     return bi;
+}
+
+void JITOperatorVisitor::collectAllColumnsFromTree(const OperatorNode* node) {
+    if (!node) return;
+    if (node->getType() == OperatorType::AGGREGATE) {
+        const auto* agg = static_cast<const AggregateNode*>(node);
+        for (const auto& a : agg->aggregates) {
+            extractAllColumns(a.agg_expr.get(), agg_cols_);
+        }
+        for (const auto& gb : agg->group_by_exprs) {
+            extractAllColumns(gb.get(), agg_cols_);
+        }
+    } else if (node->getType() == OperatorType::FILTER) {
+        const auto* flt = static_cast<const FilterNode*>(node);
+        extractAllColumns(flt->predicate.get(), filter_cols_);
+    }
+    
+    for (const auto& child : node->getChildren()) {
+        collectAllColumnsFromTree(child.get());
+    }
 }
 
 // Emits block-level filter predicates for a build-side dimension kernel.
@@ -1380,13 +1468,16 @@ void JITOperatorVisitor::consumeHashJoinVector(const HashJoinNode* node, JITCont
                  << "(tid, items, flags, " << bi.ht_name << ", "
                  << bi.ht_size_expr << ", " << bi.key_mins << ", num_tile_items);\n";
         } else {
-            // PHT_2: key+value — results land in items2
-            code << "            int items2[ITEMS_PER_THREAD];\n";
+            // PHT_2: key+value — результаты land in items2
+            // ВНИМАНИЕ: Убрано локальное объявление int items2, так как оно теперь в заголовке ядра
             code << "            BlockProbeAndPHT_2<int, int, BLOCK_THREADS, ITEMS_PER_THREAD>"
                  << "(tid, items, items2, flags, " << bi.ht_name << ", "
                  << bi.ht_size_expr << ", " << bi.key_mins << ", num_tile_items);\n";
             // Scatter payload into the val_col register for use by aggregation
             if (!bi.val_col.empty()) {
+                // РЕГИСТРАЦИЯ: Говорим TableScan, что нужно сгенерировать `int val_col[ITEMS]`;
+                ctx.col_to_reg[bi.val_col] = bi.val_col; 
+                
                 code << "            #pragma unroll\n";
                 code << "            for (int i = 0; i < ITEMS_PER_THREAD; ++i) "
                      << bi.val_col << "[i] = items2[i];\n";
@@ -1408,6 +1499,8 @@ void JITOperatorVisitor::consumeHashJoinVector(const HashJoinNode* node, JITCont
 
         std::vector<std::string> new_vars = active_vars;
         if (!bi.val_col.empty()) {
+            // РЕГИСТРАЦИЯ: Говорим TableScan, что нужно сгенерировать `int val_col[ITEMS]`;
+            ctx.col_to_reg[bi.val_col] = bi.val_col;
             code << "                        " << bi.val_col << "[i] = payload_"
                  << bi.dim_prefix << "[offset + j];\n";
             new_vars.push_back(bi.val_col);
