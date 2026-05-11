@@ -730,6 +730,15 @@ static std::string translateMathExprPush(
     }
 }
 
+static std::string resolveLoadedRegOrThrow(const std::string& col_name, const JITContext& ctx) {
+    auto it = ctx.col_to_reg.find(col_name);
+    if (it == ctx.col_to_reg.end() || it->second.empty()) {
+        throw std::runtime_error(
+            "Column '" + col_name + "' is not loaded into register before aggregate codegen");
+    }
+    return it->second;
+}
+
 // ============================================================================
 // generatePerfectHash — builds a minimal perfect hash expression string and
 // total table size for a GROUP BY column list.
@@ -737,7 +746,8 @@ static std::string translateMathExprPush(
 // ============================================================================
 static std::pair<std::string, uint64_t> generatePerfectHash(
         const std::vector<std::unique_ptr<ExprNode>>& group_by,
-        const Catalog& catalog) {
+        const Catalog& catalog,
+        const JITContext& ctx) {
     std::string hash_expr;
     uint64_t total_size = 1;
 
@@ -758,7 +768,8 @@ static std::pair<std::string, uint64_t> generatePerfectHash(
             }
         } catch (...) {}
 
-        std::string term = "(" + col_name + "[i] - " + std::to_string(min_val) + ")";
+        const std::string reg_name = resolveLoadedRegOrThrow(col_name, ctx);
+        std::string term = "(" + reg_name + "[i] - " + std::to_string(min_val) + ")";
         if (hash_expr.empty()) {
             hash_expr = term;
         } else {
@@ -832,6 +843,13 @@ void JITOperatorVisitor::consumeAggregateVector(const AggregateNode* node, JITCo
         reg_idx++;
     }
 
+    for (const auto& g : node->group_by_exprs) {
+        if (g->getType() == ExprType::COLUMN_REF) {
+            const auto* col = static_cast<const ColumnRefExpr*>(g.get());
+            (void)resolveLoadedRegOrThrow(col->column_name, ctx);
+        }
+    }
+
     if (!has_group_by) {
         // ---- Simple aggregation: local sum + reduce_over_group ----
         ctx.tuple_size = (int)node->aggregates.size();
@@ -867,7 +885,7 @@ void JITOperatorVisitor::consumeAggregateVector(const AggregateNode* node, JITCo
         }
     } else {
         // ---- GROUP BY aggregation: per-slot atomic ----
-        auto [hash_expr, total_size] = generatePerfectHash(node->group_by_exprs, catalog_);
+        auto [hash_expr, total_size] = generatePerfectHash(node->group_by_exprs, catalog_, ctx);
         int ts = (int)(node->group_by_exprs.size() + node->aggregates.size());
         ctx.tuple_size = ts;
         ctx.result_size_expr = std::to_string((uint64_t)total_size * ts);
@@ -881,8 +899,9 @@ void JITOperatorVisitor::consumeAggregateVector(const AggregateNode* node, JITCo
         for (const auto& g : node->group_by_exprs) {
             if (g->getType() == ExprType::COLUMN_REF) {
                 const auto* col = static_cast<const ColumnRefExpr*>(g.get());
+                const std::string reg_name = resolveLoadedRegOrThrow(col->column_name, ctx);
                 code << "                    d_result[(unsigned long long)hash*" << ts
-                     << "+" << slot << "] = (unsigned long long)" << col->column_name << "[i];\n";
+                     << "+" << slot << "] = (unsigned long long)" << reg_name << "[i];\n";
             }
             ++slot;
         }
@@ -927,7 +946,18 @@ void JITOperatorVisitor::consumeAggregateItem(const AggregateNode* node, JITCont
             code << "                        at_item.fetch_add(" << val << ");\n";
         }
     } else {
-        auto [hash_expr, total_size] = generatePerfectHash(node->group_by_exprs, catalog_);
+        std::set<std::string> required_cols;
+        for (const auto& agg : node->aggregates) {
+            extractAllColumns(agg.agg_expr.get(), required_cols);
+        }
+        for (const auto& g : node->group_by_exprs) {
+            extractAllColumns(g.get(), required_cols);
+        }
+        for (const auto& col : required_cols) {
+            (void)resolveLoadedRegOrThrow(col, ctx);
+        }
+
+        auto [hash_expr, total_size] = generatePerfectHash(node->group_by_exprs, catalog_, ctx);
         int ts = (int)(node->group_by_exprs.size() + node->aggregates.size());
         ctx.tuple_size = ts;
         ctx.result_size_expr = std::to_string((uint64_t)total_size * ts);
@@ -936,8 +966,9 @@ void JITOperatorVisitor::consumeAggregateItem(const AggregateNode* node, JITCont
         for (const auto& g : node->group_by_exprs) {
             if (g->getType() == ExprType::COLUMN_REF) {
                 const auto* col = static_cast<const ColumnRefExpr*>(g.get());
+                const std::string reg_name = resolveLoadedRegOrThrow(col->column_name, ctx);
                 code << "                        d_result[(unsigned long long)hash*" << ts
-                     << "+" << slot << "] = (unsigned long long)" << col->column_name << "[i];\n";
+                     << "+" << slot << "] = (unsigned long long)" << reg_name << "[i];\n";
             }
             ++slot;
         }
