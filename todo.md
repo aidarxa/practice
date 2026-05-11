@@ -1,102 +1,99 @@
-TODO 3: Conditional Probe и Поздняя Фильтрация (Уровень 3)
+Внедрение **Data-Centric Push-архитектуры** (конвейерной генерации) — это переход от "учебного" движка к СУБД промышленного уровня. Это потребует фундаментального рефакторинга вашего генератора (`visitor.cpp`), но результат превзойдет все ожидания: вы получите честную семантику SQL (с размножением строк) и максимальную утилизацию кэшей GPU.
 
-Цель: Поддержать кросс-табличные условия внутри OR (Запрос 2) и соединения таблиц, где условие JOIN само является OR-выражением (Запрос 1: lo_orderdate = d_datekey OR lo_commitdate = d_datekey).
+Вот пошаговый план (Roadmap), как перевести ваш текущий движок на Push-модель.
 
-Суть проблемы: 1. Классический HashJoinNode умеет делать только строгое зондирование (Probe) по одному внешнему ключу (fk_col).
-2. Сложные OR-предикаты, затрагивающие несколько измерений сразу, не могут быть спущены (Pushdown) ни в одну из веток. Они остаются "висеть" наверху дерева и должны вычисляться после того, как все хеш-таблицы пробиты, но до агрегации.
-Шаг 3.1: Адаптация FilterNode для "Поздней фильтрации" (Post-Probe)
+---
 
-Благодаря тому, что вы грамотно спроектировали JITOperatorVisitor, этот шаг почти готов, если вы реализовали TODO 2 (Inline JIT).
+### Шаг 1: Смена интерфейса AST-узлов (От Pull к Push)
 
-Когда PredicatePushdownRule видит условие (c_mktsegment = 1 AND d_year = 1998) OR ..., оно не сможет протолкнуть его ни в CUSTOMER, ни в DDATE (так как требуются обе таблицы). Условие останется в FilterNode на самом верху select_kernel.
+Сейчас ваш `JITOperatorVisitor` просто обходит дерево и последовательно пишет код в `stream`. Для Push-модели узлы AST должны общаться друг с другом.
 
-Вам нужно убедиться, что метод visit(const FilterNode& node) в visitor.cpp корректно обрабатывает этот случай:
-C++
+Вам нужно добавить в базовый класс `OperatorNode` два виртуальных метода:
 
-void JITOperatorVisitor::visit(const FilterNode& node) {
-    // 1. Сначала обходим детей (это сгенерирует все загрузки фактов и Hash Probes!)
-    for (const auto& child : node.getChildren()) {
-        child->accept(*this);
-    }
+1. `produce(JITContext& ctx)` — Метод, который *начинает* генерацию данных.
+2. `consume(JITContext& ctx, const std::vector<std::string>& active_vars)` — Метод, который принимает сгенерированные данные снизу и оборачивает их в свою логику.
 
-    // 2. Теперь применяем фильтр "на лету" к уже пробитым данным
-    // Если вы сделали TODO 2, JITExprVisitor сгенерирует Inline C++ код 
-    // прямо здесь, используя переменные, которые уже лежат в регистрах.
-    if (node.predicate) {
-        bool first_pred = false; // Важно: мы не перезаписываем flags, мы их срезаем (AND)
-        JITExprVisitor expr_vis(ctx_, *active_stream_, "flags", false, &first_pred);
-        node.predicate->accept(expr_vis);
-    }
+**Как это работает (на примере `Scan -> Filter -> Agg`):**
+
+1. Движок вызывает `AggNode->produce()`.
+2. `AggNode` ничего не генерирует сам, он просит ребенка: `child->produce()`.
+3. Запрос доходит до `TableScanNode`. Тот начинает писать ядро: `for (int i = 0...) { загрузка переменных; ...`.
+4. Внутри этого цикла `TableScanNode` вызывает метод родителя: `parent->consume(ctx, {v1, v2})`.
+5. Управление возвращается вверх. `FilterNode` вставляет `if (v1 > 10) {` и зовет своего родителя `parent->consume(...)`.
+6. Наконец, `AggNode` вставляет `atomic_add(...)`.
+7. Вызовы возвращаются вниз, закрывая скобки `}`.
+
+### Шаг 2: Модернизация Hash Table (Поддержка 1-to-N)
+
+Чтобы `OR`-джойны и обычные `Inner Joins` корректно размножали строки, хеш-таблица на фазе Build (в `crystal/join.h`) должна научиться хранить несколько значений по одному ключу.
+
+Вам нужно реализовать **Multi-value Hash Table**.
+
+* Вместо массива `[Key, Payload]` создаются два массива:
+1. **Directory:** `[Key, Offset, Count]` — по ключу находим, где лежат данные и сколько их.
+2. **Payload Chunk:** Сплошной массив со всеми данными измерений (значениями колонок).
+
+
+* Когда `build_kernel` встречает дубликат ключа, он атомарно увеличивает `Count` и пишет данные в `Payload Chunk`.
+
+### Шаг 3: Переписывание `HashJoinNode` (Суть размножения)
+
+Именно здесь происходит магия, из-за которой мы затеяли рефакторинг. `HashJoinNode` разделяет запрос на два конвейера.
+
+**В методе `produce()` (Фаза Build):**
+Он генерирует SYCL-ядро для левого потомка (таблицы измерения), которое строит `Multi-value Hash Table`. На этом конвейер 1 заканчивается (Pipeline Breaker).
+
+**В методе `consume()` (Фаза Probe):**
+Сюда снизу (от `TableScan` фактов) приходят переменные.
+Генератор должен написать код, который ищет ключ в хеш-таблице, получает `Offset` и `Count`, и **запускает вложенный цикл**.
+
+```cpp
+void HashJoinNode::consume(JITContext& ctx, ...) {
+    // Генерируем код для Probe
+    ctx.probe_kernel << "int offset = 0, count = 0;\n";
+    ctx.probe_kernel << "ProbeMultiHT(" << ht_name << ", " << key_var << ", &offset, &count);\n";
+    
+    // Вложенный цикл - ЭТО И ЕСТЬ РАЗМНОЖЕНИЕ СТРОК НА GPU!
+    ctx.probe_kernel << "for (int j = 0; j < count; ++j) {\n";
+    
+    // Извлекаем payload для конкретного совпадения
+    ctx.probe_kernel << "    int val = payload_chunk[offset + j];\n";
+    
+    // ПУШИМ СТРОКУ ДАЛЬШЕ РОДИТЕЛЮ (например, в Агрегацию)
+    parent->consume(ctx, ...); 
+    
+    ctx.probe_kernel << "}\n"; // Закрываем цикл размножения
 }
 
-Шаг 3.2: Поддержка OR-джойнов в HashJoinNode
+```
 
-Теперь решаем проблему Запроса 1 (lo_orderdate = d_datekey OR lo_commitdate = d_datekey).
-Нам нужно научить HashJoinNode извлекать оба ключа и генерировать двойной Probe с объединением результатов.
+Если у нас условие `OR` (как в Запросе 1), `HashJoinNode` сгенерирует два таких блока (два `Probe` + два цикла `for`), и родительский `consume` (Агрегация) будет вызван внутри каждого из них.
 
-Обновите логику поиска ключей в JITOperatorVisitor::visit(const HashJoinNode& node):
-C++
+### Шаг 4: Изоляция конвейеров (Pipeline Breakers)
 
-    std::vector<std::string> fk_cols; // Теперь это массив ключей!
-    
-    // ... внутри findCols ...
-    if (e->getType() == ExprType::OP_EQ) {
-        // ... старая логика определения fk_col ...
-        fk_cols.push_back(rc->column_name); // или lc->column_name
-    } else if (e->getType() == ExprType::OP_AND || e->getType() == ExprType::OP_OR) {
-        // Рекурсивно спускаемся и ищем все OP_EQ
-        findCols(bin->left.get());
-        findCols(bin->right.get());
-    }
+Ваш `JITContext` должен научиться понимать, что один SQL-запрос может породить **несколько** `sycl::queue.submit(...)` (несколько ядер).
 
-А в конце метода visit, при генерации кода в probe_kernel, добавьте ветвление:
-C++
+Для этого вводятся Pipeline Breakers.
 
-    if (build_idx < build_infos_.size()) {
-        const auto& bi = build_infos_[build_idx];
-        
-        if (fk_cols.size() == 1) {
-            // СТАНДАРТНЫЙ JOIN (Один ключ)
-            // ... ваш текущий код с BlockLoad и BlockProbeAndPHT ...
-        } 
-        else if (fk_cols.size() > 1) {
-            // OR-JOIN (Несколько ключей к одной таблице)
-            std::string combined_mask = ctx_.getNewMask();
-            ctx_.probe_kernel << "            int " << combined_mask << "[ITEMS_PER_THREAD];\n";
-            ctx_.probe_kernel << "            InitFlagsZero<BLOCK_THREADS, ITEMS_PER_THREAD>(" << combined_mask << ");\n";
-            
-            for (size_t k = 0; k < fk_cols.size(); ++k) {
-                std::string fk = fk_cols[k];
-                std::string temp_flags = ctx_.getNewMask();
-                
-                // 1. Копируем текущие валидные флаги во временную маску
-                ctx_.probe_kernel << "            int " << temp_flags << "[ITEMS_PER_THREAD];\n";
-                ctx_.probe_kernel << "            BlockApplyMaskAnd<...>(tid, " << temp_flags << ", flags);\n";
-                
-                // 2. Загружаем очередной внешний ключ
-                ctx_.external_columns.insert("d_" + fk);
-                ctx_.probe_kernel << "            BlockLoad<...>(d_" << fk << " + tile_offset, tid, tile_offset, items, num_tile_items);\n";
-                
-                // 3. Делаем Probe в temp_flags (а не в главные flags!)
-                ctx_.probe_kernel << "            BlockProbeAndPHT_1<...>(tid, items, " << temp_flags << ", " << bi.ht_name << ", ...);\n";
-                
-                // 4. Добавляем результат в комбинированную маску (OR)
-                ctx_.probe_kernel << "            BlockApplyMaskOr<...>(tid, " << combined_mask << ", " << temp_flags << ");\n";
-            }
-            
-            // Наконец, применяем комбинированный результат к главным флагам потока
-            ctx_.probe_kernel << "            BlockApplyMaskAnd<...>(tid, flags, " << combined_mask << ");\n";
-        }
-    }
+* `TableScan`, `Filter`, `Math` — это пайплайны. Они живут в регистрах.
+* `HashBuild` и `Aggregate` — это разрыватели.
+Когда генератор доходит до разрывателя, он:
 
-Результат TODO 3
+1. Завершает текущую строку C++ кода (закрывает скобки ядра).
+2. Регистрирует новое ядро в `execution.cpp`.
+3. Создает глобальные массивы (`malloc_device`), чтобы передать данные между ядром 1 и ядром 2.
 
-С этим кодом движок сможет элегантно переварить двойной OR-джойн. Он сгенерирует код, который:
+### Шаг 5: Оптимизатор и "Умный" OR
 
-    Создаст пустую маску combined.
+С Push-моделью ваш оптимизатор (`optimizer_rules.cpp`) заживет новой жизнью. Вы сможете спускать `OR`-предикаты прямо в `HashJoinNode`, и компилятор будет генерировать:
 
-    Попробует пробить lo_orderdate. Если найдет совпадение в DDATE, запишет 1 в combined.
+```cpp
+bool match_1 = Probe(...);
+bool match_2 = Probe(...);
 
-    Попробует пробить lo_commitdate. Если найдет, добавит 1 в combined.
+if (match_1) { /* push */ }
+if (match_2 && !match_1) { /* push */ } // Анти-дублирование, если ключи совпали на одной строке!
 
-    Оставит активными только те треды, где хотя бы одна из дат совпала!
+```
+
+---

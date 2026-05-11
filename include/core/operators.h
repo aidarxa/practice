@@ -38,12 +38,17 @@ protected:
     std::vector<std::unique_ptr<OperatorNode>> children_;
 
 public:
+    // Non-owning back-pointer to parent in the operator tree.
+    // Set automatically by addChild(). Used by push-model consume() to climb.
+    OperatorNode* parent_ = nullptr;
+
     virtual ~OperatorNode() = default;
 
     virtual OperatorType getType() const = 0;
     virtual void accept(OperatorVisitor& visitor) const = 0;
 
     void addChild(std::unique_ptr<OperatorNode> child) {
+        child->parent_ = this;   // wire the back-pointer before moving ownership
         children_.push_back(std::move(child));
     }
 
