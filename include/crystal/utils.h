@@ -7,11 +7,11 @@
 #define SF 10
 #if SF == 10
 #define DATA_DIR BASE_PATH "10/"
-#define LO_LEN 59986214
+#define LO_LEN 59986217
 #define P_LEN 800000
 #define S_LEN 20000
 #define C_LEN 300000
-#define D_LEN 2556
+#define D_LEN 2557
 #else // 20
 #define DATA_DIR BASE_PATH "20/"
 #define LO_LEN 119994746
@@ -30,6 +30,7 @@ inline int index_of(std::string *arr, int len, std::string val) {
 }
 
 inline std::string getTableName(std::string col_name) {
+  if (col_name.empty()) return "";
   if(col_name[0] == 'l') return "LINEORDER";
   if(col_name[0] == 's') return "SUPPLIER";
   if(col_name[0] == 'c') return "CUSTOMER";
