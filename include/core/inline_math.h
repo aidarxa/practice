@@ -1,6 +1,7 @@
 #pragma once
 #include <cstdint>
 #include <type_traits>
+#include <sycl/sycl.hpp>
 
 namespace db {
 
@@ -90,6 +91,34 @@ inline int safe_neq(T1 a, T2 b) {
     using P2 = typename PromoteType<T2>::type;
     using Common = std::common_type_t<P1, P2>;
     return static_cast<Common>(a) != static_cast<Common>(b) ? 1 : 0;
+}
+
+
+// Atomic helpers used by generated aggregate kernels.
+inline void atomic_add_ull(unsigned long long& target, unsigned long long value) {
+    sycl::atomic_ref<unsigned long long,
+                     sycl::memory_order::relaxed,
+                     sycl::memory_scope::device,
+                     sycl::access::address_space::global_space> at(target);
+    at.fetch_add(value);
+}
+
+inline void atomic_min_ull(unsigned long long& target, unsigned long long value) {
+    sycl::atomic_ref<unsigned long long,
+                     sycl::memory_order::relaxed,
+                     sycl::memory_scope::device,
+                     sycl::access::address_space::global_space> at(target);
+    unsigned long long observed = at.load();
+    while (value < observed && !at.compare_exchange_weak(observed, value)) {}
+}
+
+inline void atomic_max_ull(unsigned long long& target, unsigned long long value) {
+    sycl::atomic_ref<unsigned long long,
+                     sycl::memory_order::relaxed,
+                     sycl::memory_scope::device,
+                     sycl::access::address_space::global_space> at(target);
+    unsigned long long observed = at.load();
+    while (value > observed && !at.compare_exchange_weak(observed, value)) {}
 }
 
 } // namespace db

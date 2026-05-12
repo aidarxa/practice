@@ -179,9 +179,20 @@ static const AggregateNode* findAggregateNode(const OperatorNode* node) {
     if (node->getType() == OperatorType::AGGREGATE) {
         return static_cast<const AggregateNode*>(node);
     }
-    // AggregateNode всегда является корнем, но на случай вложенности — проверяем детей
     for (const auto& child : node->getChildren()) {
         const AggregateNode* found = findAggregateNode(child.get());
+        if (found) return found;
+    }
+    return nullptr;
+}
+
+static const ProjectionNode* findProjectionNode(const OperatorNode* node) {
+    if (!node) return nullptr;
+    if (node->getType() == OperatorType::PROJECTION) {
+        return static_cast<const ProjectionNode*>(node);
+    }
+    for (const auto& child : node->getChildren()) {
+        const ProjectionNode* found = findProjectionNode(child.get());
         if (found) return found;
     }
     return nullptr;
@@ -242,6 +253,8 @@ void QueryEngine::executeQuery(const std::string& sql, ExecutionContext* ctx) {
     const AggregateNode* agg_node = findAggregateNode(optimized_tree.get());
     if (agg_node) {
         ctx->expected_result_size_ = agg_node->calculateResultSize(*catalog_);
+    } else if (const ProjectionNode* proj_node = findProjectionNode(optimized_tree.get())) {
+        ctx->expected_result_size_ = proj_node->calculateResultSize(*catalog_);
     } else {
         ctx->expected_result_size_ = 1;
     }

@@ -70,9 +70,17 @@ struct JITContext {
     // Columns that must be fetched from ctx (EXTERNAL_INPUT):
     std::set<std::string> external_columns; // e.g. "d_lo_orderdate"
 
-    // Result buffer size expression (set by AggregateNode visitor)
+    // Result buffer size expression (set by AggregateNode/ProjectionNode visitor).
+    // For AVG/MIN this is the physical storage size; generated finalization
+    // code compacts it to the visible size before returning to the host.
     std::string result_size_expr;   // e.g. "7*1000"
     int         tuple_size = 1;
+    std::string visible_result_size_expr;
+
+    // Code emitted after all main pipelines, before q.wait(). Used for
+    // aggregate finalization/compaction kernels.
+    std::stringstream post_execution_code;
+    std::set<std::string> emitted_auxiliary_kernels;
 
     // ---------- helpers ----------
     std::string getNewMask() {
@@ -118,6 +126,7 @@ public:
     void visit(const LiteralIntExpr&  node) override;
     void visit(const LiteralFloatExpr& node) override;
     void visit(const BinaryExpr&      node) override;
+    void visit(const StarExpr&        node) override;
 
     // Translates AST expressions into inline C++ code
     std::string translateInlineExpr(const ExprNode* expr, bool is_probe);
@@ -173,6 +182,7 @@ public:
     void visit(const FilterNode&    node) override;
     void visit(const HashJoinNode&  node) override;
     void visit(const AggregateNode& node) override;
+    void visit(const ProjectionNode& node) override;
 
     // ---- Push-model dispatchers ----
     void produce(const OperatorNode* node, JITContext& ctx);
@@ -220,6 +230,7 @@ private:
         std::string pk_col;        // PK column in the dim table
     };
     std::unordered_map<const OperatorNode*, BuildInfo> build_infos_;
+    std::vector<std::unique_ptr<ExprNode>> expanded_projection_exprs_;
     std::set<std::string> agg_cols_;    // Columns required for aggregation (high priority for joins)
     std::set<std::string> filter_cols_; // Columns required for filtering (low priority for joins)
     void collectAllColumnsFromTree(const OperatorNode* node);
@@ -229,6 +240,7 @@ private:
     void produceFilter    (const FilterNode*     node, JITContext& ctx);
     void produceHashJoin  (const HashJoinNode*   node, JITContext& ctx);
     void produceAggregate (const AggregateNode*  node, JITContext& ctx);
+    void produceProjection(const ProjectionNode* node, JITContext& ctx);
 
     // ---- Vector-mode consume handlers (block level, outside scalar loop) ----
     void consumeFilterVector   (const FilterNode*    node, JITContext& ctx,
@@ -240,6 +252,9 @@ private:
     void consumeAggregateVector(const AggregateNode* node, JITContext& ctx,
                                 const OperatorNode* sender,
                                 const std::vector<std::string>& active_vars);
+    void consumeProjectionVector(const ProjectionNode* node, JITContext& ctx,
+                                 const OperatorNode* sender,
+                                 const std::vector<std::string>& active_vars);
 
     // ---- Item-mode consume handlers (scalar level, inside scalar loop) ----
     void consumeFilterItem   (const FilterNode*    node, JITContext& ctx,
@@ -251,6 +266,9 @@ private:
     void consumeAggregateItem(const AggregateNode* node, JITContext& ctx,
                               const OperatorNode* sender,
                               const std::vector<std::string>& active_vars);
+    void consumeProjectionItem(const ProjectionNode* node, JITContext& ctx,
+                               const OperatorNode* sender,
+                               const std::vector<std::string>& active_vars);
 
     enum class ConsumeMode : uint8_t {
         Vector = 0,

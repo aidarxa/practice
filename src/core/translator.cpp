@@ -17,6 +17,7 @@ void ColumnRefExpr::accept(ExprVisitor& visitor) const  { visitor.visit(*this); 
 void LiteralIntExpr::accept(ExprVisitor& visitor) const { visitor.visit(*this); }
 void LiteralFloatExpr::accept(ExprVisitor& visitor) const { visitor.visit(*this); }
 void BinaryExpr::accept(ExprVisitor& visitor) const     { visitor.visit(*this); }
+void StarExpr::accept(ExprVisitor& visitor) const       { visitor.visit(*this); }
 
 // --- ExprPrinter ---
 
@@ -41,6 +42,7 @@ const char* ExprPrinter::exprTypeName(ExprType t) {
         case ExprType::OP_SUB:        return "-";
         case ExprType::OP_MUL:        return "*";
         case ExprType::OP_DIV:        return "/";
+        case ExprType::STAR:          return "*";
         default:                      return "UNKNOWN";
     }
 }
@@ -75,6 +77,11 @@ void ExprPrinter::visit(const BinaryExpr& node) {
     }
 }
 
+void ExprPrinter::visit(const StarExpr& /*node*/) {
+    printIndent();
+    out_ << "[Star] *\n";
+}
+
 // ============================================================================
 // Block 2: OperatorNode accept() definitions + OperatorPrinter
 // ============================================================================
@@ -83,6 +90,7 @@ void TableScanNode::accept(OperatorVisitor& visitor) const { visitor.visit(*this
 void FilterNode::accept(OperatorVisitor& visitor) const    { visitor.visit(*this); }
 void HashJoinNode::accept(OperatorVisitor& visitor) const  { visitor.visit(*this); }
 void AggregateNode::accept(OperatorVisitor& visitor) const { visitor.visit(*this); }
+void ProjectionNode::accept(OperatorVisitor& visitor) const { visitor.visit(*this); }
 
 // --- OperatorPrinter ---
 
@@ -124,6 +132,18 @@ void OperatorPrinter::visit(const HashJoinNode& node) {
         node.join_condition->accept(ep);
     } else {
         out_ << " (no condition — naive phase)\n";
+    }
+    visitChildren(node);
+}
+
+void OperatorPrinter::visit(const ProjectionNode& node) {
+    printIndent();
+    out_ << "[Projection]\n";
+    for (const auto& expr : node.select_exprs) {
+        if (expr) {
+            ExprPrinter ep(out_, indent_ + 1);
+            expr->accept(ep);
+        }
     }
     visitChildren(node);
 }
@@ -193,10 +213,15 @@ std::unique_ptr<ExprNode> QueryTranslator::translateExpr(const hsql::Expr* expr)
     }
 
     switch (expr->type) {
+        // ---- SQL star ----
+        case hsql::kExprStar:
+            return std::make_unique<StarExpr>();
+
         // ---- Ссылка на колонку ----
         case hsql::kExprColumnRef: {
             std::string col  = expr->name  ? std::string(expr->name)  : "";
             std::string tbl  = expr->table ? std::string(expr->table) : "";
+            if (col == "*") return std::make_unique<StarExpr>();
             return std::make_unique<ColumnRefExpr>(std::move(col), std::move(tbl));
         }
 
@@ -360,13 +385,25 @@ std::unique_ptr<OperatorNode> QueryTranslator::translate(const hsql::SelectState
 
                 std::string func = sel->name ? std::string(sel->name) : "SUM";
                 std::transform(func.begin(), func.end(), func.begin(), ::toupper);
-                // Аргумент агрегатной функции
+                if (func != "COUNT" && func != "SUM" && func != "MIN" &&
+                    func != "MAX" && func != "AVG") {
+                    throw std::runtime_error("QueryTranslator: unsupported aggregate function: " + func);
+                }
+
                 std::unique_ptr<ExprNode> agg_expr;
                 if (sel->exprList && !sel->exprList->empty()) {
-                    const hsql::Expr* arg = (*sel->exprList)[0];
-                    if (arg) {
-                        agg_expr = translateExpr(arg);
+                    if (sel->exprList->size() > 1) {
+                        throw std::runtime_error("QueryTranslator: aggregate functions accept at most one argument");
                     }
+                    const hsql::Expr* arg = (*sel->exprList)[0];
+                    if (arg) agg_expr = translateExpr(arg);
+                }
+
+                // COUNT() and COUNT(*) are valid.  For SUM/MIN/MAX/AVG, a missing
+                // argument is treated as STAR to keep the AST explicit and to allow
+                // SUM(*) as a row-count aggregate requested by the engine tests.
+                if (!agg_expr && func != "COUNT") {
+                    agg_expr = std::make_unique<StarExpr>();
                 }
 
                 agg_node->aggregates.emplace_back(std::move(func), std::move(agg_expr));
@@ -375,6 +412,19 @@ std::unique_ptr<OperatorNode> QueryTranslator::translate(const hsql::SelectState
 
         agg_node->addChild(std::move(root));
         root = std::move(agg_node);
+    } else if (stmt->selectList) {
+        auto projection = std::make_unique<ProjectionNode>();
+        for (const auto* sel : *stmt->selectList) {
+            if (!sel) continue;
+            if (sel->isType(hsql::kExprFunctionRef)) {
+                throw std::runtime_error("QueryTranslator: non-aggregate function in SELECT list is not supported");
+            }
+            projection->select_exprs.push_back(translateExpr(sel));
+        }
+        if (!projection->select_exprs.empty()) {
+            projection->addChild(std::move(root));
+            root = std::move(projection);
+        }
     }
 
     return root;

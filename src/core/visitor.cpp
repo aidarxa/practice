@@ -62,12 +62,22 @@ static const char* exprTypeName(ExprType t) {
         case ExprType::OP_SUB:        return "OP_SUB";
         case ExprType::OP_MUL:        return "OP_MUL";
         case ExprType::OP_DIV:        return "OP_DIV";
+        case ExprType::STAR:          return "STAR";
         default:                      return "UNKNOWN_EXPR_TYPE";
     }
 }
 
 static bool isComparisonOp(ExprType t) {
     return t >= ExprType::OP_EQ && t <= ExprType::OP_GTE;
+}
+
+static bool isBinaryExprType(ExprType t) {
+    return t == ExprType::OP_AND || t == ExprType::OP_OR ||
+           t == ExprType::OP_EQ  || t == ExprType::OP_NEQ ||
+           t == ExprType::OP_LT  || t == ExprType::OP_LTE ||
+           t == ExprType::OP_GT  || t == ExprType::OP_GTE ||
+           t == ExprType::OP_ADD || t == ExprType::OP_SUB ||
+           t == ExprType::OP_MUL || t == ExprType::OP_DIV;
 }
 
 static FilterPredicateSupport validateFilterFastPathPredicate(
@@ -174,6 +184,10 @@ void JITExprVisitor::visit(const LiteralFloatExpr& /*node*/) {
     // No standalone code generation
 }
 
+void JITExprVisitor::visit(const StarExpr& /*node*/) {
+    // Star is handled by aggregate/projection-specific code.
+}
+
 // ============================================================================
 // JITExprVisitor — predSuffix
 // ============================================================================
@@ -240,6 +254,8 @@ std::string JITExprVisitor::translateInlineExpr(const ExprNode* expr, bool is_pr
             return std::to_string(static_cast<const LiteralIntExpr*>(expr)->value);
         case ExprType::LITERAL_FLOAT:
             return std::to_string(static_cast<const LiteralFloatExpr*>(expr)->value);
+        case ExprType::STAR:
+            return "1";
             
         case ExprType::OP_ADD:
             return "db::safe_add(" + translateInlineExpr(static_cast<const BinaryExpr*>(expr)->left.get(), is_probe) + ", " 
@@ -471,7 +487,7 @@ static void extractColumnsForTable(const ExprNode* e, const std::string& table_n
         }
     } 
     // Безопасный каст: только если это действительно бинарный оператор (тип >= OP_AND)
-    else if (e->getType() >= ExprType::OP_AND) {
+    else if (isBinaryExprType(e->getType())) {
         const auto* bin = static_cast<const BinaryExpr*>(e);
         if (bin->left) extractColumnsForTable(bin->left.get(), table_name, cols);
         if (bin->right) extractColumnsForTable(bin->right.get(), table_name, cols);
@@ -495,6 +511,11 @@ static void findAllColumnsForTable(const OperatorNode* node, const std::string& 
         }
         for (const auto& a : agg->aggregates) {
             extractColumnsForTable(a.agg_expr.get(), table_name, cols);
+        }
+    } else if (node->getType() == OperatorType::PROJECTION) {
+        const auto* proj = static_cast<const ProjectionNode*>(node);
+        for (const auto& e : proj->select_exprs) {
+            extractColumnsForTable(e.get(), table_name, cols);
         }
     }
     
@@ -522,17 +543,19 @@ JITOperatorVisitor::JITOperatorVisitor(JITContext& ctx, const Catalog& catalog)
 // The other three stubs exist only to satisfy the pure-virtual contract.
 // ============================================================================
 
-void JITOperatorVisitor::visit(const AggregateNode& node) {
-    // 1. ПОЧИНКА УКАЗАТЕЛЕЙ: Восстанавливаем parent_ для всего дерева
-    // Это необходимо, так как Оптимизатор мог разрушить связи при перестройке плана.
-    std::function<void(const OperatorNode*, OperatorNode*)> repairParents = [&](const OperatorNode* current, OperatorNode* parent) {
+static void repairOperatorParents(const OperatorNode* node) {
+    std::function<void(const OperatorNode*, OperatorNode*)> repair = [&](const OperatorNode* current, OperatorNode* parent) {
         if (!current) return;
         const_cast<OperatorNode*>(current)->parent_ = parent;
         for (const auto& child : current->getChildren()) {
-            repairParents(child.get(), const_cast<OperatorNode*>(current));
+            repair(child.get(), const_cast<OperatorNode*>(current));
         }
     };
-    repairParents(&node, nullptr);
+    repair(node, nullptr);
+}
+
+void JITOperatorVisitor::visit(const AggregateNode& node) {
+    repairOperatorParents(&node);
 
     // 2. СБОР ВСЕХ КОЛОНОК: Обходим все дерево один раз для надежного обнаружения требований
     agg_cols_.clear();
@@ -540,6 +563,14 @@ void JITOperatorVisitor::visit(const AggregateNode& node) {
     collectAllColumnsFromTree(&node);
 
     // 3. Старт генерации конвейера
+    produce(&node, ctx_);
+}
+
+void JITOperatorVisitor::visit(const ProjectionNode& node) {
+    repairOperatorParents(&node);
+    agg_cols_.clear();
+    filter_cols_.clear();
+    collectAllColumnsFromTree(&node);
     produce(&node, ctx_);
 }
 
@@ -557,6 +588,7 @@ void JITOperatorVisitor::produce(const OperatorNode* node, JITContext& ctx) {
     else if (node->getType() == OperatorType::FILTER) produceFilter(static_cast<const FilterNode*>(node), ctx);
     else if (node->getType() == OperatorType::HASH_JOIN) produceHashJoin(static_cast<const HashJoinNode*>(node), ctx);
     else if (node->getType() == OperatorType::AGGREGATE) produceAggregate(static_cast<const AggregateNode*>(node), ctx);
+    else if (node->getType() == OperatorType::PROJECTION) produceProjection(static_cast<const ProjectionNode*>(node), ctx);
 }
 
 void JITOperatorVisitor::consume(const OperatorNode* node, JITContext& ctx, const OperatorNode* sender, const std::vector<std::string>& active_vars) {
@@ -682,6 +714,8 @@ void JITOperatorVisitor::consumeVector(const OperatorNode* node, JITContext& ctx
             consumeHashJoinVector(static_cast<const HashJoinNode*>(node), ctx, sender, active_vars); break;
         case OperatorType::AGGREGATE:
             consumeAggregateVector(static_cast<const AggregateNode*>(node), ctx, sender, active_vars); break;
+        case OperatorType::PROJECTION:
+            consumeProjectionVector(static_cast<const ProjectionNode*>(node), ctx, sender, active_vars); break;
         default: break;
     }
 }
@@ -699,6 +733,8 @@ void JITOperatorVisitor::consumeItem(const OperatorNode* node, JITContext& ctx,
             consumeHashJoinItem(static_cast<const HashJoinNode*>(node), ctx, sender, active_vars); break;
         case OperatorType::AGGREGATE:
             consumeAggregateItem(static_cast<const AggregateNode*>(node), ctx, sender, active_vars); break;
+        case OperatorType::PROJECTION:
+            consumeProjectionItem(static_cast<const ProjectionNode*>(node), ctx, sender, active_vars); break;
         default: break;
     }
 }
@@ -808,6 +844,12 @@ void JITOperatorVisitor::produceAggregate(const AggregateNode* node, JITContext&
     }
 }
 
+void JITOperatorVisitor::produceProjection(const ProjectionNode* node, JITContext& ctx) {
+    if (!node->getChildren().empty()) {
+        produce(node->getChildren()[0].get(), ctx);
+    }
+}
+
 static std::string translateMathExprPush(
         const ExprNode* expr,
         JITContext& ctx,
@@ -830,6 +872,8 @@ static std::string translateMathExprPush(
             const auto* lit = static_cast<const LiteralFloatExpr*>(expr);
             return std::to_string(lit->value);
         }
+        case ExprType::STAR:
+            return cast_to_ull ? "(unsigned long long)1" : "1";
         case ExprType::OP_ADD:
         case ExprType::OP_SUB:
         case ExprType::OP_MUL:
@@ -920,7 +964,7 @@ static void extractAllColumns(const ExprNode* e, std::vector<std::string>& cols)
             cols.push_back(col->column_name);
         }
     } 
-    else if (e->getType() >= ExprType::OP_AND) {
+    else if (isBinaryExprType(e->getType())) {
         const auto* bin = static_cast<const BinaryExpr*>(e);
         if (bin->left) extractAllColumns(bin->left.get(), cols);
         if (bin->right) extractAllColumns(bin->right.get(), cols);
@@ -932,37 +976,158 @@ static void extractAllColumns(const ExprNode* e, std::set<std::string>& cols) {
     if (e->getType() == ExprType::COLUMN_REF) {
         cols.insert(static_cast<const ColumnRefExpr*>(e)->column_name);
     } 
-    else if (e->getType() >= ExprType::OP_AND) {
+    else if (isBinaryExprType(e->getType())) {
         const auto* bin = static_cast<const BinaryExpr*>(e);
         if (bin->left) extractAllColumns(bin->left.get(), cols);
         if (bin->right) extractAllColumns(bin->right.get(), cols);
     }
 }
 
+static bool aggregateNeedsHiddenCount(const AggregateNode* node) {
+    return node && node->needsHiddenCountSlot();
+}
+
+static std::string aggregateInputExpr(const AggregateDef& agg, JITContext& ctx, bool cast_to_ull) {
+    if (agg.isCount() || agg.argumentIsRowCountLike()) {
+        return cast_to_ull ? "(unsigned long long)1" : "1";
+    }
+    return translateMathExprPush(agg.agg_expr.get(), ctx, cast_to_ull);
+}
+
+static void collectAggregateColumns(const AggregateNode* node, std::vector<std::string>& cols) {
+    for (const auto& agg : node->aggregates) {
+        if (agg.agg_expr && agg.agg_expr->getType() != ExprType::STAR) {
+            extractAllColumns(agg.agg_expr.get(), cols);
+        }
+    }
+    for (const auto& g : node->group_by_exprs) {
+        extractAllColumns(g.get(), cols);
+    }
+}
+
+static void collectAggregateColumns(const AggregateNode* node, std::set<std::string>& cols) {
+    for (const auto& agg : node->aggregates) {
+        if (agg.agg_expr && agg.agg_expr->getType() != ExprType::STAR) {
+            extractAllColumns(agg.agg_expr.get(), cols);
+        }
+    }
+    for (const auto& g : node->group_by_exprs) {
+        extractAllColumns(g.get(), cols);
+    }
+}
+
+static void emitAggregateInitializationIfNeeded(const AggregateNode* node,
+                                                JITContext& ctx,
+                                                uint64_t group_count,
+                                                int visible_ts,
+                                                int storage_ts) {
+    bool has_min = false;
+    for (const auto& agg : node->aggregates) has_min = has_min || agg.isMin();
+    if (!has_min) return;
+
+    const std::string kernel_name = "init_aggregate_slots";
+    if (!ctx.emitted_auxiliary_kernels.insert(kernel_name).second) return;
+    if (std::find(ctx.kernel_class_names.begin(), ctx.kernel_class_names.end(), kernel_name) == ctx.kernel_class_names.end()) {
+        ctx.kernel_class_names.push_back(kernel_name);
+    }
+
+    auto& out = ctx.current_pipeline->includes_and_globals;
+    out << "    q.submit([&](sycl::handler& h) {\n";
+    out << "        h.parallel_for<class " << kernel_name << ">(sycl::range<1>(" << group_count
+        << "), [=](sycl::id<1> gid) {\n";
+    out << "            unsigned long long base = (unsigned long long)gid[0] * " << storage_ts << ";\n";
+    int slot = (int)node->group_by_exprs.size();
+    for (const auto& agg : node->aggregates) {
+        if (agg.isMin()) {
+            out << "            d_result[base + " << slot << "] = ~0ULL;\n";
+        }
+        ++slot;
+    }
+    out << "        });\n";
+    out << "    });\n\n";
+}
+
+static void emitAggregateFinalizationIfNeeded(const AggregateNode* node,
+                                              JITContext& ctx,
+                                              uint64_t group_count,
+                                              int visible_ts,
+                                              int storage_ts,
+                                              int hidden_count_slot) {
+    if (!aggregateNeedsHiddenCount(node)) return;
+
+    const std::string kernel_name = "finalize_aggregate_slots";
+    if (!ctx.emitted_auxiliary_kernels.insert(kernel_name).second) return;
+    if (std::find(ctx.kernel_class_names.begin(), ctx.kernel_class_names.end(), kernel_name) == ctx.kernel_class_names.end()) {
+        ctx.kernel_class_names.push_back(kernel_name);
+    }
+
+    auto& out = ctx.post_execution_code;
+    out << "    q.submit([&](sycl::handler& h) {\n";
+    out << "        h.parallel_for<class " << kernel_name << ">(sycl::range<1>(" << group_count
+        << "), [=](sycl::id<1> gid) {\n";
+    out << "            unsigned long long g = (unsigned long long)gid[0];\n";
+    out << "            unsigned long long src = g * " << storage_ts << ";\n";
+    out << "            unsigned long long dst = g * " << visible_ts << ";\n";
+    out << "            unsigned long long cnt = d_result[src + " << hidden_count_slot << "];\n";
+    out << "            if (cnt == 0ULL) {\n";
+    for (int i = 0; i < visible_ts; ++i) {
+        out << "                d_result[dst + " << i << "] = 0ULL;\n";
+    }
+    out << "                return;\n";
+    out << "            }\n";
+
+    int slot = 0;
+    for (const auto& gexpr : node->group_by_exprs) {
+        (void)gexpr;
+        out << "            d_result[dst + " << slot << "] = d_result[src + " << slot << "];\n";
+        ++slot;
+    }
+    for (const auto& agg : node->aggregates) {
+        if (agg.isAvg()) {
+            out << "            d_result[dst + " << slot << "] = d_result[src + " << slot << "] / cnt;\n";
+        } else if (agg.isMin()) {
+            out << "            d_result[dst + " << slot << "] = (d_result[src + " << slot << "] == ~0ULL) ? 0ULL : d_result[src + " << slot << "];\n";
+        } else {
+            out << "            d_result[dst + " << slot << "] = d_result[src + " << slot << "];\n";
+        }
+        ++slot;
+    }
+    out << "        });\n";
+    out << "    });\n";
+    out << "    ctx->expected_result_size_ = " << (uint64_t)group_count * (uint64_t)visible_ts << ";\n\n";
+}
+
+static void emitAtomicAggregateUpdate(std::stringstream& code,
+                                      const std::string& ref_expr,
+                                      const AggregateDef& agg,
+                                      const std::string& value_expr) {
+    if (agg.isMin()) {
+        code << "                    db::atomic_min_ull(" << ref_expr << ", " << value_expr << ");\n";
+    } else if (agg.isMax()) {
+        code << "                    db::atomic_max_ull(" << ref_expr << ", " << value_expr << ");\n";
+    } else {
+        code << "                    db::atomic_add_ull(" << ref_expr << ", " << value_expr << ");\n";
+    }
+}
+
+// ============================================================================
+// consumeAggregateVector — opens scalar aggregation loop.
+// ============================================================================
 void JITOperatorVisitor::consumeAggregateVector(const AggregateNode* node, JITContext& ctx,
                                                  const OperatorNode* /*sender*/,
                                                  const std::vector<std::string>& /*active_vars*/) {
     auto& code = ctx.current_pipeline->kernel_body;
     const bool has_group_by = !node->group_by_exprs.empty();
 
-    // 1. Extract and ensure all aggregation/groupby columns are loaded into reused buffers
     std::vector<std::string> agg_cols;
-    for (const auto& agg : node->aggregates) {
-        extractAllColumns(agg.agg_expr.get(), agg_cols);
-    }
-    for (const auto& g : node->group_by_exprs) {
-        extractAllColumns(g.get(), agg_cols);
-    }
-    
+    collectAggregateColumns(node, agg_cols);
+
     int reg_idx = 0;
     for (const auto& col : agg_cols) {
-        // Пропускаем загрузку, если это payload измерения, уже лежащий в своем регистре
-        if (ctx.col_to_reg.count(col) && ctx.col_to_reg[col] == col) {
-            continue; 
-        }
+        if (ctx.col_to_reg.count(col) && ctx.col_to_reg[col] == col) continue;
         std::string reg_name = (reg_idx == 0) ? "items" : ("items" + std::to_string(reg_idx + 1));
         loadIntoReg(col, reg_name, ctx);
-        reg_idx++;
+        ++reg_idx;
     }
 
     for (const auto& g : node->group_by_exprs) {
@@ -972,45 +1137,79 @@ void JITOperatorVisitor::consumeAggregateVector(const AggregateNode* node, JITCo
         }
     }
 
-    if (!has_group_by) {
-        // ---- Simple aggregation: local sum + reduce_over_group ----
-        ctx.tuple_size = (int)node->aggregates.size();
-        ctx.result_size_expr = std::to_string(node->aggregates.size());
+    const int visible_ts = (int)node->visibleTupleSize();
+    const bool needs_hidden_count = node->needsHiddenCountSlot();
+    const int storage_ts = (int)node->storageTupleSize();
+    const int hidden_count_slot = visible_ts;
 
-        for (std::size_t a = 0; a < node->aggregates.size(); ++a)
-            code << "            unsigned long long sum_" << a << " = 0;\n";
+    if (!has_group_by) {
+        ctx.tuple_size = visible_ts;
+        ctx.result_size_expr = std::to_string(storage_ts);
+        ctx.visible_result_size_expr = std::to_string(visible_ts);
+        emitAggregateInitializationIfNeeded(node, ctx, 1, visible_ts, storage_ts);
+
+        for (std::size_t a = 0; a < node->aggregates.size(); ++a) {
+            const auto& agg = node->aggregates[a];
+            if (agg.isMin()) {
+                code << "            unsigned long long local_" << a << " = ~0ULL;\n";
+            } else {
+                code << "            unsigned long long local_" << a << " = 0ULL;\n";
+            }
+        }
+        if (needs_hidden_count) {
+            code << "            unsigned long long local_count_hidden = 0ULL;\n";
+        }
 
         code << "            #pragma unroll\n";
         code << "            for (int i = 0; i < ITEMS_PER_THREAD; ++i) {\n";
         code << "                if (flags[i] && (tid + BLOCK_THREADS * i < num_tile_items)) {\n";
+        if (needs_hidden_count) {
+            code << "                    local_count_hidden += 1ULL;\n";
+        }
         for (std::size_t a = 0; a < node->aggregates.size(); ++a) {
-            std::string val = "1";
-            if (node->aggregates[a].func_name == "SUM" && node->aggregates[a].agg_expr)
-                val = translateMathExprPush(node->aggregates[a].agg_expr.get(), ctx, true);
-            code << "                    sum_" << a << " += " << val << ";\n";
+            const auto& agg = node->aggregates[a];
+            std::string val = aggregateInputExpr(agg, ctx, true);
+            if (agg.isMin()) {
+                code << "                    if (" << val << " < local_" << a << ") local_" << a << " = " << val << ";\n";
+            } else if (agg.isMax()) {
+                code << "                    if (" << val << " > local_" << a << ") local_" << a << " = " << val << ";\n";
+            } else {
+                code << "                    local_" << a << " += " << val << ";\n";
+            }
         }
         code << "                }\n";
         code << "            }\n";
 
         for (std::size_t a = 0; a < node->aggregates.size(); ++a) {
+            const auto& agg = node->aggregates[a];
+            const char* op = agg.isMin() ? "sycl::minimum<unsigned long long>{}" :
+                             agg.isMax() ? "sycl::maximum<unsigned long long>{}" :
+                                           "sycl::plus<unsigned long long>{}";
             code << "            unsigned long long agg_" << a
-                 << " = sycl::reduce_over_group(it.get_group(), sum_" << a
-                 << ", sycl::plus<unsigned long long>{});\n";
+                 << " = sycl::reduce_over_group(it.get_group(), local_" << a << ", " << op << ");\n";
             code << "            if (tid == 0) {\n";
-            code << "                sycl::atomic_ref<unsigned long long,"
-                 << " sycl::memory_order::relaxed,"
-                 << " sycl::memory_scope::device,"
-                 << " sycl::access::address_space::global_space>"
-                 << " at_r(d_result[" << a << "]);\n";
-            code << "                at_r.fetch_add(agg_" << a << ");\n";
+            if (agg.isMin()) {
+                code << "                db::atomic_min_ull(d_result[" << a << "], agg_" << a << ");\n";
+            } else if (agg.isMax()) {
+                code << "                db::atomic_max_ull(d_result[" << a << "], agg_" << a << ");\n";
+            } else {
+                code << "                db::atomic_add_ull(d_result[" << a << "], agg_" << a << ");\n";
+            }
             code << "            }\n";
         }
+        if (needs_hidden_count) {
+            code << "            unsigned long long agg_hidden_count = sycl::reduce_over_group(it.get_group(), local_count_hidden, sycl::plus<unsigned long long>{});\n";
+            code << "            if (tid == 0) {\n";
+            code << "                db::atomic_add_ull(d_result[" << hidden_count_slot << "], agg_hidden_count);\n";
+            code << "            }\n";
+        }
+        emitAggregateFinalizationIfNeeded(node, ctx, 1, visible_ts, storage_ts, hidden_count_slot);
     } else {
-        // ---- GROUP BY aggregation: per-slot atomic ----
         auto [hash_expr, total_size] = generatePerfectHash(node->group_by_exprs, catalog_, ctx);
-        int ts = (int)(node->group_by_exprs.size() + node->aggregates.size());
-        ctx.tuple_size = ts;
-        ctx.result_size_expr = std::to_string((uint64_t)total_size * ts);
+        ctx.tuple_size = visible_ts;
+        ctx.result_size_expr = std::to_string((uint64_t)total_size * (uint64_t)storage_ts);
+        ctx.visible_result_size_expr = std::to_string((uint64_t)total_size * (uint64_t)visible_ts);
+        emitAggregateInitializationIfNeeded(node, ctx, total_size, visible_ts, storage_ts);
 
         code << "            #pragma unroll\n";
         code << "            for (int i = 0; i < ITEMS_PER_THREAD; ++i) {\n";
@@ -1022,25 +1221,24 @@ void JITOperatorVisitor::consumeAggregateVector(const AggregateNode* node, JITCo
             if (g->getType() == ExprType::COLUMN_REF) {
                 const auto* col = static_cast<const ColumnRefExpr*>(g.get());
                 const std::string reg_name = resolveLoadedRegOrThrow(col->column_name, ctx);
-                code << "                    d_result[(unsigned long long)hash*" << ts
+                code << "                    d_result[(unsigned long long)hash*" << storage_ts
                      << "+" << slot << "] = (unsigned long long)" << reg_name << "[i];\n";
             }
             ++slot;
         }
+        if (needs_hidden_count) {
+            code << "                    db::atomic_add_ull(d_result[(unsigned long long)hash*" << storage_ts
+                 << "+" << hidden_count_slot << "], 1ULL);\n";
+        }
         for (const auto& agg : node->aggregates) {
-            std::string val = "1";
-            if (agg.func_name == "SUM" && agg.agg_expr)
-                val = translateMathExprPush(agg.agg_expr.get(), ctx, true);
-            code << "                    sycl::atomic_ref<unsigned long long,"
-                 << " sycl::memory_order::relaxed,"
-                 << " sycl::memory_scope::device,"
-                 << " sycl::access::address_space::global_space>"
-                 << " at_a(d_result[(unsigned long long)hash*" << ts << "+" << slot << "]);\n";
-            code << "                    at_a.fetch_add(" << val << ");\n";
+            std::string val = aggregateInputExpr(agg, ctx, true);
+            std::string ref = "d_result[(unsigned long long)hash*" + std::to_string(storage_ts) + "+" + std::to_string(slot) + "]";
+            emitAtomicAggregateUpdate(code, ref, agg, val);
             ++slot;
         }
         code << "                }\n";
         code << "            }\n";
+        emitAggregateFinalizationIfNeeded(node, ctx, total_size, visible_ts, storage_ts, hidden_count_slot);
     }
 }
 
@@ -1052,61 +1250,174 @@ void JITOperatorVisitor::consumeAggregateItem(const AggregateNode* node, JITCont
                                                const std::vector<std::string>& /*active_vars*/) {
     auto& code = ctx.current_pipeline->kernel_body;
     const bool has_group_by = !node->group_by_exprs.empty();
+    const int visible_ts = (int)node->visibleTupleSize();
+    const bool needs_hidden_count = node->needsHiddenCountSlot();
+    const int storage_ts = (int)node->storageTupleSize();
+    const int hidden_count_slot = visible_ts;
 
     if (!has_group_by) {
-        ctx.tuple_size = (int)node->aggregates.size();
-        ctx.result_size_expr = std::to_string(node->aggregates.size());
-        for (std::size_t a = 0; a < node->aggregates.size(); ++a) {
-            std::string val = "1";
-            if (node->aggregates[a].func_name == "SUM" && node->aggregates[a].agg_expr)
-                val = translateMathExprPush(node->aggregates[a].agg_expr.get(), ctx, true);
-            code << "                        sycl::atomic_ref<unsigned long long,"
-                 << " sycl::memory_order::relaxed,"
-                 << " sycl::memory_scope::device,"
-                 << " sycl::access::address_space::global_space>"
-                 << " at_item(d_result[" << a << "]);\n";
-            code << "                        at_item.fetch_add(" << val << ");\n";
+        ctx.tuple_size = visible_ts;
+        ctx.result_size_expr = std::to_string(storage_ts);
+        ctx.visible_result_size_expr = std::to_string(visible_ts);
+        emitAggregateInitializationIfNeeded(node, ctx, 1, visible_ts, storage_ts);
+        if (needs_hidden_count) {
+            code << "                        db::atomic_add_ull(d_result[" << hidden_count_slot << "], 1ULL);\n";
         }
+        for (std::size_t a = 0; a < node->aggregates.size(); ++a) {
+            const auto& agg = node->aggregates[a];
+            std::string val = aggregateInputExpr(agg, ctx, true);
+            std::string ref = "d_result[" + std::to_string(a) + "]";
+            if (agg.isMin()) {
+                code << "                        db::atomic_min_ull(" << ref << ", " << val << ");\n";
+            } else if (agg.isMax()) {
+                code << "                        db::atomic_max_ull(" << ref << ", " << val << ");\n";
+            } else {
+                code << "                        db::atomic_add_ull(" << ref << ", " << val << ");\n";
+            }
+        }
+        emitAggregateFinalizationIfNeeded(node, ctx, 1, visible_ts, storage_ts, hidden_count_slot);
     } else {
         std::set<std::string> required_cols;
-        for (const auto& agg : node->aggregates) {
-            extractAllColumns(agg.agg_expr.get(), required_cols);
-        }
-        for (const auto& g : node->group_by_exprs) {
-            extractAllColumns(g.get(), required_cols);
-        }
-        for (const auto& col : required_cols) {
-            (void)resolveLoadedRegOrThrow(col, ctx);
-        }
+        collectAggregateColumns(node, required_cols);
+        for (const auto& col : required_cols) (void)resolveLoadedRegOrThrow(col, ctx);
 
         auto [hash_expr, total_size] = generatePerfectHash(node->group_by_exprs, catalog_, ctx);
-        int ts = (int)(node->group_by_exprs.size() + node->aggregates.size());
-        ctx.tuple_size = ts;
-        ctx.result_size_expr = std::to_string((uint64_t)total_size * ts);
+        ctx.tuple_size = visible_ts;
+        ctx.result_size_expr = std::to_string((uint64_t)total_size * (uint64_t)storage_ts);
+        ctx.visible_result_size_expr = std::to_string((uint64_t)total_size * (uint64_t)visible_ts);
+        emitAggregateInitializationIfNeeded(node, ctx, total_size, visible_ts, storage_ts);
         code << "                        int hash = " << hash_expr << ";\n";
         int slot = 0;
         for (const auto& g : node->group_by_exprs) {
             if (g->getType() == ExprType::COLUMN_REF) {
                 const auto* col = static_cast<const ColumnRefExpr*>(g.get());
                 const std::string reg_name = resolveLoadedRegOrThrow(col->column_name, ctx);
-                code << "                        d_result[(unsigned long long)hash*" << ts
+                code << "                        d_result[(unsigned long long)hash*" << storage_ts
                      << "+" << slot << "] = (unsigned long long)" << reg_name << "[i];\n";
             }
             ++slot;
         }
+        if (needs_hidden_count) {
+            code << "                        db::atomic_add_ull(d_result[(unsigned long long)hash*" << storage_ts
+                 << "+" << hidden_count_slot << "], 1ULL);\n";
+        }
         for (const auto& agg : node->aggregates) {
-            std::string val = "1";
-            if (agg.func_name == "SUM" && agg.agg_expr)
-                val = translateMathExprPush(agg.agg_expr.get(), ctx, true);
-            code << "                        sycl::atomic_ref<unsigned long long,"
-                 << " sycl::memory_order::relaxed,"
-                 << " sycl::memory_scope::device,"
-                 << " sycl::access::address_space::global_space>"
-                 << " at_a(d_result[(unsigned long long)hash*" << ts << "+" << slot << "]);\n";
-            code << "                        at_a.fetch_add(" << val << ");\n";
+            std::string val = aggregateInputExpr(agg, ctx, true);
+            std::string ref = "d_result[(unsigned long long)hash*" + std::to_string(storage_ts) + "+" + std::to_string(slot) + "]";
+            if (agg.isMin()) {
+                code << "                        db::atomic_min_ull(" << ref << ", " << val << ");\n";
+            } else if (agg.isMax()) {
+                code << "                        db::atomic_max_ull(" << ref << ", " << val << ");\n";
+            } else {
+                code << "                        db::atomic_add_ull(" << ref << ", " << val << ");\n";
+            }
             ++slot;
         }
+        emitAggregateFinalizationIfNeeded(node, ctx, total_size, visible_ts, storage_ts, hidden_count_slot);
     }
+}
+
+
+static void collectTableScans(const OperatorNode* node, std::vector<const TableScanNode*>& out) {
+    if (!node) return;
+    if (node->getType() == OperatorType::TABLE_SCAN) {
+        out.push_back(static_cast<const TableScanNode*>(node));
+    }
+    for (const auto& child : node->getChildren()) collectTableScans(child.get(), out);
+}
+
+static std::vector<std::string> expandProjectionExpressions(
+        const ProjectionNode* node,
+        const Catalog& catalog,
+        bool allow_join_star) {
+    std::vector<std::string> cols;
+    std::vector<const TableScanNode*> scans;
+    if (!node->getChildren().empty()) collectTableScans(node->getChildren()[0].get(), scans);
+
+    for (const auto& expr : node->select_exprs) {
+        if (!expr) continue;
+        if (expr->getType() == ExprType::STAR) {
+            if (scans.size() > 1 && !allow_join_star) {
+                throw std::runtime_error(
+                    "SELECT * over joins is not supported by the current single-payload PHT projection path. "
+                    "List the required columns explicitly.");
+            }
+            for (const auto* scan : scans) {
+                const auto& meta = catalog.getTableMetadata(scan->table_name);
+                for (const auto& col : meta.getColumnNames()) cols.push_back(col);
+            }
+        } else if (expr->getType() == ExprType::COLUMN_REF) {
+            cols.push_back(static_cast<const ColumnRefExpr*>(expr.get())->column_name);
+        } else {
+            // Complex expression: emitted as an expression slot, not a named column.
+            cols.push_back("");
+        }
+    }
+    return cols;
+}
+
+void JITOperatorVisitor::consumeProjectionVector(const ProjectionNode* node, JITContext& ctx,
+                                                  const OperatorNode* /*sender*/,
+                                                  const std::vector<std::string>& /*active_vars*/) {
+    auto& code = ctx.current_pipeline->kernel_body;
+    std::vector<const TableScanNode*> scans;
+    if (!node->getChildren().empty()) collectTableScans(node->getChildren()[0].get(), scans);
+
+    // SELECT * is intentionally restricted to one scan until projection supports
+    // multi-column hash-table payloads for dimensions.
+    (void)expandProjectionExpressions(node, catalog_, false);
+
+    std::vector<const ExprNode*> expanded;
+    for (const auto& expr : node->select_exprs) {
+        if (!expr) continue;
+        if (expr->getType() == ExprType::STAR) {
+            for (const auto* scan : scans) {
+                const auto& meta = catalog_.getTableMetadata(scan->table_name);
+                for (const auto& col : meta.getColumnNames()) {
+                    expanded_projection_exprs_.push_back(std::make_unique<ColumnRefExpr>(col));
+                    expanded.push_back(expanded_projection_exprs_.back().get());
+                }
+            }
+        } else {
+            expanded.push_back(expr.get());
+        }
+    }
+
+    std::vector<std::string> cols;
+    for (const auto* expr : expanded) extractAllColumns(expr, cols);
+    int reg_idx = 0;
+    for (const auto& col : cols) {
+        if (ctx.col_to_reg.count(col) && ctx.col_to_reg[col] == col) continue;
+        std::string reg_name = (reg_idx == 0) ? "items" : ("items" + std::to_string(reg_idx + 1));
+        loadIntoReg(col, reg_name, ctx);
+        ++reg_idx;
+    }
+
+    const int tuple_size = (int)expanded.size();
+    ctx.tuple_size = tuple_size > 0 ? tuple_size : 1;
+    std::string row_count = "LO_LEN";
+    if (scans.size() == 1) row_count = sizeMacroFor(scans[0]->table_name);
+    ctx.result_size_expr = row_count + " * " + std::to_string(ctx.tuple_size);
+    ctx.visible_result_size_expr = ctx.result_size_expr;
+
+    JITExprVisitor expr_vis(ctx, code, "flags", false, nullptr);
+    code << "            #pragma unroll\n";
+    code << "            for (int i = 0; i < ITEMS_PER_THREAD; ++i) {\n";
+    code << "                if (flags[i] && (tid + BLOCK_THREADS * i < num_tile_items)) {\n";
+    code << "                    unsigned long long out_row = (unsigned long long)(tile_offset + tid + BLOCK_THREADS * i);\n";
+    for (int slot = 0; slot < (int)expanded.size(); ++slot) {
+        std::string val = expr_vis.translateInlineExpr(expanded[slot], true);
+        code << "                    d_result[out_row*" << ctx.tuple_size << "+" << slot
+             << "] = (unsigned long long)(" << val << ");\n";
+    }
+    code << "                }\n";
+    code << "            }\n";
+}
+
+void JITOperatorVisitor::consumeProjectionItem(const ProjectionNode* /*node*/, JITContext& /*ctx*/,
+                                                const OperatorNode* /*sender*/,
+                                                const std::vector<std::string>& /*active_vars*/) {
+    throw std::runtime_error("Projection after row-expanding MHT joins is not supported yet");
 }
 
 
@@ -1250,6 +1561,11 @@ void JITOperatorVisitor::collectAllColumnsFromTree(const OperatorNode* node) {
     } else if (node->getType() == OperatorType::FILTER) {
         const auto* flt = static_cast<const FilterNode*>(node);
         extractAllColumns(flt->predicate.get(), filter_cols_);
+    } else if (node->getType() == OperatorType::PROJECTION) {
+        const auto* proj = static_cast<const ProjectionNode*>(node);
+        for (const auto& e : proj->select_exprs) {
+            extractAllColumns(e.get(), agg_cols_);
+        }
     }
     
     for (const auto& child : node->getChildren()) {
@@ -1891,6 +2207,8 @@ std::string JITOperatorVisitor::generateCode() const {
         code << p.includes_and_globals.str();
         code << p.kernel_body.str();
     }
+
+    code << ctx_.post_execution_code.str();
 
     code << "    q.wait();\n\n";
     for (const auto& ht : ctx_.hash_tables) {
