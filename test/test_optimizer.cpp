@@ -405,6 +405,77 @@ static void test_jit_visitor_q31() {
 }
 
 // ============================================================================
+// Test 7: mixed predicates should use universal path without debug comments
+// ============================================================================
+static void test_jit_visitor_mixed_predicate_universal_path() {
+    std::cout << "Test 7: JIT Visitor mixed predicate fallback to universal path... ";
+
+    std::string sql =
+        "SELECT SUM(lo_revenue) "
+        "FROM lineorder "
+        "WHERE (lo_discount + 1) < 5 OR lo_quantity = 10";
+
+    hsql::SQLParserResult result;
+    auto* ast = parseSQL(sql, result);
+    assert(ast != nullptr);
+
+    db::QueryTranslator translator;
+    auto tree = translator.translate(ast);
+    db::Optimizer opt;
+    tree = opt.optimize(std::move(tree));
+
+    auto catalog = buildTestCatalog();
+    db::JITContext ctx;
+    db::JITOperatorVisitor visitor(ctx, *catalog);
+    tree->accept(visitor);
+    std::string code = visitor.generateCode();
+
+    assert(code.find("Fallback for complex expression") == std::string::npos);
+    assert(code.find("safe_add") != std::string::npos);
+    assert(code.find("||") != std::string::npos);
+
+    std::cout << "PASSED\n";
+}
+
+// ============================================================================
+// Test 8: unsupported predicate should fail before AdaptiveCPP compilation
+// ============================================================================
+static void test_jit_visitor_unsupported_predicate_throws() {
+    std::cout << "Test 8: JIT Visitor unsupported predicate throws early... ";
+
+    std::string sql =
+        "SELECT SUM(lo_revenue) "
+        "FROM lineorder "
+        "WHERE lo_discount = 1.5";
+
+    hsql::SQLParserResult result;
+    auto* ast = parseSQL(sql, result);
+    assert(ast != nullptr);
+
+    db::QueryTranslator translator;
+    auto tree = translator.translate(ast);
+    db::Optimizer opt;
+    tree = opt.optimize(std::move(tree));
+
+    auto catalog = buildTestCatalog();
+    db::JITContext ctx;
+    db::JITOperatorVisitor visitor(ctx, *catalog);
+
+    bool thrown = false;
+    try {
+        tree->accept(visitor);
+    } catch (const std::runtime_error& e) {
+        thrown = true;
+        const std::string msg = e.what();
+        assert(msg.find("not translatable") != std::string::npos);
+        assert(msg.find("LITERAL_FLOAT") != std::string::npos);
+    }
+    assert(thrown && "Expected unsupported predicate to throw before JIT C++ compilation");
+
+    std::cout << "PASSED\n";
+}
+
+// ============================================================================
 int main() {
     std::cout << "=== test_optimizer (new pipeline) ===\n\n";
 
@@ -414,6 +485,8 @@ int main() {
     test_calculate_result_size();
     test_jit_visitor_q21();
     test_jit_visitor_q31();
+    test_jit_visitor_mixed_predicate_universal_path();
+    test_jit_visitor_unsupported_predicate_throws();
 
     std::cout << "\nAll tests passed!\n";
     return 0;

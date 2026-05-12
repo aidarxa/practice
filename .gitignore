@@ -5,3 +5,4 @@ data/10/
 deps/
 sql-parser/*
 test/queries/result/
+todo.md

@@ -5,10 +5,13 @@
 
 #include <cstdlib>
 #include <dlfcn.h>
+#include <filesystem>
 #include <fstream>
 #include <functional>
 #include <iostream>
 #include <stdexcept>
+#include <utility>
+#include <vector>
 
 namespace db {
 
@@ -27,6 +30,66 @@ void FileBasedQueryCache::put(const std::string& query_hash, const std::string& 
 }
 
 // --- AdaptiveCppCompiler ---
+AdaptiveCppCompiler::AdaptiveCppCompiler(std::string include_dir,
+                                         std::string deps_include_dir)
+    : include_dir_(std::move(include_dir)),
+      deps_include_dir_(std::move(deps_include_dir)) {
+    if (include_dir_.empty()) {
+#ifdef CRYSTAL_INCLUDE_DIR_DEFAULT
+        include_dir_ = CRYSTAL_INCLUDE_DIR_DEFAULT;
+#endif
+    }
+    if (deps_include_dir_.empty()) {
+#ifdef CRYSTAL_DEPS_INCLUDE_DIR_DEFAULT
+        deps_include_dir_ = CRYSTAL_DEPS_INCLUDE_DIR_DEFAULT;
+#endif
+    }
+}
+
+static std::string escapeShellArg(const std::string& value) {
+    std::string escaped = "'";
+    for (char c : value) {
+        if (c == '\'') {
+            escaped += "'\\''";
+        } else {
+            escaped += c;
+        }
+    }
+    escaped += "'";
+    return escaped;
+}
+
+static std::string getRequiredPath(const char* env_name,
+                                   const std::string& configured_value) {
+    if (!configured_value.empty()) {
+        return configured_value;
+    }
+    const char* env_value = std::getenv(env_name);
+    if (!env_value) {
+        throw std::runtime_error(
+            std::string("Missing required path. Set environment variable ") +
+            env_name + " or pass it into AdaptiveCppCompiler constructor.");
+    }
+    std::string path(env_value);
+    if (path.empty()) {
+        throw std::runtime_error(
+            std::string("Environment variable ") + env_name + " is empty.");
+    }
+    return path;
+}
+
+static void validateExistingDir(const std::string& path, const std::string& name) {
+    if (path.empty()) {
+        throw std::runtime_error(name + " path is empty.");
+    }
+    std::filesystem::path fs_path(path);
+    if (!std::filesystem::exists(fs_path)) {
+        throw std::runtime_error(name + " path does not exist: " + path);
+    }
+    if (!std::filesystem::is_directory(fs_path)) {
+        throw std::runtime_error(name + " path is not a directory: " + path);
+    }
+}
 
 std::string AdaptiveCppCompiler::compile(const std::string& source_code, const std::string& query_hash) {
     std::string cpp_path = "/tmp/" + query_hash + ".cpp";
@@ -40,11 +103,24 @@ std::string AdaptiveCppCompiler::compile(const std::string& source_code, const s
     ofs << source_code;
     ofs.close();
 
-    // TODO: Read INCLUDE path from config/env
-    std::string include_path = "/home/aidar/practice/include";
-    std::string deps_include = "/home/aidar/practice/deps/include";
+    const std::string include_path = getRequiredPath("CRYSTAL_INCLUDE_DIR", include_dir_);
+    const std::string deps_include = getRequiredPath("CRYSTAL_DEPS_INCLUDE_DIR", deps_include_dir_);
+    validateExistingDir(include_path, "CRYSTAL_INCLUDE_DIR");
+    validateExistingDir(deps_include, "CRYSTAL_DEPS_INCLUDE_DIR");
 
-    std::string compile_cmd = "acpp -O3 -fPIC -shared -I" + include_path + " -I" + deps_include + " " + cpp_path + " -o " + so_path;
+    std::vector<std::string> args = {
+        "acpp", "-O3", "-fPIC", "-shared",
+        "-I" + include_path,
+        "-I" + deps_include,
+        cpp_path,
+        "-o", so_path
+    };
+
+    std::string compile_cmd;
+    for (size_t i = 0; i < args.size(); ++i) {
+        if (i != 0) compile_cmd += " ";
+        compile_cmd += escapeShellArg(args[i]);
+    }
 
     int ret = std::system(compile_cmd.c_str());
     if (ret != 0) {
@@ -103,9 +179,20 @@ static const AggregateNode* findAggregateNode(const OperatorNode* node) {
     if (node->getType() == OperatorType::AGGREGATE) {
         return static_cast<const AggregateNode*>(node);
     }
-    // AggregateNode всегда является корнем, но на случай вложенности — проверяем детей
     for (const auto& child : node->getChildren()) {
         const AggregateNode* found = findAggregateNode(child.get());
+        if (found) return found;
+    }
+    return nullptr;
+}
+
+static const ProjectionNode* findProjectionNode(const OperatorNode* node) {
+    if (!node) return nullptr;
+    if (node->getType() == OperatorType::PROJECTION) {
+        return static_cast<const ProjectionNode*>(node);
+    }
+    for (const auto& child : node->getChildren()) {
+        const ProjectionNode* found = findProjectionNode(child.get());
         if (found) return found;
     }
     return nullptr;
@@ -166,6 +253,8 @@ void QueryEngine::executeQuery(const std::string& sql, ExecutionContext* ctx) {
     const AggregateNode* agg_node = findAggregateNode(optimized_tree.get());
     if (agg_node) {
         ctx->expected_result_size_ = agg_node->calculateResultSize(*catalog_);
+    } else if (const ProjectionNode* proj_node = findProjectionNode(optimized_tree.get())) {
+        ctx->expected_result_size_ = proj_node->calculateResultSize(*catalog_);
     } else {
         ctx->expected_result_size_ = 1;
     }

@@ -47,7 +47,7 @@ struct NotEqual{
     T _compare;
     NotEqual(T compare):_compare(compare){};
     bool operator()(const T& value) const noexcept {
-        return value == _compare;
+        return value != _compare;
     };
 };
 
@@ -67,7 +67,6 @@ inline void InitFlagsZero(int (&flags)[ITEMS_PER_THREAD]) {
         flags[i] = 0;
     }
 }
-
 template <typename T,typename Predicate, int BLOCK_THREADS, int ITEMS_PER_THREAD>
 inline void BlockPredDirect(size_t tid, T (&items)[ITEMS_PER_THREAD],int (&flags)[ITEMS_PER_THREAD], Predicate pred) {
     #pragma unroll
@@ -274,4 +273,175 @@ inline void BlockApplyMaskAnd(size_t tid, int (&target_mask)[ITEMS_PER_THREAD], 
         target_mask[i] = target_mask[i] && source_mask[i];
     }
 }
+
+// -------------------------------------------_COLS TEMPLATES----------------------------------------------
+
+template <typename T, int BLOCK_THREADS, int ITEMS_PER_THREAD>
+inline void BlockPredEq_Cols(size_t tid, T (&items1)[ITEMS_PER_THREAD], T (&items2)[ITEMS_PER_THREAD], int (&flags)[ITEMS_PER_THREAD], int num_items) {
+    #pragma unroll
+    for (int i = 0; i < ITEMS_PER_THREAD; ++i) {
+        if (tid + BLOCK_THREADS * i < num_items) {
+            flags[i] = (items1[i] == items2[i]);
+        }
+    }
+}
+template <typename T, int BLOCK_THREADS, int ITEMS_PER_THREAD>
+inline void BlockPredAEq_Cols(size_t tid, T (&items1)[ITEMS_PER_THREAD], T (&items2)[ITEMS_PER_THREAD], int (&flags)[ITEMS_PER_THREAD], int num_items) {
+    #pragma unroll
+    for (int i = 0; i < ITEMS_PER_THREAD; ++i) {
+        if (tid + BLOCK_THREADS * i < num_items) {
+            flags[i] = flags[i] && (items1[i] == items2[i]);
+        }
+    }
+}
+template <typename T, int BLOCK_THREADS, int ITEMS_PER_THREAD>
+inline void BlockPredOrEq_Cols(size_t tid, T (&items1)[ITEMS_PER_THREAD], T (&items2)[ITEMS_PER_THREAD], int (&flags)[ITEMS_PER_THREAD], int num_items) {
+    #pragma unroll
+    for (int i = 0; i < ITEMS_PER_THREAD; ++i) {
+        if (tid + BLOCK_THREADS * i < num_items) {
+            flags[i] = flags[i] || (items1[i] == items2[i]);
+        }
+    }
+}
+
+template <typename T, int BLOCK_THREADS, int ITEMS_PER_THREAD>
+inline void BlockPredNEq_Cols(size_t tid, T (&items1)[ITEMS_PER_THREAD], T (&items2)[ITEMS_PER_THREAD], int (&flags)[ITEMS_PER_THREAD], int num_items) {
+    #pragma unroll
+    for (int i = 0; i < ITEMS_PER_THREAD; ++i) {
+        if (tid + BLOCK_THREADS * i < num_items) {
+            flags[i] = (items1[i] != items2[i]);
+        }
+    }
+}
+template <typename T, int BLOCK_THREADS, int ITEMS_PER_THREAD>
+inline void BlockPredANEq_Cols(size_t tid, T (&items1)[ITEMS_PER_THREAD], T (&items2)[ITEMS_PER_THREAD], int (&flags)[ITEMS_PER_THREAD], int num_items) {
+    #pragma unroll
+    for (int i = 0; i < ITEMS_PER_THREAD; ++i) {
+        if (tid + BLOCK_THREADS * i < num_items) {
+            flags[i] = flags[i] && (items1[i] != items2[i]);
+        }
+    }
+}
+template <typename T, int BLOCK_THREADS, int ITEMS_PER_THREAD>
+inline void BlockPredOrNEq_Cols(size_t tid, T (&items1)[ITEMS_PER_THREAD], T (&items2)[ITEMS_PER_THREAD], int (&flags)[ITEMS_PER_THREAD], int num_items) {
+    #pragma unroll
+    for (int i = 0; i < ITEMS_PER_THREAD; ++i) {
+        if (tid + BLOCK_THREADS * i < num_items) {
+            flags[i] = flags[i] || (items1[i] != items2[i]);
+        }
+    }
+}
+
+template <typename T, int BLOCK_THREADS, int ITEMS_PER_THREAD>
+inline void BlockPredLT_Cols(size_t tid, T (&items1)[ITEMS_PER_THREAD], T (&items2)[ITEMS_PER_THREAD], int (&flags)[ITEMS_PER_THREAD], int num_items) {
+    #pragma unroll
+    for (int i = 0; i < ITEMS_PER_THREAD; ++i) {
+        if (tid + BLOCK_THREADS * i < num_items) {
+            flags[i] = (items1[i] < items2[i]);
+        }
+    }
+}
+template <typename T, int BLOCK_THREADS, int ITEMS_PER_THREAD>
+inline void BlockPredALT_Cols(size_t tid, T (&items1)[ITEMS_PER_THREAD], T (&items2)[ITEMS_PER_THREAD], int (&flags)[ITEMS_PER_THREAD], int num_items) {
+    #pragma unroll
+    for (int i = 0; i < ITEMS_PER_THREAD; ++i) {
+        if (tid + BLOCK_THREADS * i < num_items) {
+            flags[i] = flags[i] && (items1[i] < items2[i]);
+        }
+    }
+}
+template <typename T, int BLOCK_THREADS, int ITEMS_PER_THREAD>
+inline void BlockPredOrLT_Cols(size_t tid, T (&items1)[ITEMS_PER_THREAD], T (&items2)[ITEMS_PER_THREAD], int (&flags)[ITEMS_PER_THREAD], int num_items) {
+    #pragma unroll
+    for (int i = 0; i < ITEMS_PER_THREAD; ++i) {
+        if (tid + BLOCK_THREADS * i < num_items) {
+            flags[i] = flags[i] || (items1[i] < items2[i]);
+        }
+    }
+}
+
+template <typename T, int BLOCK_THREADS, int ITEMS_PER_THREAD>
+inline void BlockPredLTE_Cols(size_t tid, T (&items1)[ITEMS_PER_THREAD], T (&items2)[ITEMS_PER_THREAD], int (&flags)[ITEMS_PER_THREAD], int num_items) {
+    #pragma unroll
+    for (int i = 0; i < ITEMS_PER_THREAD; ++i) {
+        if (tid + BLOCK_THREADS * i < num_items) {
+            flags[i] = (items1[i] <= items2[i]);
+        }
+    }
+}
+template <typename T, int BLOCK_THREADS, int ITEMS_PER_THREAD>
+inline void BlockPredALTE_Cols(size_t tid, T (&items1)[ITEMS_PER_THREAD], T (&items2)[ITEMS_PER_THREAD], int (&flags)[ITEMS_PER_THREAD], int num_items) {
+    #pragma unroll
+    for (int i = 0; i < ITEMS_PER_THREAD; ++i) {
+        if (tid + BLOCK_THREADS * i < num_items) {
+            flags[i] = flags[i] && (items1[i] <= items2[i]);
+        }
+    }
+}
+template <typename T, int BLOCK_THREADS, int ITEMS_PER_THREAD>
+inline void BlockPredOrLTE_Cols(size_t tid, T (&items1)[ITEMS_PER_THREAD], T (&items2)[ITEMS_PER_THREAD], int (&flags)[ITEMS_PER_THREAD], int num_items) {
+    #pragma unroll
+    for (int i = 0; i < ITEMS_PER_THREAD; ++i) {
+        if (tid + BLOCK_THREADS * i < num_items) {
+            flags[i] = flags[i] || (items1[i] <= items2[i]);
+        }
+    }
+}
+
+template <typename T, int BLOCK_THREADS, int ITEMS_PER_THREAD>
+inline void BlockPredGT_Cols(size_t tid, T (&items1)[ITEMS_PER_THREAD], T (&items2)[ITEMS_PER_THREAD], int (&flags)[ITEMS_PER_THREAD], int num_items) {
+    #pragma unroll
+    for (int i = 0; i < ITEMS_PER_THREAD; ++i) {
+        if (tid + BLOCK_THREADS * i < num_items) {
+            flags[i] = (items1[i] > items2[i]);
+        }
+    }
+}
+template <typename T, int BLOCK_THREADS, int ITEMS_PER_THREAD>
+inline void BlockPredAGT_Cols(size_t tid, T (&items1)[ITEMS_PER_THREAD], T (&items2)[ITEMS_PER_THREAD], int (&flags)[ITEMS_PER_THREAD], int num_items) {
+    #pragma unroll
+    for (int i = 0; i < ITEMS_PER_THREAD; ++i) {
+        if (tid + BLOCK_THREADS * i < num_items) {
+            flags[i] = flags[i] && (items1[i] > items2[i]);
+        }
+    }
+}
+template <typename T, int BLOCK_THREADS, int ITEMS_PER_THREAD>
+inline void BlockPredOrGT_Cols(size_t tid, T (&items1)[ITEMS_PER_THREAD], T (&items2)[ITEMS_PER_THREAD], int (&flags)[ITEMS_PER_THREAD], int num_items) {
+    #pragma unroll
+    for (int i = 0; i < ITEMS_PER_THREAD; ++i) {
+        if (tid + BLOCK_THREADS * i < num_items) {
+            flags[i] = flags[i] || (items1[i] > items2[i]);
+        }
+    }
+}
+
+template <typename T, int BLOCK_THREADS, int ITEMS_PER_THREAD>
+inline void BlockPredGTE_Cols(size_t tid, T (&items1)[ITEMS_PER_THREAD], T (&items2)[ITEMS_PER_THREAD], int (&flags)[ITEMS_PER_THREAD], int num_items) {
+    #pragma unroll
+    for (int i = 0; i < ITEMS_PER_THREAD; ++i) {
+        if (tid + BLOCK_THREADS * i < num_items) {
+            flags[i] = (items1[i] >= items2[i]);
+        }
+    }
+}
+template <typename T, int BLOCK_THREADS, int ITEMS_PER_THREAD>
+inline void BlockPredAGTE_Cols(size_t tid, T (&items1)[ITEMS_PER_THREAD], T (&items2)[ITEMS_PER_THREAD], int (&flags)[ITEMS_PER_THREAD], int num_items) {
+    #pragma unroll
+    for (int i = 0; i < ITEMS_PER_THREAD; ++i) {
+        if (tid + BLOCK_THREADS * i < num_items) {
+            flags[i] = flags[i] && (items1[i] >= items2[i]);
+        }
+    }
+}
+template <typename T, int BLOCK_THREADS, int ITEMS_PER_THREAD>
+inline void BlockPredOrGTE_Cols(size_t tid, T (&items1)[ITEMS_PER_THREAD], T (&items2)[ITEMS_PER_THREAD], int (&flags)[ITEMS_PER_THREAD], int num_items) {
+    #pragma unroll
+    for (int i = 0; i < ITEMS_PER_THREAD; ++i) {
+        if (tid + BLOCK_THREADS * i < num_items) {
+            flags[i] = flags[i] || (items1[i] >= items2[i]);
+        }
+    }
+}
+
 // -------------------------------------------PREDICATE----------------------------------------------

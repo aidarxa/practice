@@ -1,111 +1,99 @@
-Техническое Задание (Часть 3/3): Интеграция Конвейера и Динамическое Управление Памятью
+Внедрение **Data-Centric Push-архитектуры** (конвейерной генерации) — это переход от "учебного" движка к СУБД промышленного уровня. Это потребует фундаментального рефакторинга вашего генератора (`visitor.cpp`), но результат превзойдет все ожидания: вы получите честную семантику SQL (с размножением строк) и максимальную утилизацию кэшей GPU.
 
-Роль и задача:
-Это финальный этап архитектурного рефакторинга нашей СУБД. У нас уже готовы абстрактные деревья (Expression Tree, Operator Tree), Транслятор, Оптимизатор с правилом Predicate Pushdown и JIT-кодогенератор (паттерн Visitor).
+Вот пошаговый план (Roadmap), как перевести ваш текущий движок на Push-модель.
 
-Твоя задача на этом этапе — собрать все эти модули в единый рабочий конвейер в QueryEngine::processQuery и решить критическую проблему управления памятью (из-за которой мы ловили исключения кучи AdaptiveCPP в сложных запросах типа SSB Q4.3).
-Глава 6. Расчет размера буфера результатов (Dynamic Sizing)
+---
 
-Раньше мы выделяли жестко захардкоженные 21000 * 4 байт, что приводило к Segfault на GPU при больших группировках. Теперь размер должен вычисляться динамически на основе метаданных Каталога и структуры AggregateNode.
-6.1 Модификация AggregateNode
+### Шаг 1: Смена интерфейса AST-узлов (От Pull к Push)
 
-Добавь в класс AggregateNode (в operators.h) метод для точного расчета кардинальности результата:
-C++
+Сейчас ваш `JITOperatorVisitor` просто обходит дерево и последовательно пишет код в `stream`. Для Push-модели узлы AST должны общаться друг с другом.
 
-uint64_t calculateResultSize(const Catalog& catalog) const {
-    uint64_t total_size = 1;
-    for (const auto& group_expr : group_by_exprs_) {
-        // Если это ColumnRefExpr, извлекаем имя колонки и таблицы
-        // Ищем статистику в catalog.getTableMetadata(...)
-        // Если статистика есть, умножаем total_size на stats.cardinality_
-        // Если статистики нет или это сложное выражение, используем фолбэк (например, берем общий размер таблицы)
-        // ВАЖНО: Никакого хардкода `card = 7` для городов! Города должны брать свою реальную кардинальность.
-    }
-    return total_size;
+Вам нужно добавить в базовый класс `OperatorNode` два виртуальных метода:
+
+1. `produce(JITContext& ctx)` — Метод, который *начинает* генерацию данных.
+2. `consume(JITContext& ctx, const std::vector<std::string>& active_vars)` — Метод, который принимает сгенерированные данные снизу и оборачивает их в свою логику.
+
+**Как это работает (на примере `Scan -> Filter -> Agg`):**
+
+1. Движок вызывает `AggNode->produce()`.
+2. `AggNode` ничего не генерирует сам, он просит ребенка: `child->produce()`.
+3. Запрос доходит до `TableScanNode`. Тот начинает писать ядро: `for (int i = 0...) { загрузка переменных; ...`.
+4. Внутри этого цикла `TableScanNode` вызывает метод родителя: `parent->consume(ctx, {v1, v2})`.
+5. Управление возвращается вверх. `FilterNode` вставляет `if (v1 > 10) {` и зовет своего родителя `parent->consume(...)`.
+6. Наконец, `AggNode` вставляет `atomic_add(...)`.
+7. Вызовы возвращаются вниз, закрывая скобки `}`.
+
+### Шаг 2: Модернизация Hash Table (Поддержка 1-to-N)
+
+Чтобы `OR`-джойны и обычные `Inner Joins` корректно размножали строки, хеш-таблица на фазе Build (в `crystal/join.h`) должна научиться хранить несколько значений по одному ключу.
+
+Вам нужно реализовать **Multi-value Hash Table**.
+
+* Вместо массива `[Key, Payload]` создаются два массива:
+1. **Directory:** `[Key, Offset, Count]` — по ключу находим, где лежат данные и сколько их.
+2. **Payload Chunk:** Сплошной массив со всеми данными измерений (значениями колонок).
+
+
+* Когда `build_kernel` встречает дубликат ключа, он атомарно увеличивает `Count` и пишет данные в `Payload Chunk`.
+
+### Шаг 3: Переписывание `HashJoinNode` (Суть размножения)
+
+Именно здесь происходит магия, из-за которой мы затеяли рефакторинг. `HashJoinNode` разделяет запрос на два конвейера.
+
+**В методе `produce()` (Фаза Build):**
+Он генерирует SYCL-ядро для левого потомка (таблицы измерения), которое строит `Multi-value Hash Table`. На этом конвейер 1 заканчивается (Pipeline Breaker).
+
+**В методе `consume()` (Фаза Probe):**
+Сюда снизу (от `TableScan` фактов) приходят переменные.
+Генератор должен написать код, который ищет ключ в хеш-таблице, получает `Offset` и `Count`, и **запускает вложенный цикл**.
+
+```cpp
+void HashJoinNode::consume(JITContext& ctx, ...) {
+    // Генерируем код для Probe
+    ctx.probe_kernel << "int offset = 0, count = 0;\n";
+    ctx.probe_kernel << "ProbeMultiHT(" << ht_name << ", " << key_var << ", &offset, &count);\n";
+    
+    // Вложенный цикл - ЭТО И ЕСТЬ РАЗМНОЖЕНИЕ СТРОК НА GPU!
+    ctx.probe_kernel << "for (int j = 0; j < count; ++j) {\n";
+    
+    // Извлекаем payload для конкретного совпадения
+    ctx.probe_kernel << "    int val = payload_chunk[offset + j];\n";
+    
+    // ПУШИМ СТРОКУ ДАЛЬШЕ РОДИТЕЛЮ (например, в Агрегацию)
+    parent->consume(ctx, ...); 
+    
+    ctx.probe_kernel << "}\n"; // Закрываем цикл размножения
 }
 
-6.2 Модификация ExecutionContext
+```
 
-В файле include/core/execution.h добавь поле для передачи размера в DatabaseInstance:
-C++
+Если у нас условие `OR` (как в Запросе 1), `HashJoinNode` сгенерирует два таких блока (два `Probe` + два цикла `for`), и родительский `consume` (Агрегация) будет вызван внутри каждого из них.
 
-struct ExecutionContext {
-    sycl::queue* q_;
-    std::unordered_map<std::string, void*> buffers_;
-    void* result_buffer_ = nullptr;
-    
-    // НОВОЕ ПОЛЕ:
-    size_t expected_result_size_{0}; 
-    
-    // ...
-};
+### Шаг 4: Изоляция конвейеров (Pipeline Breakers)
 
-Глава 7. Интеграция главного конвейера (QueryEngine::processQuery)
+Ваш `JITContext` должен научиться понимать, что один SQL-запрос может породить **несколько** `sycl::queue.submit(...)` (несколько ядер).
 
-Теперь нам нужно выбросить старый монолитный buildPhysicalPlan из QueryEngine и заменить его на элегантный вызов новых подсистем.
+Для этого вводятся Pipeline Breakers.
 
-Измени метод processQuery (в execution.cpp или optimizer.cpp в зависимости от твоей структуры):
-C++
+* `TableScan`, `Filter`, `Math` — это пайплайны. Они живут в регистрах.
+* `HashBuild` и `Aggregate` — это разрыватели.
+Когда генератор доходит до разрывателя, он:
 
-void QueryEngine::processQuery(hsql::SelectStatement* stmt, ExecutionContext* ctx) {
-    // ШАГ 1: Трансляция (AST -> Naive Operator Tree)
-    QueryTranslator translator(catalog_);
-    auto naive_tree = translator.translate(stmt);
+1. Завершает текущую строку C++ кода (закрывает скобки ядра).
+2. Регистрирует новое ядро в `execution.cpp`.
+3. Создает глобальные массивы (`malloc_device`), чтобы передать данные между ядром 1 и ядром 2.
 
-    // ШАГ 2: Оптимизация (Naive Tree -> Optimized Operator Tree)
-    Optimizer optimizer;
-    auto optimized_tree = optimizer.optimize(std::move(naive_tree));
+### Шаг 5: Оптимизатор и "Умный" OR
 
-    // ШАГ 3: Расчет памяти
-    // Ищем AggregateNode в корне или под корнем
-    const AggregateNode* agg_node = findAggregateNode(optimized_tree.get());
-    if (agg_node) {
-        uint64_t tuples = agg_node->calculateResultSize(*catalog_);
-        uint64_t tuple_size = agg_node->group_by_exprs_.size() + agg_node->aggregations_.size();
-        ctx->expected_result_size_ = tuples * tuple_size;
-    } else {
-        ctx->expected_result_size_ = 1; // Скалярная агрегация
-    }
+С Push-моделью ваш оптимизатор (`optimizer_rules.cpp`) заживет новой жизнью. Вы сможете спускать `OR`-предикаты прямо в `HashJoinNode`, и компилятор будет генерировать:
 
-    // ШАГ 4: JIT Генерация (Optimized Tree -> C++ Code)
-    JITContext jit_ctx;
-    JITOperatorVisitor visitor(jit_ctx);
-    optimized_tree->accept(visitor);
+```cpp
+bool match_1 = Probe(...);
+bool match_2 = Probe(...);
 
-    std::string final_code = assembleFinalKernel(jit_ctx);
+if (match_1) { /* push */ }
+if (match_2 && !match_1) { /* push */ } // Анти-дублирование, если ключи совпали на одной строке!
 
-    // ШАГ 5: Динамическая компиляция (.so)
-    auto lib_path = compiler_->compile(final_code);
+```
 
-    // ШАГ 6: Выполнение
-    // ВНИМАНИЕ: Вызов выделения памяти должен происходить именно ЗДЕСЬ,
-    // когда мы точно знаем ctx->expected_result_size_!
-    db_instance_->ensureCapacity(ctx->expected_result_size_);
-    db_instance_->zeroResultBuffer();
-
-    auto executor = std::make_unique<JITExecutor>(lib_path);
-    executor->execute(ctx);
-}
-
-(Примечание: Убедись, что метод сборки финального C++ файла assembleFinalKernel правильно склеивает jit_ctx.includes_and_globals, jit_ctx.build_kernels и jit_ctx.probe_kernel в единую функцию extern "C" void execute_query(db::ExecutionContext* ctx)).
-Глава 8. Финальный План Действий (Action Plan) для тебя
-
-Твоя задача — завершить рефакторинг движка. Выдай мне готовый production-ready код в следующем порядке:
-
-Шаг 1: AggregateNode и Управление Памятью
-
-    Реализуй метод calculateResultSize в AggregateNode с правильным обращением к Catalog.
-
-    Добавь expected_result_size_ в ExecutionContext.
-
-    Обнови логику в DatabaseInstance, чтобы он НЕ аллоцировал буфер слепо в начале, а ждал точного размера от QueryEngine.
-
-Шаг 2: QueryEngine::processQuery
-
-    Напиши полную, обновленную версию processQuery, реализующую все 6 шагов конвейера (Трансляция -> Оптимизация -> Память -> Visitor -> Компиляция -> Выполнение).
-
-Шаг 3: Сборка JIT-кода
-
-    Покажи код функции assembleFinalKernel, которая склеивает результаты работы JITOperatorVisitor в валидный C++ файл, готовый для компилятора LLVM/SYCL.
-
-Убедись, что нигде не осталось следов старого buildPhysicalPlan. Наша новая архитектура: Дерево -> Оптимизатор -> Visitor.
+---

@@ -14,26 +14,44 @@
 namespace db {
 
 // ============================================================================
+// Pipeline — one SYCL kernel submission block.
+// includes_and_globals: q.submit([&](handler& h) { ... launch parameters ... }
+// kernel_body:          the kernel lambda body (inside parallel_for)
+// ============================================================================
+struct Pipeline {
+    std::string       kernel_name;
+    std::stringstream includes_and_globals;
+    std::stringstream kernel_body;
+};
+
+// ============================================================================
 // JITContext — shared mutable state threaded through both visitors.
 // ============================================================================
 struct JITContext {
-    std::stringstream includes_and_globals;
-    std::stringstream build_kernels;  // All build-phase kernel bodies
-    std::stringstream probe_kernel;   // Main select kernel body
+    // ---- Multi-pipeline support ----
+    // Ordered list of kernels to submit sequentially.
+    // Build kernels come first, then the probe/select kernel.
+    std::vector<Pipeline> pipelines;
+    Pipeline*             current_pipeline = nullptr;
 
-    // column_name → register name in the *probe/select* kernel.
-    // Set by JITOperatorVisitor when it emits a BlockLoad in the probe kernel.
+    void startNewPipeline(const std::string& name) {
+        pipelines.emplace_back();
+        current_pipeline = &pipelines.back();
+        current_pipeline->kernel_name = name;
+    }
+
+    // ---- Column tracking (probe kernel) ----
+    // column_name → register name in the probe kernel.
     std::unordered_map<std::string, std::string> col_to_reg;
 
-    // Which columns have already been BlockLoad-ed in the *current* kernel.
-    // Reset at kernel boundaries.
+    // Which columns have already been BlockLoad-ed in the probe kernel.
     std::set<std::string> loaded_in_probe;
 
     // Counter for unique temporary OR-mask names ("mask_1", "mask_2", …)
     int mask_counter = 0;
 
     std::string current_items_col;
-    
+
     // Counter used to generate unique kernel class names.
     int build_kernel_count = 0;
 
@@ -52,9 +70,17 @@ struct JITContext {
     // Columns that must be fetched from ctx (EXTERNAL_INPUT):
     std::set<std::string> external_columns; // e.g. "d_lo_orderdate"
 
-    // Result buffer size expression (set by AggregateNode visitor)
+    // Result buffer size expression (set by AggregateNode/ProjectionNode visitor).
+    // For AVG/MIN this is the physical storage size; generated finalization
+    // code compacts it to the visible size before returning to the host.
     std::string result_size_expr;   // e.g. "7*1000"
     int         tuple_size = 1;
+    std::string visible_result_size_expr;
+
+    // Code emitted after all main pipelines, before q.wait(). Used for
+    // aggregate finalization/compaction kernels.
+    std::stringstream post_execution_code;
+    std::set<std::string> emitted_auxiliary_kernels;
 
     // ---------- helpers ----------
     std::string getNewMask() {
@@ -100,6 +126,10 @@ public:
     void visit(const LiteralIntExpr&  node) override;
     void visit(const LiteralFloatExpr& node) override;
     void visit(const BinaryExpr&      node) override;
+    void visit(const StarExpr&        node) override;
+
+    // Translates AST expressions into inline C++ code
+    std::string translateInlineExpr(const ExprNode* expr, bool is_probe);
 
 private:
     JITContext&        ctx_;
@@ -121,66 +151,160 @@ private:
 };
 
 // ============================================================================
-// JITOperatorVisitor — macro-level: walks the Operator Tree and emits
-// full SYCL kernel bodies into JITContext.
+// JITOperatorVisitor — macro-level: walks the Operator Tree using the
+// Data-Centric Push Model and emits full SYCL kernel bodies into JITContext.
 //
-// HashJoinNode:  left  (build-side / dimension) → separate build kernel
-//                right (probe-side / fact)       → continues in probe kernel
+// Entry point: visit(AggregateNode) → produce(root)
+//
+// Runtime flow (canonical Data-Centric path, no legacy scalar fallback):
+//   produce(Agg) → produce(HashJoin) → produce(Filter) → produce(Scan)
+//   Scan opens a for-loop, then:
+//   consumeVector(Filter) → consumeVector(HashJoin) → consumeVector(Agg)
+//   If a join expands 1-to-N (MHT), control switches to consumeItem(...)
+//   for the remainder of the parent chain in that scope.
+//
+// Pipeline Breakers:
+//   HashBuildNode generates one or more separate build kernels (pipelines)
+//   before triggering the probe pipeline.
 // ============================================================================
 class JITOperatorVisitor : public OperatorVisitor {
 public:
+    enum class ExecutionMode : uint8_t {
+        DataCentric = 0
+    };
+
     explicit JITOperatorVisitor(JITContext& ctx, const Catalog& catalog);
 
+    // ---- Legacy OperatorVisitor interface (entry point via accept()) ----
+    // AggregateNode::accept() calls visit(AggregateNode) which kicks off produce().
+    // Other visit() methods are stubs — traversal is driven by produce/consume.
     void visit(const TableScanNode& node) override;
     void visit(const FilterNode&    node) override;
     void visit(const HashJoinNode&  node) override;
     void visit(const AggregateNode& node) override;
+    void visit(const ProjectionNode& node) override;
 
-    // Assembles the complete execute_query() source file from JITContext.
+    // ---- Push-model dispatchers ----
+    void produce(const OperatorNode* node, JITContext& ctx);
+
+    // Vector-mode consumer: called OUTSIDE any scalar loop.
+    // All Crystal block primitives (BlockLoad, BlockPred, BlockProbeAndPHT) are valid here.
+    void consumeVector(const OperatorNode* node, JITContext& ctx,
+                       const OperatorNode* sender,
+                       const std::vector<std::string>& active_vars);
+
+    // Item-mode consumer: called INSIDE a scalar expansion loop (MHT j-loop).
+    // Only scalar / atomic operations are valid here.
+    void consumeItem(const OperatorNode* node, JITContext& ctx,
+                     const OperatorNode* sender,
+                     const std::vector<std::string>& active_vars);
+
+    // Canonical dispatcher:
+    //  - called only by produce* entry points.
+    //  - routes into consumeVector/consumeItem according to consume_mode_.
+    //  - legacy scalar consume path is intentionally removed.
+    void consume(const OperatorNode* node, JITContext& ctx,
+                 const OperatorNode* sender,
+                 const std::vector<std::string>& active_vars);
+
     std::string generateCode() const;
 
 private:
     JITContext&    ctx_;
     const Catalog& catalog_;
 
-    // Points to whichever stream is currently being written into.
-    std::stringstream* active_stream_;
-
-    // Whether we are currently generating inside a build kernel.
-    bool in_build_kernel_ = false;
-
-    // Track which columns have been loaded in the CURRENT build kernel.
-    std::set<std::string> loaded_in_build_;
-
-    // first_pred flag shared within the probe kernel's filter chain.
-    bool probe_first_pred_ = true;
-
     // Build-side pending info (populated while visiting left of HashJoin).
+    // Helper for Vectorized Push Model
+    void ensureLoaded(const std::string& col_name, JITContext& ctx) const;
+
     struct BuildInfo {
         std::string ht_name;       // "d_s_hash_table"
         std::string ht_size_expr;  // "20000" or "2*20000"
         std::string key_mins;      // "0" or "1"
-        uint8_t     variant;       // 1 = keys only, 2 = key-value pairs
-        std::string fk_col;        // foreign key column in fact table
-        std::string val_col;       // value column (variant 2 only)
+        uint8_t     variant;       // 1 = keys only (PHT_1), 2 = key-value pairs (PHT_2)
+        bool        use_mht;       // true = Multi-value HT (two-pass), false = Perfect HT
+        std::vector<std::string> fk_cols; // FK column(s) in the probe/fact table
+        std::string val_col;       // payload column (variant 2 / MHT only)
         std::string dim_prefix;    // "s", "c", "p", "d"
         std::string size_macro;    // "S_LEN", "C_LEN", etc.
+        std::string pk_col;        // PK column in the dim table
     };
-    std::vector<BuildInfo> build_infos_;
+    std::unordered_map<const OperatorNode*, BuildInfo> build_infos_;
+    std::vector<std::unique_ptr<ExprNode>> expanded_projection_exprs_;
+    std::set<std::string> agg_cols_;    // Columns required for aggregation (high priority for joins)
+    std::set<std::string> filter_cols_; // Columns required for filtering (low priority for joins)
+    void collectAllColumnsFromTree(const OperatorNode* node);
 
-    // Helpers
+    // ---- Produce handlers (top-down) ----
+    void produceTableScan (const TableScanNode*  node, JITContext& ctx);
+    void produceFilter    (const FilterNode*     node, JITContext& ctx);
+    void produceHashJoin  (const HashJoinNode*   node, JITContext& ctx);
+    void produceAggregate (const AggregateNode*  node, JITContext& ctx);
+    void produceProjection(const ProjectionNode* node, JITContext& ctx);
+
+    // ---- Vector-mode consume handlers (block level, outside scalar loop) ----
+    void consumeFilterVector   (const FilterNode*    node, JITContext& ctx,
+                                const OperatorNode* sender,
+                                const std::vector<std::string>& active_vars);
+    void consumeHashJoinVector (const HashJoinNode*  node, JITContext& ctx,
+                                const OperatorNode* sender,
+                                const std::vector<std::string>& active_vars);
+    void consumeAggregateVector(const AggregateNode* node, JITContext& ctx,
+                                const OperatorNode* sender,
+                                const std::vector<std::string>& active_vars);
+    void consumeProjectionVector(const ProjectionNode* node, JITContext& ctx,
+                                 const OperatorNode* sender,
+                                 const std::vector<std::string>& active_vars);
+
+    // ---- Item-mode consume handlers (scalar level, inside scalar loop) ----
+    void consumeFilterItem   (const FilterNode*    node, JITContext& ctx,
+                              const OperatorNode* sender,
+                              const std::vector<std::string>& active_vars);
+    void consumeHashJoinItem (const HashJoinNode*  node, JITContext& ctx,
+                              const OperatorNode* sender,
+                              const std::vector<std::string>& active_vars);
+    void consumeAggregateItem(const AggregateNode* node, JITContext& ctx,
+                              const OperatorNode* sender,
+                              const std::vector<std::string>& active_vars);
+    void consumeProjectionItem(const ProjectionNode* node, JITContext& ctx,
+                               const OperatorNode* sender,
+                               const std::vector<std::string>& active_vars);
+
+    enum class ConsumeMode : uint8_t {
+        Vector = 0,
+        Item
+    };
+
+    ExecutionMode execution_mode_ = ExecutionMode::DataCentric;
+    ConsumeMode   consume_mode_   = ConsumeMode::Vector;
+
+    // ---- Build kernel emitters ----
+    // PHT: emit one build kernel (with optional filter). Populates hash_tables.
+    void emitPHTBuildKernel(const BuildInfo& bi,
+                            const FilterNode* build_filter,
+                            JITContext& ctx);
+
+    // MHT: emit Count + 3-step Prefix Sum + Write kernels. Populates hash_tables.
+    void emitMHTBuildKernels(const BuildInfo& bi,
+                             const FilterNode* build_filter,
+                             JITContext& ctx);
+
+    // ---- Helpers ----
     static std::string tablePrefix(const std::string& table_name);
     static std::string sizeMacro  (const std::string& table_name);
 
-    // Generate a complete build kernel for one dimension.
-    // Writes into ctx_.build_kernels.
-    void emitBuildKernel(const std::string& dim_table,
-                         const FilterNode*  filter,
-                         const TableScanNode& scan);
-
-    // Derive hash-table sizing from catalog stats.
+    // Derive hash-table sizing from catalog stats + join condition.
     BuildInfo computeBuildInfo(const std::string& dim_table,
-                               const FilterNode*  filter) const;
+                               const FilterNode*  filter,
+                               const HashJoinNode* join_node) const;
+
+    // Emit filter predicates (block-level BlockPred* calls) for a build kernel.
+    // Uses `items` register, writes into `flags`.
+    // Returns the column name that is currently loaded into `items` after filtering.
+    std::string emitBuildFilter(const FilterNode* filter,
+                                const std::string& dim_table,
+                                std::stringstream& code,
+                                JITContext& ctx) const;
 };
 
 } // namespace db

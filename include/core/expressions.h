@@ -26,6 +26,7 @@ enum class ExprType {
     OP_SUB,        // -
     OP_MUL,        // *
     OP_DIV,        // /
+    STAR,          // * in SELECT * or aggregate arguments
 };
 
 // ============================================================================
@@ -36,6 +37,7 @@ class ColumnRefExpr;
 class LiteralIntExpr;
 class LiteralFloatExpr;
 class BinaryExpr;
+class StarExpr;
 
 // ============================================================================
 // 3. Абстрактный базовый класс узла выражения
@@ -130,6 +132,21 @@ public:
     }
 };
 
+
+// SQL star: SELECT * and aggregate arguments such as COUNT(*)
+class StarExpr final : public ExprNode {
+public:
+    StarExpr() = default;
+
+    ExprType getType() const override { return ExprType::STAR; }
+
+    void accept(ExprVisitor& visitor) const override;
+
+    std::unique_ptr<ExprNode> clone() const override {
+        return std::make_unique<StarExpr>();
+    }
+};
+
 // ============================================================================
 // 5. Visitor — абстрактный обходчик дерева выражений
 // ============================================================================
@@ -140,6 +157,7 @@ public:
     virtual void visit(const LiteralIntExpr& node)  = 0;
     virtual void visit(const LiteralFloatExpr& node)= 0;
     virtual void visit(const BinaryExpr& node)      = 0;
+    virtual void visit(const StarExpr& node)        = 0;
 };
 
 // ============================================================================
@@ -155,6 +173,7 @@ public:
     void visit(const LiteralIntExpr& node) override;
     void visit(const LiteralFloatExpr& node) override;
     void visit(const BinaryExpr& node) override;
+    void visit(const StarExpr& node) override;
 
 private:
     std::ostream& out_;

@@ -64,7 +64,12 @@ private:
 
 class AdaptiveCppCompiler : public ICompiler {
 public:
+    AdaptiveCppCompiler(std::string include_dir = {},
+                        std::string deps_include_dir = {});
     std::string compile(const std::string& source_code, const std::string& query_hash) override;
+private:
+    std::string include_dir_;
+    std::string deps_include_dir_;
 };
 
 class DynamicLibraryExecutor : public IExecutor {
