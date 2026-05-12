@@ -42,6 +42,7 @@ static std::shared_ptr<Catalog> buildTestCatalog() {
                      "s_region", "s_phone"},
                     20000, false);
     s.setColumnStats("s_suppkey", {1, 20000, 20000});
+    s.setColumnPrimaryKey("s_suppkey");
     s.setColumnStats("s_city",   {0, 249,   250});
     s.setColumnStats("s_region", {0, 4,     5});
     s.setColumnStats("s_nation", {0, 24,    25});
@@ -53,6 +54,7 @@ static std::shared_ptr<Catalog> buildTestCatalog() {
                      "c_region", "c_phone", "c_mktsegment"},
                     300000, false);
     c.setColumnStats("c_custkey", {1, 300000, 300000});
+    c.setColumnPrimaryKey("c_custkey");
     c.setColumnStats("c_city",   {0, 249,    250});
     c.setColumnStats("c_region", {0, 4,      5});
     c.setColumnStats("c_nation", {0, 24,     25});
@@ -64,6 +66,7 @@ static std::shared_ptr<Catalog> buildTestCatalog() {
                      "p_color", "p_type", "p_size", "p_container"},
                     800000, false);
     p.setColumnStats("p_partkey",  {1, 800000, 800000});
+    p.setColumnPrimaryKey("p_partkey");
     p.setColumnStats("p_category", {1, 25,     25});
     p.setColumnStats("p_brand1",   {1, 1000,   1000});
     catalog->pushTableMetadata(p);
@@ -77,6 +80,7 @@ static std::shared_ptr<Catalog> buildTestCatalog() {
                      "d_weekdayfl"},
                     2556, false);
     d.setColumnStats("d_datekey", {19920101, 19981230, 2556});
+    d.setColumnPrimaryKey("d_datekey");
     d.setColumnStats("d_year",    {1992, 1998, 7});
     catalog->pushTableMetadata(d);
 
@@ -475,6 +479,61 @@ static void test_jit_visitor_unsupported_predicate_throws() {
     std::cout << "PASSED\n";
 }
 
+
+// ============================================================================
+// Test 9: Catalog uniqueness metadata is explicit and available to codegen
+// ============================================================================
+static void test_catalog_uniqueness_metadata() {
+    std::cout << "Test 9: Catalog uniqueness metadata... ";
+
+    auto catalog = buildTestCatalog();
+
+    const auto& d = catalog->getTableMetadata("DDATE");
+    const auto& p = catalog->getTableMetadata("PART");
+    const auto& s = catalog->getTableMetadata("SUPPLIER");
+    const auto& c = catalog->getTableMetadata("CUSTOMER");
+
+    assert(d.isColumnPrimaryKey("d_datekey"));
+    assert(p.isColumnPrimaryKey("p_partkey"));
+    assert(s.isColumnPrimaryKey("s_suppkey"));
+    assert(c.isColumnPrimaryKey("c_custkey"));
+
+    assert(d.isColumnUnique("d_datekey"));
+    assert(p.isColumnUnique("p_partkey"));
+    assert(s.isColumnUnique("s_suppkey"));
+    assert(c.isColumnUnique("c_custkey"));
+
+    const auto& lo = catalog->getTableMetadata("LINEORDER");
+    assert(!lo.isColumnUnique("lo_custkey"));
+    assert(!lo.isColumnPrimaryKey("lo_custkey"));
+
+    std::cout << "PASSED\n";
+}
+
+
+
+// ============================================================================
+// Test 10: nullable metadata survives stats updates
+// ============================================================================
+static void test_catalog_nullable_metadata() {
+    std::cout << "Test 10: Catalog nullable metadata... ";
+
+    TableMetadata t("T", {"a", "b"}, 10, false);
+    t.setColumnNullable("a", true);
+    t.setColumnStats("a", {1, 9, 9});
+    assert(t.isColumnNullable("a"));
+
+    t.setColumnStats("b", {0, 1, 2, false, false, true});
+    assert(t.isColumnNullable("b"));
+
+    t.setColumnPrimaryKey("a");
+    assert(t.isColumnPrimaryKey("a"));
+    assert(t.isColumnUnique("a"));
+    assert(t.isColumnNullable("a"));
+
+    std::cout << "PASSED\n";
+}
+
 // ============================================================================
 int main() {
     std::cout << "=== test_optimizer (new pipeline) ===\n\n";
@@ -487,6 +546,8 @@ int main() {
     test_jit_visitor_q31();
     test_jit_visitor_mixed_predicate_universal_path();
     test_jit_visitor_unsupported_predicate_throws();
+    test_catalog_uniqueness_metadata();
+    test_catalog_nullable_metadata();
 
     std::cout << "\nAll tests passed!\n";
     return 0;

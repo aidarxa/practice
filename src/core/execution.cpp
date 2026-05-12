@@ -20,6 +20,15 @@
 
 namespace db {
 
+static std::string tableNameFromColumn(const std::string& col) {
+    if (col.rfind("lo_", 0) == 0) return "LINEORDER";
+    if (col.rfind("s_", 0) == 0) return "SUPPLIER";
+    if (col.rfind("c_", 0) == 0) return "CUSTOMER";
+    if (col.rfind("p_", 0) == 0) return "PART";
+    if (col.rfind("d_", 0) == 0) return "DDATE";
+    return "";
+}
+
 // --- FileBasedQueryCache ---
 
 std::optional<std::string> FileBasedQueryCache::get(const std::string& query_hash) {
@@ -385,14 +394,54 @@ static void collectTableScansForResultLayout(const OperatorNode* node,
     }
 }
 
+static bool expressionMayBeNullable(const ExprNode* expr, const Catalog& catalog) {
+    if (!expr) return true;
+    switch (expr->getType()) {
+        case ExprType::STAR:
+        case ExprType::LITERAL_INT:
+        case ExprType::LITERAL_FLOAT:
+            return false;
+        case ExprType::COLUMN_REF: {
+            const auto* c = static_cast<const ColumnRefExpr*>(expr);
+            const std::string table = tableNameFromColumn(c->column_name);
+            try {
+                return catalog.getTableMetadata(table).isColumnNullable(c->column_name);
+            } catch (...) {
+                return true;
+            }
+        }
+        case ExprType::OP_ADD:
+        case ExprType::OP_SUB:
+        case ExprType::OP_MUL:
+        case ExprType::OP_DIV:
+        case ExprType::OP_EQ:
+        case ExprType::OP_NEQ:
+        case ExprType::OP_LT:
+        case ExprType::OP_LTE:
+        case ExprType::OP_GT:
+        case ExprType::OP_GTE:
+        case ExprType::OP_AND:
+        case ExprType::OP_OR: {
+            const auto* b = static_cast<const BinaryExpr*>(expr);
+            return expressionMayBeNullable(b->left.get(), catalog) ||
+                   expressionMayBeNullable(b->right.get(), catalog);
+        }
+        case ExprType::OP_IS_NULL:
+        case ExprType::OP_IS_NOT_NULL:
+            return false;
+        default:
+            return true;
+    }
+}
+
 static std::vector<ResultColumnDesc> inferResultColumns(const OperatorNode* node,
                                                         const Catalog& catalog) {
     std::vector<ResultColumnDesc> descs;
     if (!node) return descs;
 
     if (const auto* agg = findAggregateNode(node)) {
-        for (std::size_t i = 0; i < agg->group_by_exprs.size(); ++i) {
-            descs.push_back({LogicalType::Int64, 0, false});
+        for (const auto& gexpr : agg->group_by_exprs) {
+            descs.push_back({LogicalType::Int64, 0, expressionMayBeNullable(gexpr.get(), catalog)});
         }
         for (const auto& agg_def : agg->aggregates) {
             if (agg_def.isAvg()) {
@@ -416,12 +465,12 @@ static std::vector<ResultColumnDesc> inferResultColumns(const OperatorNode* node
             if (expr->getType() == ExprType::STAR) {
                 for (const auto* scan : scans) {
                     const auto& meta = catalog.getTableMetadata(scan->table_name);
-                    for (uint64_t i = 0; i < meta.getColumnCount(); ++i) {
-                        descs.push_back({LogicalType::Int64, 0, false});
+                    for (const auto& col_name : meta.getColumnNames()) {
+                        descs.push_back({LogicalType::Int64, 0, meta.isColumnNullable(col_name)});
                     }
                 }
             } else {
-                descs.push_back({LogicalType::Int64, 0, false});
+                descs.push_back({LogicalType::Int64, 0, expressionMayBeNullable(expr.get(), catalog)});
             }
         }
     }
@@ -493,7 +542,7 @@ void QueryEngine::executeQuery(const std::string& sql, ExecutionContext* ctx) {
     }
 
     ctx->result_columns_ = inferResultColumns(optimized_tree.get(), *catalog_);
-    ctx->result_row_count_ = 0;
+    ctx->resetResultShapeFlags();
     ctx->result_is_dense_ = findProjectionNode(optimized_tree.get()) != nullptr;
 
     preflightDeviceMemoryOrThrow(ctx, optimized_tree.get(), *catalog_);
@@ -501,11 +550,12 @@ void QueryEngine::executeQuery(const std::string& sql, ExecutionContext* ctx) {
     // Гарантируем достаточную ёмкость буфера и обнуляем его перед запуском ядра.
     // DynamicDeviceBuffer::ensureCapacity реаллоцирует только при нехватке места.
     ctx->result_buffer_->ensureCapacity(ctx->expected_result_size_);
-    ctx->result_buffer_->zero();            // ctx->result_buffer_ почему-то имеет capacity 31500 при expected_result_size_ = 21000
-
+    ctx->result_buffer_->zero();
+    ctx->ensureResultValidityCapacity(ctx->expected_result_size_);
 
     // ШАГ 5: Проверка кеша
-    std::string query_hash = "query_" + std::to_string(std::hash<std::string>{}(sql));
+    static constexpr const char* kJitAbiVersion = "v18_columnar_projection";
+    std::string query_hash = std::string("query_") + kJitAbiVersion + "_" + std::to_string(std::hash<std::string>{}(sql));
     auto cached_lib = cache_->get(query_hash);
     if (cached_lib.has_value()) {
         // Cache HIT: размер уже рассчитан, буфер подготовлен — просто выполняем

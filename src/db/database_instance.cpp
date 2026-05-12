@@ -25,10 +25,16 @@ DatabaseInstance::DatabaseInstance()
     // QueryEngine::executeQuery вызовет ensureCapacity с точным размером
     // перед запуском каждого ядра (через expected_result_size_).
     ctx_->result_buffer_ = std::make_unique<DynamicDeviceBuffer<unsigned long long>>(q_, 0);
+    ctx_->result_validity_buffer_ = std::make_unique<DynamicDeviceBuffer<uint64_t>>(q_, 0);
 }
 
 DatabaseInstance::~DatabaseInstance() {
     for (auto& pair : ctx_->buffers_) {
+        if (pair.second) {
+            sycl::free(pair.second, q_);
+        }
+    }
+    for (auto& pair : ctx_->null_bitmaps_) {
         if (pair.second) {
             sycl::free(pair.second, q_);
         }
@@ -52,6 +58,14 @@ void DatabaseInstance::initCatalog() {
         }
     };
 
+    auto applyNullabilityFromStorage = [](TableMetadata& table) {
+        for (const auto& col_name : table.getColumnNames()) {
+            if (hasNullBitmapFile(col_name)) {
+                table.setColumnNullable(col_name, true);
+            }
+        }
+    };
+
     // LINEORDER (fact)
     TableMetadata lo("LINEORDER",
                      {"lo_orderkey", "lo_linenumber", "lo_custkey", "lo_partkey",
@@ -61,6 +75,7 @@ void DatabaseInstance::initCatalog() {
                       "lo_supplycost", "lo_tax", "lo_commitdate", "lo_shipmode"},
                      LO_LEN, true);
     applyStats(lo);
+    applyNullabilityFromStorage(lo);
     catalog_->pushTableMetadata(lo);
 
     // SUPPLIER (dimension)
@@ -69,6 +84,8 @@ void DatabaseInstance::initCatalog() {
                      "s_region", "s_phone"},
                     S_LEN, false);
     applyStats(s);
+    applyNullabilityFromStorage(s);
+    s.setColumnPrimaryKey("s_suppkey");
     catalog_->pushTableMetadata(s);
 
     // CUSTOMER (dimension)
@@ -77,6 +94,8 @@ void DatabaseInstance::initCatalog() {
                      "c_region", "c_phone", "c_mktsegment"},
                     C_LEN, false);
     applyStats(c);
+    applyNullabilityFromStorage(c);
+    c.setColumnPrimaryKey("c_custkey");
     catalog_->pushTableMetadata(c);
 
     // PART (dimension)
@@ -85,6 +104,8 @@ void DatabaseInstance::initCatalog() {
                      "p_color", "p_type", "p_size", "p_container"},
                     P_LEN, false);
     applyStats(p);
+    applyNullabilityFromStorage(p);
+    p.setColumnPrimaryKey("p_partkey");
     catalog_->pushTableMetadata(p);
 
     // DDATE (dimension)
@@ -96,6 +117,8 @@ void DatabaseInstance::initCatalog() {
                      "d_weekdayfl"},
                     D_LEN, false);
     applyStats(d);
+    applyNullabilityFromStorage(d);
+    d.setColumnPrimaryKey("d_datekey");
     catalog_->pushTableMetadata(d);
 }
 
@@ -124,6 +147,14 @@ void DatabaseInstance::loadData() {
 
             std::string buf_name = "d_" + col_name;
             ctx_->buffers_[buf_name] = d_ptr;
+
+            std::vector<uint64_t> validity = loadValidityBitmapIfExists(col_name, size);
+            if (!validity.empty()) {
+                uint64_t* d_null_bitmap = sycl::malloc_device<uint64_t>(validity.size(), q_);
+                ctx_->loaded_device_bytes_ += validity.size() * sizeof(uint64_t);
+                q_.copy(validity.data(), d_null_bitmap, validity.size()).wait();
+                ctx_->null_bitmaps_[buf_name] = d_null_bitmap;
+            }
         }
     }
     std::cout << "\nData loading complete!" << std::endl;
@@ -137,24 +168,74 @@ QueryResult DatabaseInstance::executeQuery(const std::string& sql) {
     // Ждём завершения всех GPU операций перед копированием на хост.
     q_.wait();
 
-    // Определяем фактическое количество элементов для копирования.
-    // expected_result_size_ устанавливается QueryEngine до запуска ядра.
-    size_t copy_size = ctx_->expected_result_size_;
-    if (copy_size == 0) copy_size = 1; // защита от нулевого размера
-
-    // Копируем результаты на хост
-    std::vector<unsigned long long> h_result;
-    ctx_->result_buffer_->copyToHost(h_result, copy_size);
-
     QueryResult result;
-    result.data = std::move(h_result);
-    result.tuple_size = ctx_->tuple_size_;
+    result.tuple_size = ctx_->tuple_size_ == 0 ? 1 : ctx_->tuple_size_;
     result.columns = ctx_->result_columns_;
     result.dense_result = ctx_->result_is_dense_;
 
-    if (result.tuple_size == 0) {
-        result.tuple_size = 1;
+    if (ctx_->result_is_columnar_) {
+        result.row_count = ctx_->result_row_count_;
+        result.dense_result = true;
+        result.has_columnar_result = true;
+        result.column_data.resize(ctx_->result_column_count_);
+        result.column_validity_bitmap.resize(ctx_->result_column_count_);
+        const size_t rows_to_copy = result.row_count;
+        const size_t validity_words = (rows_to_copy + 63ULL) / 64ULL;
+        for (size_t col = 0; col < ctx_->result_column_count_; ++col) {
+            if (col < ctx_->result_column_buffers_.size() && ctx_->result_column_buffers_[col]) {
+                ctx_->result_column_buffers_[col]->copyToHost(result.column_data[col], rows_to_copy);
+            }
+            if (col < ctx_->result_column_validity_buffers_.size() && ctx_->result_column_validity_buffers_[col]) {
+                ctx_->result_column_validity_buffers_[col]->copyToHost(result.column_validity_bitmap[col], validity_words);
+            }
+        }
+        return result;
     }
+
+    // Legacy row-wise path used by hash/group aggregate kernels.
+    size_t copy_size = ctx_->expected_result_size_;
+    if (copy_size == 0) copy_size = 1; // защита от нулевого размера
+
+    std::vector<unsigned long long> h_result;
+    ctx_->result_buffer_->copyToHost(h_result, copy_size);
+
+    std::vector<uint64_t> h_validity;
+    if (ctx_->expected_result_validity_words_ > 0 && ctx_->result_validity_buffer_) {
+        ctx_->result_validity_buffer_->copyToHost(h_validity, ctx_->expected_result_validity_words_);
+    }
+
+    result.data = std::move(h_result);
+    result.cell_validity_bitmap = std::move(h_validity);
+    result.has_cell_validity = !result.cell_validity_bitmap.empty();
+
+    auto row_valid_at = [&](size_t value_idx) -> bool {
+        if (!result.has_cell_validity || result.cell_validity_bitmap.empty()) return true;
+        const size_t word = value_idx >> 6U;
+        if (word >= result.cell_validity_bitmap.size()) return false;
+        return ((result.cell_validity_bitmap[word] >> (value_idx & 63U)) & 1ULL) != 0ULL;
+    };
+
+    auto build_columnar_result = [&]() {
+        if (result.tuple_size == 0 || result.data.empty()) return;
+        const size_t physical_rows = result.data.size() / result.tuple_size;
+        if (physical_rows == 0) return;
+        result.column_data.assign(result.tuple_size, std::vector<unsigned long long>(physical_rows, 0ULL));
+        const size_t words_per_col = (physical_rows + 63ULL) / 64ULL;
+        result.column_validity_bitmap.assign(result.tuple_size, std::vector<uint64_t>(words_per_col, 0ULL));
+        for (size_t row = 0; row < physical_rows; ++row) {
+            const size_t base = row * result.tuple_size;
+            for (size_t col = 0; col < result.tuple_size; ++col) {
+                const size_t src_idx = base + col;
+                result.column_data[col][row] = result.data[src_idx];
+                if (row_valid_at(src_idx)) {
+                    result.column_validity_bitmap[col][row >> 6U] |= (1ULL << (row & 63U));
+                }
+            }
+        }
+        result.has_columnar_result = true;
+    };
+
+    build_columnar_result();
 
     if (ctx_->result_is_dense_) {
         result.row_count = ctx_->result_row_count_;
@@ -166,16 +247,23 @@ QueryResult DatabaseInstance::executeQuery(const std::string& sql) {
     } else {
         const size_t physical_rows = result.data.size() / result.tuple_size;
         size_t non_empty_rows = 0;
+        auto valid_at = [&](size_t value_idx) -> bool {
+            if (!result.has_cell_validity || result.cell_validity_bitmap.empty()) return false;
+            const size_t word = value_idx >> 6U;
+            if (word >= result.cell_validity_bitmap.size()) return false;
+            return ((result.cell_validity_bitmap[word] >> (value_idx & 63U)) & 1ULL) != 0ULL;
+        };
         for (size_t row = 0; row < physical_rows; ++row) {
             const size_t base = row * result.tuple_size;
-            bool all_zero = true;
+            bool present = false;
             for (size_t col = 0; col < result.tuple_size; ++col) {
-                if (result.data[base + col] != 0ULL) {
-                    all_zero = false;
+                const size_t idx = base + col;
+                if (result.data[idx] != 0ULL || valid_at(idx)) {
+                    present = true;
                     break;
                 }
             }
-            if (!all_zero) ++non_empty_rows;
+            if (present) ++non_empty_rows;
         }
         result.row_count = non_empty_rows;
     }

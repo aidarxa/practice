@@ -3,12 +3,16 @@
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 struct ColumnStatistics {
   int64_t min_value_ = 0;    // e.g. 19920101 for d_datekey
   int64_t max_value_ = 0;    // e.g. 19981230 for d_datekey
   uint64_t cardinality_ = 0; // number of unique values (e.g. 25 for s_nation)
+  bool is_unique_ = false;
+  bool is_primary_key_ = false;
+  bool is_nullable_ = false;
 };
 
 class TableMetadata {
@@ -66,7 +70,14 @@ public:
 
   inline void setColumnStats(const std::string &col,
                              const ColumnStatistics &stats) {
-    column_stats_[col] = stats;
+    auto &dst = column_stats_[col];
+    const bool was_unique = dst.is_unique_;
+    const bool was_primary_key = dst.is_primary_key_;
+    const bool was_nullable = dst.is_nullable_;
+    dst = stats;
+    dst.is_unique_ = stats.is_unique_ || was_unique || stats.is_primary_key_ || was_primary_key;
+    dst.is_primary_key_ = stats.is_primary_key_ || was_primary_key;
+    dst.is_nullable_ = stats.is_nullable_ || was_nullable;
   }
   inline const ColumnStatistics &
   getColumnStats(const std::string &col) const {
@@ -81,6 +92,37 @@ public:
   inline const std::unordered_map<std::string, ColumnStatistics> &
   getAllColumnStats() const {
     return column_stats_;
+  }
+
+  inline void setColumnUnique(const std::string &col, bool unique = true) {
+    auto &stats = column_stats_[col];
+    stats.is_unique_ = unique;
+    if (!unique) stats.is_primary_key_ = false;
+  }
+
+  inline void setColumnPrimaryKey(const std::string &col, bool primary_key = true) {
+    auto &stats = column_stats_[col];
+    stats.is_primary_key_ = primary_key;
+    if (primary_key) stats.is_unique_ = true;
+  }
+
+  inline void setColumnNullable(const std::string &col, bool nullable = true) {
+    column_stats_[col].is_nullable_ = nullable;
+  }
+
+  inline bool isColumnUnique(const std::string &col) const {
+    auto it = column_stats_.find(col);
+    return it != column_stats_.end() && it->second.is_unique_;
+  }
+
+  inline bool isColumnPrimaryKey(const std::string &col) const {
+    auto it = column_stats_.find(col);
+    return it != column_stats_.end() && it->second.is_primary_key_;
+  }
+
+  inline bool isColumnNullable(const std::string &col) const {
+    auto it = column_stats_.find(col);
+    return it != column_stats_.end() && it->second.is_nullable_;
   }
 
 private:

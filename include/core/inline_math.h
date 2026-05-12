@@ -143,4 +143,18 @@ inline void atomic_max_ull(unsigned long long& target, unsigned long long value)
     while (value > observed && !at.compare_exchange_weak(observed, value)) {}
 }
 
+inline void atomic_set_valid_bit(uint64_t* bitmap, unsigned long long bit_idx) {
+    if (bitmap == nullptr) return;
+    sycl::atomic_ref<uint64_t,
+                     sycl::memory_order::relaxed,
+                     sycl::memory_scope::device,
+                     sycl::access::address_space::global_space> at(bitmap[bit_idx >> 6]);
+    at.fetch_or(1ULL << (bit_idx & 63ULL));
+}
+
+inline int bitmap_valid_at(const uint64_t* bitmap, unsigned long long bit_idx) {
+    if (bitmap == nullptr) return 1;
+    return static_cast<int>((bitmap[bit_idx >> 6] >> (bit_idx & 63ULL)) & 1ULL);
+}
+
 } // namespace db

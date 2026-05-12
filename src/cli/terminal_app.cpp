@@ -29,9 +29,36 @@ bool containsSemicolon(const std::string& s) {
     return s.find(';') != std::string::npos;
 }
 
+static bool resultCellIsValid(const db::QueryResult& result, size_t value_idx) {
+    if (!result.has_cell_validity || result.cell_validity_bitmap.empty()) return true;
+    const size_t word = value_idx >> 6U;
+    if (word >= result.cell_validity_bitmap.size()) return true;
+    return ((result.cell_validity_bitmap[word] >> (value_idx & 63U)) & 1ULL) != 0ULL;
+}
+
+static bool resultColumnCellIsValid(const db::QueryResult& result, size_t row, size_t col) {
+    if (!result.has_columnar_result || col >= result.column_validity_bitmap.size()) {
+        return resultCellIsValid(result, row * result.tuple_size + col);
+    }
+    const auto& bitmap = result.column_validity_bitmap[col];
+    if (bitmap.empty()) return true;
+    const size_t word = row >> 6U;
+    if (word >= bitmap.size()) return false;
+    return ((bitmap[word] >> (row & 63U)) & 1ULL) != 0ULL;
+}
+
+static unsigned long long resultCellRaw(const db::QueryResult& result, size_t row, size_t col) {
+    if (result.has_columnar_result && col < result.column_data.size() && row < result.column_data[col].size()) {
+        return result.column_data[col][row];
+    }
+    return result.data[row * result.tuple_size + col];
+}
+
 std::string formatResultValue(unsigned long long raw,
                               const std::vector<db::ResultColumnDesc>& cols,
-                              size_t col_idx) {
+                              size_t col_idx,
+                              bool valid) {
+    if (!valid) return "NULL";
     if (col_idx < cols.size() && cols[col_idx].type == db::LogicalType::Float64) {
         double value = 0.0;
         static_assert(sizeof(value) == sizeof(raw), "double and ULL must have equal size");
@@ -140,7 +167,8 @@ void TerminalApp::executeQuery(const std::string& sql) {
                 const size_t base = row * tuple_size;
                 if (base + tuple_size > result.size()) return false;
                 for (size_t j = 0; j < tuple_size; ++j) {
-                    if (result[base + j] != 0ULL) return true;
+                    const size_t value_idx = base + j;
+                    if (result[value_idx] != 0ULL || resultCellIsValid(query_result, value_idx)) return true;
                 }
                 return false;
             };
@@ -148,12 +176,12 @@ void TerminalApp::executeQuery(const std::string& sql) {
             std::vector<size_t> rows_to_print;
             const size_t limit = ctx_.output_row_limit_enabled ? ctx_.output_row_limit
                                                                : static_cast<size_t>(-1);
-            if (tuple_size <= 1) {
-                if (!result.empty() && query_result.row_count != 0) rows_to_print.push_back(0);
-            } else if (query_result.dense_result) {
+            if (query_result.dense_result) {
                 const size_t total = query_result.row_count;
                 const size_t begin = (ctx_.output_row_limit_enabled && total > limit) ? (total - limit) : 0;
                 for (size_t row = begin; row < total; ++row) rows_to_print.push_back(row);
+            } else if (tuple_size <= 1) {
+                if (!result.empty() && query_result.row_count != 0) rows_to_print.push_back(0);
             } else {
                 const size_t physical_rows = tuple_size == 0 ? 0 : result.size() / tuple_size;
                 for (size_t row = 0; row < physical_rows; ++row) {
@@ -172,12 +200,12 @@ void TerminalApp::executeQuery(const std::string& sql) {
                 for (size_t row : rows_to_print) {
                     const size_t base = row * tuple_size;
                     if (tuple_size <= 1) {
-                        std::cout << formatResultValue(result[0], columns, 0) << "\n";
+                        std::cout << formatResultValue(resultCellRaw(query_result, row, 0), columns, 0, resultColumnCellIsValid(query_result, row, 0)) << "\n";
                         continue;
                     }
                     std::cout << "Row " << row << ": ";
                     for (size_t j = 0; j < tuple_size; ++j) {
-                        std::cout << formatResultValue(result[base + j], columns, j);
+                        std::cout << formatResultValue(resultCellRaw(query_result, row, j), columns, j, resultColumnCellIsValid(query_result, row, j));
                         if (j < tuple_size - 1) std::cout << " | ";
                     }
                     std::cout << "\n";

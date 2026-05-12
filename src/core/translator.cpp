@@ -42,6 +42,8 @@ const char* ExprPrinter::exprTypeName(ExprType t) {
         case ExprType::OP_SUB:        return "-";
         case ExprType::OP_MUL:        return "*";
         case ExprType::OP_DIV:        return "/";
+        case ExprType::OP_IS_NULL:    return "IS NULL";
+        case ExprType::OP_IS_NOT_NULL:return "IS NOT NULL";
         case ExprType::STAR:          return "*";
         default:                      return "UNKNOWN";
     }
@@ -235,6 +237,25 @@ std::unique_ptr<ExprNode> QueryTranslator::translateExpr(const hsql::Expr* expr)
 
         // ---- Бинарные/логические операторы ----
         case hsql::kExprOperator: {
+            // SQL NULL predicates. Hyrise SQL parser represents both
+            // `x IS NULL` and `x IS NOT NULL` as unary operators in Expr.
+            if (expr->opType == hsql::kOpIsNull) {
+                if (!expr->expr) {
+                    throw std::runtime_error("QueryTranslator: IS NULL missing operand");
+                }
+                return std::make_unique<BinaryExpr>(
+                    ExprType::OP_IS_NULL, translateExpr(expr->expr), nullptr);
+            }
+            if (expr->opType == hsql::kOpNot && expr->expr &&
+                expr->expr->type == hsql::kExprOperator &&
+                expr->expr->opType == hsql::kOpIsNull) {
+                if (!expr->expr->expr) {
+                    throw std::runtime_error("QueryTranslator: IS NOT NULL missing operand");
+                }
+                return std::make_unique<BinaryExpr>(
+                    ExprType::OP_IS_NOT_NULL, translateExpr(expr->expr->expr), nullptr);
+            }
+
             // BETWEEN не обрабатываем — должно быть развёрнуто в >= и <= на уровне SQL
             if (expr->opType == hsql::kOpBetween) {
                 throw std::runtime_error(

@@ -26,6 +26,8 @@ enum class ExprType {
     OP_SUB,        // -
     OP_MUL,        // *
     OP_DIV,        // /
+    OP_IS_NULL,    // IS NULL
+    OP_IS_NOT_NULL,// IS NOT NULL
     STAR,          // * in SELECT * or aggregate arguments
 };
 

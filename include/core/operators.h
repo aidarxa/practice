@@ -209,9 +209,12 @@ struct AggregateDef {
     // Logical output: every aggregate contributes one visible value.
     uint64_t visibleSlotCount() const { return 1; }
 
-    // Physical storage: AVG/MIN need one hidden per-group row-count slot shared
-    // at AggregateNode level, not per aggregate.
+    // Physical storage: every aggregate contributes one visible state slot.
+    // Aggregates that may return NULL on an all-NULL input get a separate
+    // hidden non-null counter at AggregateNode level. COUNT never needs one.
     uint64_t storageSlotCount() const { return 1; }
+
+    bool needsNonNullCount() const { return !isCount(); }
 
     // Explicit move-only: нет копирования из-за unique_ptr
     AggregateDef(const AggregateDef&) = delete;
@@ -236,17 +239,22 @@ public:
         return static_cast<uint64_t>(group_by_exprs.size() + aggregates.size());
     }
 
-    bool needsHiddenCountSlot() const {
+    uint64_t hiddenCountSlotCount() const {
+        uint64_t count = 0;
         for (const auto& agg : aggregates) {
-            if (agg.isAvg() || agg.isMin()) return true;
+            if (agg.needsNonNullCount()) ++count;
         }
-        return false;
+        return count;
+    }
+
+    bool needsHiddenCountSlot() const {
+        return hiddenCountSlotCount() != 0;
     }
 
     uint64_t storageTupleSize() const {
         uint64_t slots = static_cast<uint64_t>(group_by_exprs.size());
         for (const auto& agg : aggregates) slots += agg.storageSlotCount();
-        if (needsHiddenCountSlot()) ++slots;
+        slots += hiddenCountSlotCount();
         return slots == 0 ? 1 : slots;
     }
 
@@ -275,6 +283,10 @@ public:
                 } else {
                     // Фолбэк: используем размер таблицы как верхнюю оценку
                     cardinality = meta.getSize();
+                }
+                if (meta.isColumnNullable(col_name)) {
+                    // One extra GROUP BY bucket for SQL NULL.
+                    ++cardinality;
                 }
             } catch (...) {
                 // Таблица не найдена — минимальный фолбэк

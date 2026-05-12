@@ -43,6 +43,7 @@ struct JITContext {
     // ---- Column tracking (probe kernel) ----
     // column_name → register name in the probe kernel.
     std::unordered_map<std::string, std::string> col_to_reg;
+    std::unordered_map<std::string, std::string> col_to_valid_reg;
 
     // table_name → row-id vector register. Used by projection/materialization
     // after PK/FK joins: the hash table carries only build row_id, and
@@ -74,6 +75,7 @@ struct JITContext {
 
     // Columns that must be fetched from ctx (EXTERNAL_INPUT):
     std::set<std::string> external_columns; // e.g. "d_lo_orderdate"
+    std::set<std::string> external_null_columns; // nullable bitmap symbols, e.g. "n_lo_orderdate"
 
     // Result buffer size expression (set by AggregateNode/ProjectionNode visitor).
     // For AVG/MIN this is the physical storage size; generated finalization

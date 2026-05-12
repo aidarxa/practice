@@ -38,6 +38,12 @@ static void extractTableNamesImpl(const ExprNode* expr,
             extractTableNamesImpl(bin->right.get(), out);
             break;
         }
+        case ExprType::OP_IS_NULL:
+        case ExprType::OP_IS_NOT_NULL: {
+            const auto* bin = static_cast<const BinaryExpr*>(expr);
+            extractTableNamesImpl(bin->left.get(), out);
+            break;
+        }
         default:
             break;
     }

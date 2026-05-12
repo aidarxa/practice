@@ -7,6 +7,7 @@
 #include <cstddef>
 #include <unordered_map>
 #include <vector>
+#include <stdexcept>
 #include <sycl/sycl.hpp>
 
 #include "core/memory.h"
@@ -26,8 +27,27 @@ struct ResultColumnDesc {
     bool nullable = false;
 };
 
+template <typename T>
+struct ColumnView {
+    T* data = nullptr;
+    uint64_t* null_bitmap = nullptr;
+    bool nullable = false;
+};
+
 struct QueryResult {
+    // Legacy row-wise host buffer. Kept for compatibility with sparse aggregate
+    // internals and existing tests. The external host result is now also exposed
+    // in columnar form below.
     std::vector<unsigned long long> data;
+    std::vector<uint64_t> cell_validity_bitmap; // row-wise bitset: 1 = valid, 0 = NULL
+    bool has_cell_validity = false;
+
+    // Typed columnar host result. column_data[c][r] stores column c, row r.
+    // column_validity_bitmap[c] uses one bit per row: 1 = valid, 0 = NULL.
+    std::vector<std::vector<unsigned long long>> column_data;
+    std::vector<std::vector<uint64_t>> column_validity_bitmap;
+    bool has_columnar_result = false;
+
     size_t tuple_size = 1;
     std::vector<ResultColumnDesc> columns;
 
@@ -45,11 +65,19 @@ struct QueryResult {
 struct ExecutionContext {
     sycl::queue* q_ = nullptr;
     std::unique_ptr<DynamicDeviceBuffer<unsigned long long>> result_buffer_;
+    std::unique_ptr<DynamicDeviceBuffer<uint64_t>> result_validity_buffer_;
     std::unordered_map<std::string, void*> buffers_;
+    std::unordered_map<std::string, uint64_t*> null_bitmaps_;
     size_t tuple_size_ = 1;
     std::vector<ResultColumnDesc> result_columns_;
     size_t result_row_count_{0};
     bool result_is_dense_{false};
+    bool result_is_columnar_{false};
+    size_t result_column_count_{0};
+    size_t result_column_row_capacity_{0};
+    std::vector<std::unique_ptr<DynamicDeviceBuffer<unsigned long long>>> result_column_buffers_;
+    std::vector<std::unique_ptr<DynamicDeviceBuffer<uint64_t>>> result_column_validity_buffers_;
+    size_t expected_result_validity_words_{0};
 
     // Размер буфера результатов в элементах (устанавливается QueryEngine перед выполнением).
     // DatabaseInstance использует это значение для copyToHost вместо хардкода 21000.
@@ -70,8 +98,76 @@ struct ExecutionContext {
         return nullptr;
     }
 
+
+    uint64_t* getNullBitmap(const std::string& name) {
+        auto it = null_bitmaps_.find(name);
+        if (it == null_bitmaps_.end()) return nullptr;
+        return it->second;
+    }
+
+    template<typename T>
+    ColumnView<T> getColumnView(const std::string& name) {
+        return ColumnView<T>{getBuffer<T>(name), getNullBitmap(name), getNullBitmap(name) != nullptr};
+    }
+
     unsigned long long* getResultPointer() const {
         return result_buffer_ ? result_buffer_->data() : nullptr;
+    }
+
+    uint64_t* getResultValidityPointer() const {
+        return result_validity_buffer_ ? result_validity_buffer_->data() : nullptr;
+    }
+
+    void ensureResultValidityCapacity(size_t value_count) {
+        expected_result_validity_words_ = (value_count + 63ULL) / 64ULL;
+        if (result_validity_buffer_) {
+            result_validity_buffer_->ensureCapacity(expected_result_validity_words_ == 0 ? 1 : expected_result_validity_words_);
+            result_validity_buffer_->zero();
+        }
+    }
+
+    void ensureColumnarResultCapacity(size_t column_count, size_t row_count) {
+        result_is_columnar_ = true;
+        result_column_count_ = column_count;
+        result_column_row_capacity_ = row_count;
+        result_column_buffers_.resize(column_count);
+        result_column_validity_buffers_.resize(column_count);
+        const size_t value_capacity = row_count == 0 ? 1 : row_count;
+        const size_t validity_words = ((row_count + 63ULL) / 64ULL) == 0 ? 1 : ((row_count + 63ULL) / 64ULL);
+        for (size_t col = 0; col < column_count; ++col) {
+            if (!result_column_buffers_[col]) {
+                result_column_buffers_[col] = std::make_unique<DynamicDeviceBuffer<unsigned long long>>(*q_, 0);
+            }
+            result_column_buffers_[col]->ensureCapacity(value_capacity);
+            result_column_buffers_[col]->zero();
+            if (!result_column_validity_buffers_[col]) {
+                result_column_validity_buffers_[col] = std::make_unique<DynamicDeviceBuffer<uint64_t>>(*q_, 0);
+            }
+            result_column_validity_buffers_[col]->ensureCapacity(validity_words);
+            result_column_validity_buffers_[col]->zero();
+        }
+    }
+
+    unsigned long long* getResultColumnPointer(size_t col) const {
+        if (col >= result_column_buffers_.size() || !result_column_buffers_[col]) {
+            throw std::out_of_range("result column buffer is not allocated");
+        }
+        return result_column_buffers_[col]->data();
+    }
+
+    uint64_t* getResultColumnValidityPointer(size_t col) const {
+        if (col >= result_column_validity_buffers_.size() || !result_column_validity_buffers_[col]) {
+            throw std::out_of_range("result column validity buffer is not allocated");
+        }
+        return result_column_validity_buffers_[col]->data();
+    }
+
+    void resetResultShapeFlags() {
+        result_row_count_ = 0;
+        result_is_dense_ = false;
+        result_is_columnar_ = false;
+        result_column_count_ = 0;
+        result_column_row_capacity_ = 0;
     }
 };
 
