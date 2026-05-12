@@ -147,6 +147,30 @@ static FilterPredicateSupport validateFilterFastPathPredicate(
     return FilterPredicateSupport::Unsupported;
 }
 
+
+static void emitLoadOrGatherIntoReg(const std::string& col_name,
+                                    const std::string& reg_name,
+                                    JITContext& ctx,
+                                    std::stringstream& stream) {
+    auto mapped = ctx.col_to_reg.find(col_name);
+    if (mapped != ctx.col_to_reg.end() && mapped->second == reg_name) return;
+
+    const std::string table_name = getTableName(col_name);
+    auto rid = ctx.table_rowid_regs.find(table_name);
+    ctx.external_columns.insert("d_" + col_name);
+    ctx.col_to_reg[col_name] = reg_name;
+
+    if (rid != ctx.table_rowid_regs.end() && !rid->second.empty()) {
+        stream << "            BlockGather<int, BLOCK_THREADS, ITEMS_PER_THREAD>("
+               << "d_" << col_name << ", tid, " << rid->second
+               << ", flags, " << reg_name << ", num_tile_items);\n";
+    } else {
+        stream << "            BlockLoad<int, BLOCK_THREADS, ITEMS_PER_THREAD>("
+               << "d_" << col_name << " + tile_offset, tid, tile_offset, "
+               << reg_name << ", num_tile_items);\n";
+    }
+}
+
 // ============================================================================
 // JITExprVisitor — constructor
 // ============================================================================
@@ -238,14 +262,7 @@ std::string JITExprVisitor::translateInlineExpr(const ExprNode* expr, bool is_pr
                 if (mapped != ctx_.col_to_reg.end() && !mapped->second.empty()) {
                     return mapped->second + "[i]";
                 }
-                if (!ctx_.loaded_in_probe.count(col_name)) {
-                    ctx_.loaded_in_probe.insert(col_name);
-                    ctx_.col_to_reg[col_name] = col_name;
-                    ctx_.external_columns.insert("d_" + col_name);
-                    stream_ << "            BlockLoad<int, BLOCK_THREADS, ITEMS_PER_THREAD>("
-                            << "d_" << col_name << " + tile_offset, tid, tile_offset, "
-                            << col_name << ", num_tile_items);\n";
-                }
+                emitLoadOrGatherIntoReg(col_name, col_name, ctx_, stream_);
                 return ctx_.col_to_reg[col_name] + "[i]";
             }
             return col_name + "[i]";
@@ -292,14 +309,7 @@ void JITExprVisitor::visitComparison(const BinaryExpr& node) {
 
         auto load_col_if_needed = [&](const std::string& cname, const std::string& reg) {
             if (ctx_.col_to_reg.count(cname) && !ctx_.col_to_reg[cname].empty()) return;
-            if (!ctx_.loaded_in_probe.count(cname)) {
-                ctx_.loaded_in_probe.insert(cname);
-                ctx_.col_to_reg[cname] = reg;
-                ctx_.external_columns.insert("d_" + cname);
-                stream_ << "            BlockLoad<int, BLOCK_THREADS, ITEMS_PER_THREAD>("
-                        << "d_" << cname << " + tile_offset, tid, tile_offset, "
-                        << reg << ", num_tile_items);\n";
-            }
+            emitLoadOrGatherIntoReg(cname, reg, ctx_, stream_);
         };
 
         // Загрузка обеих колонок
@@ -608,7 +618,6 @@ void JITOperatorVisitor::consume(const OperatorNode* node, JITContext& ctx, cons
 // ============================================================================
 
 void JITOperatorVisitor::produceTableScan(const TableScanNode* node, JITContext& ctx) {
-    ctx.startNewPipeline("Scan_" + node->table_name);
     const std::string size_macro = sizeMacro(node->table_name);
 
     // Collect all columns needed from this table (traversing upward through parents)
@@ -618,54 +627,76 @@ void JITOperatorVisitor::produceTableScan(const TableScanNode* node, JITContext&
     std::vector<std::string> active_vars;
     findAllColumnsForTable(root, node->table_name, active_vars);
 
-    // 1. Пишем заголовок (подготовка параметров запуска)
-    std::stringstream header;
-    header << "    q.submit([&](sycl::handler& h) {\n";
-    header << "        int num_tiles = (" << size_macro << " + TILE_SIZE - 1) / TILE_SIZE;\n";
-    header << "        h.parallel_for<class " << ctx.current_pipeline->kernel_name << ">"
-           << "(sycl::nd_range<1>(num_tiles * BLOCK_THREADS, BLOCK_THREADS), [=](sycl::nd_item<1> it) {\n";
-    header << "            int tid = it.get_local_linear_id();\n";
-    header << "            int tile_offset = it.get_group_linear_id() * TILE_SIZE;\n";
-    header << "            int num_tile_items = (it.get_group_linear_id() == it.get_group_range(0) - 1) ? "
-           << size_macro << " - tile_offset : TILE_SIZE;\n";
+    const bool exact_projection = root && root->getType() == OperatorType::PROJECTION;
 
-    // 2. Временно перехватываем вывод ядра
-    // Мы очищаем текущий поток, чтобы захватить только логику, генерируемую consumeVector.
-    std::string existing_body = ctx.current_pipeline->kernel_body.str();
-    ctx.current_pipeline->kernel_body.str(""); 
+    auto emit_one_scan_pipeline = [&](const std::string& pipeline_name,
+                                      ProjectionPass projection_pass) {
+        ctx.startNewPipeline(pipeline_name);
+        projection_pass_ = projection_pass;
 
-    // 3. ЗАПУСК КОНВЕЙЕРА (Эта фаза заполнит ctx.col_to_reg)
-    if (node->parent_) {
-        consume_mode_ = ConsumeMode::Vector;
-        consume(node->parent_, ctx, node, active_vars);
-    }
-    std::string pipeline_logic = ctx.current_pipeline->kernel_body.str();
+        // A scan pipeline owns its vector-register scope.  Build kernels and
+        // external column declarations remain accumulated in ctx, but per-scan
+        // register bindings must not leak from Count pass to Write pass.
+        ctx.col_to_reg.clear();
+        ctx.table_rowid_regs.clear();
+        ctx.loaded_in_probe.clear();
+        ctx.current_items_col.clear();
 
-    // 4. Теперь мы знаем все нужные регистры (items, items2, items3...). Генерируем декларации!
-    std::stringstream declarations;
-    declarations << "            int items[ITEMS_PER_THREAD];\n";
-    declarations << "            int flags[ITEMS_PER_THREAD];\n";
-    declarations << "            int items2[ITEMS_PER_THREAD];\n"; // ВСЕГДА объявляем items2
-    
-    std::set<std::string> emitted;
-    for (const auto& pair : ctx.col_to_reg) {
-        const std::string& reg = pair.second;
-        // Пропускаем уже объявленные базовые регистры
-        if (reg != "items" && reg != "flags" && reg != "items2" && !emitted.count(reg)) {
-            declarations << "            int " << reg << "[ITEMS_PER_THREAD];\n";
-            emitted.insert(reg);
+        // 1. Kernel launch header.
+        std::stringstream header;
+        header << "    q.submit([&](sycl::handler& h) {\n";
+        header << "        int num_tiles = (" << size_macro << " + TILE_SIZE - 1) / TILE_SIZE;\n";
+        header << "        h.parallel_for<class " << ctx.current_pipeline->kernel_name << ">"
+               << "(sycl::nd_range<1>(num_tiles * BLOCK_THREADS, BLOCK_THREADS), [=](sycl::nd_item<1> it) {\n";
+        header << "            int tid = it.get_local_linear_id();\n";
+        header << "            int tile_offset = it.get_group_linear_id() * TILE_SIZE;\n";
+        header << "            int num_tile_items = (it.get_group_linear_id() == it.get_group_range(0) - 1) ? "
+               << size_macro << " - tile_offset : TILE_SIZE;\n";
+
+        // 2. Capture pipeline body emitted by consumeVector.
+        std::string existing_body = ctx.current_pipeline->kernel_body.str();
+        ctx.current_pipeline->kernel_body.str("");
+
+        if (node->parent_) {
+            consume_mode_ = ConsumeMode::Vector;
+            consume(node->parent_, ctx, node, active_vars);
         }
-    }
-    declarations << "            InitFlags<BLOCK_THREADS, ITEMS_PER_THREAD>(flags);\n\n";
+        std::string pipeline_logic = ctx.current_pipeline->kernel_body.str();
 
-    // 5. Склеиваем всё обратно: Префикс + Заголовок + Декларации + Логика + Футер
-    ctx.current_pipeline->kernel_body.str("");
-    ctx.current_pipeline->kernel_body << existing_body 
-                                      << header.str() 
-                                      << declarations.str() 
-                                      << pipeline_logic 
-                                      << "        });\n";
-    ctx.current_pipeline->kernel_body << "    });\n\n";
+        // 3. Register declarations discovered during pipeline generation.
+        std::stringstream declarations;
+        declarations << "            int items[ITEMS_PER_THREAD];\n";
+        declarations << "            int flags[ITEMS_PER_THREAD];\n";
+        declarations << "            int items2[ITEMS_PER_THREAD];\n";
+
+        std::set<std::string> emitted;
+        for (const auto& pair : ctx.col_to_reg) {
+            const std::string& reg = pair.second;
+            if (reg != "items" && reg != "flags" && reg != "items2" && !emitted.count(reg)) {
+                declarations << "            int " << reg << "[ITEMS_PER_THREAD];\n";
+                emitted.insert(reg);
+            }
+        }
+        declarations << "            InitFlags<BLOCK_THREADS, ITEMS_PER_THREAD>(flags);\n\n";
+
+        // 4. Stitch final kernel.
+        ctx.current_pipeline->kernel_body.str("");
+        ctx.current_pipeline->kernel_body << existing_body
+                                          << header.str()
+                                          << declarations.str()
+                                          << pipeline_logic
+                                          << "        });\n";
+        ctx.current_pipeline->kernel_body << "    });\n\n";
+    };
+
+    if (exact_projection) {
+        emit_one_scan_pipeline("Scan_" + node->table_name + "_Count", ProjectionPass::Count);
+        emit_one_scan_pipeline("Scan_" + node->table_name + "_Write", ProjectionPass::Write);
+    } else {
+        emit_one_scan_pipeline("Scan_" + node->table_name, ProjectionPass::None);
+    }
+
+    projection_pass_ = ProjectionPass::None;
 }
 
 void JITOperatorVisitor::produceFilter(const FilterNode* node, JITContext& ctx) {
@@ -681,20 +712,12 @@ void JITOperatorVisitor::produceFilter(const FilterNode* node, JITContext& ctx) 
 void JITOperatorVisitor::ensureLoaded(const std::string& col_name, JITContext& ctx) const {} // DEPRECATED
 
 static void loadIntoReg(const std::string& col_name, const std::string& reg_name, JITContext& ctx) {
-    // ОГРОМНЫЙ ФИКС: Если колонка УЖЕ является самостоятельным регистром (например, d_year, 
-    // извлеченный из HashJoin), мы НЕ ДОЛЖНЫ пытаться загрузить ее из глобальной памяти фактов!
-    if (ctx.col_to_reg.count(col_name) && ctx.col_to_reg[col_name] == col_name) {
-        return; // Колонка уже доступна локально!
+    auto mapped = ctx.col_to_reg.find(col_name);
+    if (mapped != ctx.col_to_reg.end() && mapped->second == reg_name) {
+        return;
     }
-
-    if (ctx.col_to_reg[col_name] != reg_name) {
-        ctx.external_columns.insert("d_" + col_name);
-        ctx.col_to_reg[col_name] = reg_name;
-        auto& code = ctx.current_pipeline->kernel_body;
-        code << "            BlockLoad<int, BLOCK_THREADS, ITEMS_PER_THREAD>("
-             << "d_" << col_name << " + tile_offset, tid, tile_offset, " 
-             << reg_name << ", num_tile_items);\n";
-    }
+    auto& code = ctx.current_pipeline->kernel_body;
+    emitLoadOrGatherIntoReg(col_name, reg_name, ctx, code);
 }
 
 // ============================================================================
@@ -988,7 +1011,7 @@ static bool aggregateNeedsHiddenCount(const AggregateNode* node) {
 }
 
 static std::string aggregateInputExpr(const AggregateDef& agg, JITContext& ctx, bool cast_to_ull) {
-    if (agg.isCount() || agg.argumentIsRowCountLike()) {
+    if (agg.isCount()) {
         return cast_to_ull ? "(unsigned long long)1" : "1";
     }
     return translateMathExprPush(agg.agg_expr.get(), ctx, cast_to_ull);
@@ -1061,7 +1084,10 @@ static void emitAggregateFinalizationIfNeeded(const AggregateNode* node,
         ctx.kernel_class_names.push_back(kernel_name);
     }
 
+    const uint64_t visible_size = (uint64_t)group_count * (uint64_t)visible_ts;
     auto& out = ctx.post_execution_code;
+    out << "    unsigned long long* d_visible_result = sycl::malloc_device<unsigned long long>(" << visible_size << ", q);\n";
+    out << "    q.memset(d_visible_result, 0, " << visible_size << " * sizeof(unsigned long long));\n";
     out << "    q.submit([&](sycl::handler& h) {\n";
     out << "        h.parallel_for<class " << kernel_name << ">(sycl::range<1>(" << group_count
         << "), [=](sycl::id<1> gid) {\n";
@@ -1071,7 +1097,7 @@ static void emitAggregateFinalizationIfNeeded(const AggregateNode* node,
     out << "            unsigned long long cnt = d_result[src + " << hidden_count_slot << "];\n";
     out << "            if (cnt == 0ULL) {\n";
     for (int i = 0; i < visible_ts; ++i) {
-        out << "                d_result[dst + " << i << "] = 0ULL;\n";
+        out << "                d_visible_result[dst + " << i << "] = 0ULL;\n";
     }
     out << "                return;\n";
     out << "            }\n";
@@ -1079,22 +1105,26 @@ static void emitAggregateFinalizationIfNeeded(const AggregateNode* node,
     int slot = 0;
     for (const auto& gexpr : node->group_by_exprs) {
         (void)gexpr;
-        out << "            d_result[dst + " << slot << "] = d_result[src + " << slot << "];\n";
+        out << "            d_visible_result[dst + " << slot << "] = d_result[src + " << slot << "];\n";
         ++slot;
     }
     for (const auto& agg : node->aggregates) {
         if (agg.isAvg()) {
-            out << "            d_result[dst + " << slot << "] = d_result[src + " << slot << "] / cnt;\n";
+            out << "            double avg_value_" << slot << " = static_cast<double>(d_result[src + " << slot << "]) / static_cast<double>(cnt);\n";
+            out << "            d_visible_result[dst + " << slot << "] = db::bit_cast_double_to_ull(avg_value_" << slot << ");\n";
         } else if (agg.isMin()) {
-            out << "            d_result[dst + " << slot << "] = (d_result[src + " << slot << "] == ~0ULL) ? 0ULL : d_result[src + " << slot << "];\n";
+            out << "            d_visible_result[dst + " << slot << "] = (d_result[src + " << slot << "] == ~0ULL) ? 0ULL : d_result[src + " << slot << "];\n";
         } else {
-            out << "            d_result[dst + " << slot << "] = d_result[src + " << slot << "];\n";
+            out << "            d_visible_result[dst + " << slot << "] = d_result[src + " << slot << "];\n";
         }
         ++slot;
     }
     out << "        });\n";
     out << "    });\n";
-    out << "    ctx->expected_result_size_ = " << (uint64_t)group_count * (uint64_t)visible_ts << ";\n\n";
+    out << "    q.memcpy(d_result, d_visible_result, " << visible_size << " * sizeof(unsigned long long));\n";
+    out << "    q.wait();\n";
+    out << "    sycl::free(d_visible_result, q);\n";
+    out << "    ctx->expected_result_size_ = " << visible_size << ";\n\n";
 }
 
 static void emitAtomicAggregateUpdate(std::stringstream& code,
@@ -1318,6 +1348,123 @@ void JITOperatorVisitor::consumeAggregateItem(const AggregateNode* node, JITCont
 }
 
 
+static bool projectionRequiresRowIdPayload(const HashJoinNode* join_node,
+                                           const std::string& dim_table) {
+    const OperatorNode* curr = join_node ? join_node->parent_ : nullptr;
+    while (curr) {
+        if (curr->getType() == OperatorType::PROJECTION) {
+            const auto* proj = static_cast<const ProjectionNode*>(curr);
+            for (const auto& expr : proj->select_exprs) {
+                if (!expr) continue;
+                if (expr->getType() == ExprType::STAR) return true;
+                std::vector<std::string> cols;
+                extractColumnsForTable(expr.get(), dim_table, cols);
+                if (!cols.empty()) return true;
+            }
+        }
+        curr = curr->parent_;
+    }
+    return false;
+}
+
+static void ensureProjectionExactBuffers(JITContext& ctx,
+                                         const std::string& row_count_expr,
+                                         int tuple_size) {
+    const std::string num_tiles_expr = "((" + row_count_expr + " + TILE_SIZE - 1) / TILE_SIZE)";
+    auto has_buffer = [&](const std::string& name) {
+        for (const auto& ht : ctx.hash_tables) {
+            if (ht.name == name) return true;
+        }
+        return false;
+    };
+    if (!has_buffer("d_projection_counts")) {
+        ctx.hash_tables.push_back({"d_projection_counts", "unsigned long long", num_tiles_expr});
+    }
+    if (!has_buffer("d_projection_offsets")) {
+        ctx.hash_tables.push_back({"d_projection_offsets", "unsigned long long", num_tiles_expr});
+    }
+    if (!has_buffer("d_projection_write_counts")) {
+        ctx.hash_tables.push_back({"d_projection_write_counts", "unsigned long long", num_tiles_expr});
+    }
+    const std::string scan_blocks_expr = "(((" + row_count_expr + " + TILE_SIZE - 1) / TILE_SIZE + 255) / 256)";
+    if (!has_buffer("d_projection_block_sums")) {
+        ctx.hash_tables.push_back({"d_projection_block_sums", "unsigned long long", scan_blocks_expr});
+    }
+
+    ctx.projection_exact_materialization = true;
+    ctx.projection_row_count_expr = row_count_expr;
+    ctx.projection_tuple_size = tuple_size;
+    ctx.result_size_expr = "1";
+    ctx.visible_result_size_expr = "1";
+}
+
+static void emitProjectionPrefixScanBeforeWrite(JITContext& ctx,
+                                                const std::string& row_count_expr,
+                                                int tuple_size) {
+    const std::string marker = "projection_exact_prefix_scan";
+    if (!ctx.emitted_auxiliary_kernels.insert(marker).second) return;
+
+    auto& out = ctx.current_pipeline->includes_and_globals;
+    out << "    {\n";
+    out << "        const int projection_num_tiles = (" << row_count_expr << " + TILE_SIZE - 1) / TILE_SIZE;\n";
+    out << "        const int projection_scan_blocks = (projection_num_tiles + 255) / 256;\n";
+    out << "        q.submit([&](sycl::handler& h) {\n";
+    out << "            h.parallel_for<class ProjectionTileBlockScan>(sycl::nd_range<1>(projection_scan_blocks * 256, 256), [=](sycl::nd_item<1> it) {\n";
+    out << "                const int gid = static_cast<int>(it.get_global_linear_id());\n";
+    out << "                const int lid = static_cast<int>(it.get_local_linear_id());\n";
+    out << "                unsigned long long val = (gid < projection_num_tiles) ? d_projection_counts[gid] : 0ULL;\n";
+    out << "                unsigned long long scanned = sycl::exclusive_scan_over_group(it.get_group(), val, sycl::plus<unsigned long long>{});\n";
+    out << "                if (gid < projection_num_tiles) d_projection_offsets[gid] = scanned;\n";
+    out << "                if (lid == 255) d_projection_block_sums[it.get_group_linear_id()] = scanned + val;\n";
+    out << "            });\n";
+    out << "        });\n";
+    out << "        q.submit([&](sycl::handler& h) {\n";
+    out << "            h.parallel_for<class ProjectionBlockSumsScan>(sycl::nd_range<1>(1024, 1024), [=](sycl::nd_item<1> it) {\n";
+    out << "                const int gid = static_cast<int>(it.get_global_linear_id());\n";
+    out << "                unsigned long long val = (gid < projection_scan_blocks) ? d_projection_block_sums[gid] : 0ULL;\n";
+    out << "                unsigned long long scanned = sycl::exclusive_scan_over_group(it.get_group(), val, sycl::plus<unsigned long long>{});\n";
+    out << "                if (gid < projection_scan_blocks) d_projection_block_sums[gid] = scanned;\n";
+    out << "            });\n";
+    out << "        });\n";
+    out << "        q.submit([&](sycl::handler& h) {\n";
+    out << "            h.parallel_for<class ProjectionAddBlockSums>(sycl::nd_range<1>(projection_scan_blocks * 256, 256), [=](sycl::nd_item<1> it) {\n";
+    out << "                const int gid = static_cast<int>(it.get_global_linear_id());\n";
+    out << "                if (gid < projection_num_tiles) {\n";
+    out << "                    d_projection_offsets[gid] += d_projection_block_sums[it.get_group_linear_id()];\n";
+    out << "                }\n";
+    out << "            });\n";
+    out << "        });\n";
+    out << "        unsigned long long projection_last_offset = 0ULL;\n";
+    out << "        unsigned long long projection_last_count = 0ULL;\n";
+    out << "        if (projection_num_tiles > 0) {\n";
+    out << "            q.memcpy(&projection_last_offset, d_projection_offsets + projection_num_tiles - 1, sizeof(unsigned long long)).wait();\n";
+    out << "            q.memcpy(&projection_last_count, d_projection_counts + projection_num_tiles - 1, sizeof(unsigned long long)).wait();\n";
+    out << "        }\n";
+    out << "        unsigned long long projection_running = projection_last_offset + projection_last_count;\n";
+    out << "        if (projection_running != 0ULL && projection_running > static_cast<unsigned long long>(std::numeric_limits<size_t>::max() / " << tuple_size << ")) {\n";
+    out << "            throw std::overflow_error(\"Projection result size overflow\");\n";
+    out << "        }\n";
+    out << "        ctx->result_row_count_ = static_cast<size_t>(projection_running);\n";
+    out << "        ctx->result_is_dense_ = true;\n";
+    out << "        ctx->expected_result_size_ = static_cast<size_t>(projection_running) * " << tuple_size << ";\n";
+    out << "        const size_t projection_result_bytes = ctx->expected_result_size_ * sizeof(unsigned long long);\n";
+    out << "        const size_t projection_temp_bytes = static_cast<size_t>(projection_num_tiles) * 3ULL * sizeof(unsigned long long) + static_cast<size_t>(projection_scan_blocks) * sizeof(unsigned long long);\n";
+    out << "        const size_t projection_total_mem = static_cast<size_t>(q.get_device().get_info<sycl::info::device::global_mem_size>());\n";
+    out << "        const size_t projection_reserve_a = projection_total_mem / 10ULL;\n";
+    out << "        const size_t projection_reserve_b = static_cast<size_t>(512ULL * 1024ULL * 1024ULL);\n";
+    out << "        const size_t projection_reserve = projection_reserve_a > projection_reserve_b ? projection_reserve_a : projection_reserve_b;\n";
+    out << "        const size_t projection_budget = projection_total_mem > projection_reserve ? projection_total_mem - projection_reserve : projection_total_mem / 2ULL;\n";
+    out << "        const size_t projection_required = ctx->loaded_device_bytes_ + projection_temp_bytes + projection_result_bytes;\n";
+    out << "        if (projection_required > projection_budget) {\n";
+    out << "            throw std::runtime_error(\"Insufficient GPU memory after projection count: exact materialized result does not fit device memory\");\n";
+    out << "        }\n";
+    out << "        ctx->result_buffer_->ensureCapacity(ctx->expected_result_size_ == 0 ? 1 : ctx->expected_result_size_);\n";
+    out << "        ctx->result_buffer_->zero();\n";
+    out << "        d_result = ctx->getResultPointer();\n";
+    out << "        q.memset(d_projection_write_counts, 0, projection_num_tiles * sizeof(unsigned long long));\n";
+    out << "    }\n\n";
+}
+
 static void collectTableScans(const OperatorNode* node, std::vector<const TableScanNode*>& out) {
     if (!node) return;
     if (node->getType() == OperatorType::TABLE_SCAN) {
@@ -1363,9 +1510,9 @@ void JITOperatorVisitor::consumeProjectionVector(const ProjectionNode* node, JIT
     std::vector<const TableScanNode*> scans;
     if (!node->getChildren().empty()) collectTableScans(node->getChildren()[0].get(), scans);
 
-    // SELECT * is intentionally restricted to one scan until projection supports
-    // multi-column hash-table payloads for dimensions.
-    (void)expandProjectionExpressions(node, catalog_, false);
+    // SELECT * over joins is implemented through row-id payloads in PHTUnique:
+    // dimension columns are gathered lazily at projection time.
+    (void)expandProjectionExpressions(node, catalog_, true);
 
     std::vector<const ExprNode*> expanded;
     for (const auto& expr : node->select_exprs) {
@@ -1383,6 +1530,30 @@ void JITOperatorVisitor::consumeProjectionVector(const ProjectionNode* node, JIT
         }
     }
 
+    const int tuple_size = (int)expanded.size();
+    ctx.tuple_size = tuple_size > 0 ? tuple_size : 1;
+    std::string row_count = "LO_LEN";
+    if (scans.size() == 1) row_count = sizeMacroFor(scans[0]->table_name);
+    ensureProjectionExactBuffers(ctx, row_count, ctx.tuple_size);
+
+    if (projection_pass_ == ProjectionPass::Count) {
+        code << "            unsigned long long projection_local_count = 0ULL;\n";
+        code << "            #pragma unroll\n";
+        code << "            for (int i = 0; i < ITEMS_PER_THREAD; ++i) {\n";
+        code << "                if (flags[i] && (tid + BLOCK_THREADS * i < num_tile_items)) {\n";
+        code << "                    ++projection_local_count;\n";
+        code << "                }\n";
+        code << "            }\n";
+        code << "            if (projection_local_count != 0ULL) {\n";
+        code << "                db::atomic_add_ull(d_projection_counts[it.get_group_linear_id()], projection_local_count);\n";
+        code << "            }\n";
+        return;
+    }
+
+    if (projection_pass_ == ProjectionPass::Write) {
+        emitProjectionPrefixScanBeforeWrite(ctx, row_count, ctx.tuple_size);
+    }
+
     std::vector<std::string> cols;
     for (const auto* expr : expanded) extractAllColumns(expr, cols);
     int reg_idx = 0;
@@ -1393,18 +1564,12 @@ void JITOperatorVisitor::consumeProjectionVector(const ProjectionNode* node, JIT
         ++reg_idx;
     }
 
-    const int tuple_size = (int)expanded.size();
-    ctx.tuple_size = tuple_size > 0 ? tuple_size : 1;
-    std::string row_count = "LO_LEN";
-    if (scans.size() == 1) row_count = sizeMacroFor(scans[0]->table_name);
-    ctx.result_size_expr = row_count + " * " + std::to_string(ctx.tuple_size);
-    ctx.visible_result_size_expr = ctx.result_size_expr;
-
     JITExprVisitor expr_vis(ctx, code, "flags", false, nullptr);
     code << "            #pragma unroll\n";
     code << "            for (int i = 0; i < ITEMS_PER_THREAD; ++i) {\n";
     code << "                if (flags[i] && (tid + BLOCK_THREADS * i < num_tile_items)) {\n";
-    code << "                    unsigned long long out_row = (unsigned long long)(tile_offset + tid + BLOCK_THREADS * i);\n";
+    code << "                    unsigned long long projection_local_row = db::atomic_fetch_add_ull(d_projection_write_counts[it.get_group_linear_id()], 1ULL);\n";
+    code << "                    unsigned long long out_row = d_projection_offsets[it.get_group_linear_id()] + projection_local_row;\n";
     for (int slot = 0; slot < (int)expanded.size(); ++slot) {
         std::string val = expr_vis.translateInlineExpr(expanded[slot], true);
         code << "                    d_result[out_row*" << ctx.tuple_size << "+" << slot
@@ -1421,17 +1586,20 @@ void JITOperatorVisitor::consumeProjectionItem(const ProjectionNode* /*node*/, J
 }
 
 
+
 JITOperatorVisitor::BuildInfo JITOperatorVisitor::computeBuildInfo(
         const std::string& dim_table,
         const FilterNode* /*filter*/,
         const HashJoinNode* join_node) const {
     BuildInfo bi;
+    bi.dim_table   = dim_table;
     bi.dim_prefix  = tablePrefix(dim_table);
     bi.size_macro  = sizeMacro(dim_table);
     bi.ht_name     = "d_" + bi.dim_prefix + "_hash_table";
     bi.variant     = 1;
     bi.use_mht     = false;
     bi.key_mins    = "0";
+    bi.row_id_reg  = bi.dim_prefix + "_row_id";
 
     // SSB dimension keys are used by the hand-written reference kernels with
     // zero-based perfect-hash domains for PART/SUPPLIER/CUSTOMER.  Keeping the
@@ -1501,6 +1669,13 @@ JITOperatorVisitor::BuildInfo JITOperatorVisitor::computeBuildInfo(
             }
         };
         extractKeys(join_node->join_condition.get());
+    }
+
+    if (projectionRequiresRowIdPayload(join_node, dim_table)) {
+        bi.payload_is_row_id = true;
+        bi.variant = 2;
+        bi.val_col.clear();
+        return bi;
     }
 
     // 1. Собираем колонки, которые требуются узлам ВЫШЕ джойна
@@ -1752,7 +1927,7 @@ void JITOperatorVisitor::emitPHTBuildKernel(
 
     // Register PK column as external
     if (!bi.pk_col.empty()) ctx.external_columns.insert("d_" + bi.pk_col);
-    if (!bi.val_col.empty()) ctx.external_columns.insert("d_" + bi.val_col);
+    if (!bi.val_col.empty() && !bi.payload_is_row_id) ctx.external_columns.insert("d_" + bi.val_col);
 
     code << "    q.submit([&](sycl::handler& h) {\n";
     code << "        int num_tiles = (" << bi.size_macro << " + TILE_SIZE - 1) / TILE_SIZE;\n";
@@ -1787,8 +1962,13 @@ void JITOperatorVisitor::emitPHTBuildKernel(
              << "(tid, items, flags, " << bi.ht_name << ", "
              << bi.ht_size_expr << ", " << bi.key_mins << ", num_tile_items);\n";
     } else {
-        // PHT_2: key+value — load payload into items2 then build
-        if (!bi.val_col.empty()) {
+        // PHT_2: key+value. For projection/materialization the value is the
+        // build-side row_id; for aggregation/filter pushdown it remains a
+        // single scalar payload column.
+        if (bi.payload_is_row_id) {
+            code << "            BlockMakeRowIds<BLOCK_THREADS, ITEMS_PER_THREAD>"
+                 << "(tid, tile_offset, items2, num_tile_items);\n";
+        } else if (!bi.val_col.empty()) {
             code << "            BlockLoad<int, BLOCK_THREADS, ITEMS_PER_THREAD>("
                  << "d_" << bi.val_col << " + tile_offset, tid, tile_offset, items2, num_tile_items);\n";
         }
@@ -1813,7 +1993,7 @@ void JITOperatorVisitor::emitMHTBuildKernels(
     std::string block_sums_name = "d_" + bi.dim_prefix + "_block_sums";
 
     if (!bi.pk_col.empty()) ctx.external_columns.insert("d_" + bi.pk_col);
-    if (!bi.val_col.empty()) ctx.external_columns.insert("d_" + bi.val_col);
+    if (!bi.val_col.empty() && !bi.payload_is_row_id) ctx.external_columns.insert("d_" + bi.val_col);
 
     ctx.hash_tables.push_back({bi.ht_name,    "int", "3*" + bi.ht_size_expr});
     ctx.hash_tables.push_back({counts_name,   "int", bi.ht_size_expr});
@@ -1914,9 +2094,13 @@ void JITOperatorVisitor::emitMHTBuildKernels(
     if (!bi.pk_col.empty())
         c2 << "            BlockLoad<int,BLOCK_THREADS,ITEMS_PER_THREAD>"
            << "(d_" << bi.pk_col << "+tile_offset,tid,tile_offset,items,num_tile_items);\n";
-    if (!bi.val_col.empty())
+    if (bi.payload_is_row_id) {
+        c2 << "            BlockMakeRowIds<BLOCK_THREADS,ITEMS_PER_THREAD>"
+           << "(tid,tile_offset,items2,num_tile_items);\n";
+    } else if (!bi.val_col.empty()) {
         c2 << "            BlockLoad<int,BLOCK_THREADS,ITEMS_PER_THREAD>"
            << "(d_" << bi.val_col << "+tile_offset,tid,tile_offset,items2,num_tile_items);\n";
+    }
     c2 << "            BlockBuildMHT_Write<int,int,BLOCK_THREADS,ITEMS_PER_THREAD>"
        << "(tid,items,items2,flags," << bi.ht_name << "," << offsets_name << ","
        << counts_name << "," << counts_name << ",payload_" << bi.dim_prefix
@@ -1975,7 +2159,7 @@ void JITOperatorVisitor::produceHashJoin(const HashJoinNode* node, JITContext& c
 
     // --- Route to PHT or MHT ---
     if (!bi.use_mht) {
-        bi.variant = bi.val_col.empty() ? 1 : 2;
+        bi.variant = (bi.payload_is_row_id || !bi.val_col.empty()) ? 2 : 1;
         emitPHTBuildKernel(bi, build_filter, ctx);
     } else {
         bi.variant = 2;
@@ -2010,8 +2194,11 @@ void JITOperatorVisitor::consumeHashJoinVector(const HashJoinNode* node, JITCont
         //   lo_orderdate = d_datekey OR lo_commitdate = d_datekey
         // SQL OR semantics require probing every FK alternative.  If two FK
         // values are equal, the dimension row must be emitted only once.
-        const std::string payload_reg = bi.val_col.empty() ? "items2" : bi.val_col;
-        if (!bi.val_col.empty()) {
+        const std::string payload_reg = bi.payload_is_row_id ? bi.row_id_reg : (bi.val_col.empty() ? "items2" : bi.val_col);
+        if (bi.payload_is_row_id) {
+            ctx.table_rowid_regs[bi.dim_table] = payload_reg;
+            ctx.col_to_reg["__rowid_" + bi.dim_table] = payload_reg;
+        } else if (!bi.val_col.empty()) {
             ctx.col_to_reg[bi.val_col] = payload_reg;
         }
 
@@ -2098,8 +2285,12 @@ void JITOperatorVisitor::consumeHashJoinVector(const HashJoinNode* node, JITCont
         code << "                    for (int j = 0; j < count; ++j) {\n";
 
         std::vector<std::string> new_vars = active_vars;
-        if (!bi.val_col.empty()) {
-            // РЕГИСТРАЦИЯ: Говорим TableScan, что нужно сгенерировать `int val_col[ITEMS]`;
+        if (bi.payload_is_row_id) {
+            ctx.table_rowid_regs[bi.dim_table] = bi.row_id_reg;
+            ctx.col_to_reg["__rowid_" + bi.dim_table] = bi.row_id_reg;
+            code << "                        " << bi.row_id_reg << "[i] = payload_"
+                 << bi.dim_prefix << "[offset + j];\n";
+        } else if (!bi.val_col.empty()) {
             ctx.col_to_reg[bi.val_col] = bi.val_col;
             code << "                        " << bi.val_col << "[i] = payload_"
                  << bi.dim_prefix << "[offset + j];\n";
@@ -2161,6 +2352,8 @@ std::string JITOperatorVisitor::generateCode() const {
 
     code << "#include \"core/execution.h\"\n";
     code << "#include <sycl/sycl.hpp>\n";
+    code << "#include <limits>\n";
+    code << "#include <stdexcept>\n";
     code << "#include \"crystal/load.h\"\n";
     code << "#include \"crystal/pred.h\"\n";
     code << "#include \"crystal/join.h\"\n";

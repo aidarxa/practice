@@ -44,6 +44,11 @@ struct JITContext {
     // column_name → register name in the probe kernel.
     std::unordered_map<std::string, std::string> col_to_reg;
 
+    // table_name → row-id vector register. Used by projection/materialization
+    // after PK/FK joins: the hash table carries only build row_id, and
+    // late columns are gathered by row_id at the end of the pipeline.
+    std::unordered_map<std::string, std::string> table_rowid_regs;
+
     // Which columns have already been BlockLoad-ed in the probe kernel.
     std::set<std::string> loaded_in_probe;
 
@@ -76,6 +81,13 @@ struct JITContext {
     std::string result_size_expr;   // e.g. "7*1000"
     int         tuple_size = 1;
     std::string visible_result_size_expr;
+
+    // Exact projection materialization: the first scan pass counts surviving
+    // rows per tile; host prefix-scan computes exact offsets and result size;
+    // the second scan pass writes rows into the exact result buffer.
+    bool projection_exact_materialization = false;
+    std::string projection_row_count_expr;
+    int projection_tuple_size = 0;
 
     // Code emitted after all main pipelines, before q.wait(). Used for
     // aggregate finalization/compaction kernels.
@@ -223,8 +235,11 @@ private:
         std::string key_mins;      // "0" or "1"
         uint8_t     variant;       // 1 = keys only (PHT_1), 2 = key-value pairs (PHT_2)
         bool        use_mht;       // true = Multi-value HT (two-pass), false = Perfect HT
+        bool        payload_is_row_id = false; // PHT_2 payload is build-side row_id, not a value column
         std::vector<std::string> fk_cols; // FK column(s) in the probe/fact table
         std::string val_col;       // payload column (variant 2 / MHT only)
+        std::string row_id_reg;    // vector register name for build-side row_id payload
+        std::string dim_table;     // build-side table name
         std::string dim_prefix;    // "s", "c", "p", "d"
         std::string size_macro;    // "S_LEN", "C_LEN", etc.
         std::string pk_col;        // PK column in the dim table
@@ -277,6 +292,13 @@ private:
 
     ExecutionMode execution_mode_ = ExecutionMode::DataCentric;
     ConsumeMode   consume_mode_   = ConsumeMode::Vector;
+
+    enum class ProjectionPass : uint8_t {
+        None = 0,
+        Count,
+        Write
+    };
+    ProjectionPass projection_pass_ = ProjectionPass::None;
 
     // ---- Build kernel emitters ----
     // PHT: emit one build kernel (with optional filter). Populates hash_tables.

@@ -4,6 +4,8 @@
 #include <vector>
 #include <cstddef>
 #include <utility>
+#include <stdexcept>
+#include <limits>
 
 namespace db {
 
@@ -50,9 +52,26 @@ public:
     void ensureCapacity(size_t requested_capacity) {
         if (requested_capacity > capacity_) {
             free();
-            size_t new_capacity = static_cast<size_t>(requested_capacity * 1.5);
-            allocate(new_capacity);
+            allocate(nextCapacity(requested_capacity));
         }
+    }
+
+    size_t nextCapacity(size_t requested_capacity) const {
+        // Avoid 1.5x over-allocation for large analytical projections.  On
+        // scale-factor 10, SELECT * can already require many GiB exactly; a
+        // high-water multiplier turns a rejectable query into a driver-level
+        // allocation failure.  Keep the small-query high-water mark only where
+        // it is harmless.
+        constexpr size_t kSmallBufferElements = 1ULL << 20;
+        if (requested_capacity == 0) return 0;
+        if (requested_capacity <= kSmallBufferElements) {
+            if (requested_capacity > std::numeric_limits<size_t>::max() / 3 * 2) {
+                throw std::overflow_error("DynamicDeviceBuffer capacity overflow");
+            }
+            size_t grown = requested_capacity + requested_capacity / 2;
+            return grown > requested_capacity ? grown : requested_capacity;
+        }
+        return requested_capacity;
     }
 
     void zero() {

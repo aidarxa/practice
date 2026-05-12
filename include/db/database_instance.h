@@ -19,7 +19,7 @@ public:
     void loadData();
 
     /// Выполняет JIT-компиляцию и запуск на GPU, возвращает сырые данные ответа и tuple_size
-    std::pair<std::vector<unsigned long long>, size_t> executeQuery(const std::string& sql);
+    QueryResult executeQuery(const std::string& sql);
 
     /// Возвращает сгенерированный JIT-код без его компиляции
     std::string generateQueryCode(const std::string& sql);

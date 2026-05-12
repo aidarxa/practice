@@ -37,3 +37,33 @@ inline void BlockLoad(T* input, size_t tid, int tile_offset, int (&items)[ITEMS_
 // -------------------------------------------BLOCK LOAD---------------------------------------------
 // -----------------------------------------------END------------------------------------------------
 
+
+// ----------------------------------------BLOCK GATHER---------------------------------------------
+template <typename T, int BLOCK_THREADS, int ITEMS_PER_THREAD>
+inline void BlockGather(T* input,
+                        int tid,
+                        int (&row_ids)[ITEMS_PER_THREAD],
+                        int (&flags)[ITEMS_PER_THREAD],
+                        T (&items)[ITEMS_PER_THREAD],
+                        int num_items) {
+#pragma unroll
+    for (int i = 0; i < ITEMS_PER_THREAD; ++i) {
+        if (flags[i] && (i * BLOCK_THREADS + tid < num_items)) {
+            items[i] = input[row_ids[i]];
+        }
+    }
+}
+
+template <int BLOCK_THREADS, int ITEMS_PER_THREAD>
+inline void BlockMakeRowIds(int tid,
+                            int tile_offset,
+                            int (&row_ids)[ITEMS_PER_THREAD],
+                            int num_items) {
+#pragma unroll
+    for (int i = 0; i < ITEMS_PER_THREAD; ++i) {
+        if (i * BLOCK_THREADS + tid < num_items) {
+            row_ids[i] = tile_offset + tid + i * BLOCK_THREADS;
+        }
+    }
+}
+// ----------------------------------------BLOCK GATHER---------------------------------------------

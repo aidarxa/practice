@@ -171,13 +171,19 @@ public:
 // ============================================================================
 struct AggregateDef {
     std::string func_name;              // "COUNT", "SUM", "MIN", "MAX", "AVG"
-    std::unique_ptr<ExprNode> agg_expr; // nullptr for COUNT(), StarExpr for COUNT(*) / SUM(*)
+    std::unique_ptr<ExprNode> agg_expr; // StarExpr only for COUNT(*); nullptr is invalid after translation
 
     AggregateDef(std::string name, std::unique_ptr<ExprNode> expr)
         : func_name(std::move(name)), agg_expr(std::move(expr)) {
         std::transform(func_name.begin(), func_name.end(), func_name.begin(), ::toupper);
         if (!isSupportedFunction()) {
             throw std::runtime_error("Unsupported aggregate function: " + func_name);
+        }
+        if (!agg_expr) {
+            throw std::runtime_error("Aggregate function " + func_name + " requires an argument; use COUNT(*) for row count");
+        }
+        if (hasStarArgument() && !isCount()) {
+            throw std::runtime_error("Aggregate function " + func_name + " does not accept '*' according to SQL semantics");
         }
     }
 
@@ -197,7 +203,7 @@ struct AggregateDef {
         return agg_expr && agg_expr->getType() == ExprType::STAR;
     }
     bool argumentIsRowCountLike() const {
-        return hasNoArgument() || hasStarArgument();
+        return isCount() && hasStarArgument();
     }
 
     // Logical output: every aggregate contributes one visible value.

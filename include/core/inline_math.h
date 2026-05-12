@@ -94,7 +94,29 @@ inline int safe_neq(T1 a, T2 b) {
 }
 
 
+inline unsigned long long bit_cast_double_to_ull(double value) {
+    union Bits { double d; unsigned long long u; };
+    Bits bits;
+    bits.d = value;
+    return bits.u;
+}
+
+inline double bit_cast_ull_to_double(unsigned long long value) {
+    union Bits { double d; unsigned long long u; };
+    Bits bits;
+    bits.u = value;
+    return bits.d;
+}
+
 // Atomic helpers used by generated aggregate kernels.
+inline unsigned long long atomic_fetch_add_ull(unsigned long long& target, unsigned long long value) {
+    sycl::atomic_ref<unsigned long long,
+                     sycl::memory_order::relaxed,
+                     sycl::memory_scope::device,
+                     sycl::access::address_space::global_space> at(target);
+    return at.fetch_add(value);
+}
+
 inline void atomic_add_ull(unsigned long long& target, unsigned long long value) {
     sycl::atomic_ref<unsigned long long,
                      sycl::memory_order::relaxed,

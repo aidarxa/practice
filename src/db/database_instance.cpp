@@ -106,6 +106,7 @@ void DatabaseInstance::loadData() {
         total_columns += table.getColumnCount();
     }
 
+    ctx_->loaded_device_bytes_ = 0;
     int current_column = 0;
     for (const auto& table : catalog_->getTablesMetadata()) {
         uint64_t size = table.getSize();
@@ -118,6 +119,7 @@ void DatabaseInstance::loadData() {
 
             // Allocate and copy to GPU
             int* d_ptr = sycl::malloc_device<int>(size, q_);
+            ctx_->loaded_device_bytes_ += static_cast<size_t>(size) * sizeof(int);
             q_.copy(data.data(), d_ptr, size).wait();
 
             std::string buf_name = "d_" + col_name;
@@ -127,7 +129,7 @@ void DatabaseInstance::loadData() {
     std::cout << "\nData loading complete!" << std::endl;
 }
 
-std::pair<std::vector<unsigned long long>, size_t> DatabaseInstance::executeQuery(const std::string& sql) {
+QueryResult DatabaseInstance::executeQuery(const std::string& sql) {
     // QueryEngine::executeQuery самостоятельно вызовет ensureCapacity и zero
     // на основе рассчитанного expected_result_size_.
     engine_->executeQuery(sql, ctx_.get());
@@ -144,7 +146,40 @@ std::pair<std::vector<unsigned long long>, size_t> DatabaseInstance::executeQuer
     std::vector<unsigned long long> h_result;
     ctx_->result_buffer_->copyToHost(h_result, copy_size);
 
-    return {h_result, ctx_->tuple_size_};
+    QueryResult result;
+    result.data = std::move(h_result);
+    result.tuple_size = ctx_->tuple_size_;
+    result.columns = ctx_->result_columns_;
+    result.dense_result = ctx_->result_is_dense_;
+
+    if (result.tuple_size == 0) {
+        result.tuple_size = 1;
+    }
+
+    if (ctx_->result_is_dense_) {
+        result.row_count = ctx_->result_row_count_;
+        if (result.row_count == 0 && !result.data.empty() && ctx_->expected_result_size_ != 0) {
+            result.row_count = result.data.size() / result.tuple_size;
+        }
+    } else if (result.tuple_size <= 1) {
+        result.row_count = result.data.empty() ? 0 : 1;
+    } else {
+        const size_t physical_rows = result.data.size() / result.tuple_size;
+        size_t non_empty_rows = 0;
+        for (size_t row = 0; row < physical_rows; ++row) {
+            const size_t base = row * result.tuple_size;
+            bool all_zero = true;
+            for (size_t col = 0; col < result.tuple_size; ++col) {
+                if (result.data[base + col] != 0ULL) {
+                    all_zero = false;
+                    break;
+                }
+            }
+            if (!all_zero) ++non_empty_rows;
+        }
+        result.row_count = non_empty_rows;
+    }
+    return result;
 }
 
 std::string DatabaseInstance::generateQueryCode(const std::string& sql) {

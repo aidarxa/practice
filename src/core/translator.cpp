@@ -399,11 +399,15 @@ std::unique_ptr<OperatorNode> QueryTranslator::translate(const hsql::SelectState
                     if (arg) agg_expr = translateExpr(arg);
                 }
 
-                // COUNT() and COUNT(*) are valid.  For SUM/MIN/MAX/AVG, a missing
-                // argument is treated as STAR to keep the AST explicit and to allow
-                // SUM(*) as a row-count aggregate requested by the engine tests.
-                if (!agg_expr && func != "COUNT") {
-                    agg_expr = std::make_unique<StarExpr>();
+                if (!agg_expr) {
+                    throw std::runtime_error(
+                        "QueryTranslator: aggregate function " + func +
+                        " requires exactly one SQL argument; use COUNT(*) for row count");
+                }
+                if (agg_expr->getType() == ExprType::STAR && func != "COUNT") {
+                    throw std::runtime_error(
+                        "QueryTranslator: aggregate function " + func +
+                        " does not accept '*' according to SQL semantics");
                 }
 
                 agg_node->aggregates.emplace_back(std::move(func), std::move(agg_expr));

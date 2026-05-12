@@ -5,8 +5,12 @@
 
 #include <algorithm>
 #include <fstream>
+#include <cstring>
+#include <iomanip>
 #include <iostream>
 #include <string>
+#include <sstream>
+#include <vector>
 
 namespace db::cli {
 
@@ -23,6 +27,20 @@ std::string trim(const std::string& s) {
 /// Проверяет, содержит ли строка символ ';' (завершение SQL-запроса).
 bool containsSemicolon(const std::string& s) {
     return s.find(';') != std::string::npos;
+}
+
+std::string formatResultValue(unsigned long long raw,
+                              const std::vector<db::ResultColumnDesc>& cols,
+                              size_t col_idx) {
+    if (col_idx < cols.size() && cols[col_idx].type == db::LogicalType::Float64) {
+        double value = 0.0;
+        static_assert(sizeof(value) == sizeof(raw), "double and ULL must have equal size");
+        std::memcpy(&value, &raw, sizeof(value));
+        std::ostringstream oss;
+        oss << std::setprecision(15) << value;
+        return oss.str();
+    }
+    return std::to_string(raw);
 }
 
 } // anonymous namespace
@@ -111,40 +129,66 @@ void TerminalApp::executeQuery(const std::string& sql) {
             }
         } else {
             // Выполняем реальный запрос
-            auto res_pair = db_->executeQuery(sql);
-            const std::vector<unsigned long long>& result = res_pair.first;
-            size_t tuple_size = res_pair.second;
-            
-            // Простой вывод результата
-            std::cout << "--- Result ---\n";
-            bool has_results = false;
-            
+            auto query_result = db_->executeQuery(sql);
+            const std::vector<unsigned long long>& result = query_result.data;
+            size_t tuple_size = query_result.tuple_size;
+            const auto& columns = query_result.columns;
+
+            auto is_non_empty_tuple = [&](size_t row) -> bool {
+                if (query_result.dense_result) return row < query_result.row_count;
+                if (tuple_size <= 1) return row == 0 && !result.empty();
+                const size_t base = row * tuple_size;
+                if (base + tuple_size > result.size()) return false;
+                for (size_t j = 0; j < tuple_size; ++j) {
+                    if (result[base + j] != 0ULL) return true;
+                }
+                return false;
+            };
+
+            std::vector<size_t> rows_to_print;
+            const size_t limit = ctx_.output_row_limit_enabled ? ctx_.output_row_limit
+                                                               : static_cast<size_t>(-1);
             if (tuple_size <= 1) {
-                // Скалярная агрегация
-                std::cout << result[0] << "\n";
-                has_results = true;
+                if (!result.empty() && query_result.row_count != 0) rows_to_print.push_back(0);
+            } else if (query_result.dense_result) {
+                const size_t total = query_result.row_count;
+                const size_t begin = (ctx_.output_row_limit_enabled && total > limit) ? (total - limit) : 0;
+                for (size_t row = begin; row < total; ++row) rows_to_print.push_back(row);
             } else {
-                for (size_t i = 0; i < result.size(); i += tuple_size) {
-                    bool all_zero = true;
-                    for (size_t j = 0; j < tuple_size; ++j) {
-                        if (result[i + j] != 0) {
-                            all_zero = false;
-                            break;
-                        }
+                const size_t physical_rows = tuple_size == 0 ? 0 : result.size() / tuple_size;
+                for (size_t row = 0; row < physical_rows; ++row) {
+                    if (!is_non_empty_tuple(row)) continue;
+                    if (ctx_.output_row_limit_enabled && rows_to_print.size() == limit) {
+                        rows_to_print.erase(rows_to_print.begin());
                     }
-                    if (all_zero) continue;
-                    
-                    std::cout << "Row " << (i / tuple_size) << ": ";
+                    rows_to_print.push_back(row);
+                }
+            }
+
+            std::cout << "--- Result ---\n";
+            if (rows_to_print.empty()) {
+                std::cout << "0\n";
+            } else {
+                for (size_t row : rows_to_print) {
+                    const size_t base = row * tuple_size;
+                    if (tuple_size <= 1) {
+                        std::cout << formatResultValue(result[0], columns, 0) << "\n";
+                        continue;
+                    }
+                    std::cout << "Row " << row << ": ";
                     for (size_t j = 0; j < tuple_size; ++j) {
-                        std::cout << result[i + j];
+                        std::cout << formatResultValue(result[base + j], columns, j);
                         if (j < tuple_size - 1) std::cout << " | ";
                     }
                     std::cout << "\n";
-                    has_results = true;
                 }
             }
-            if (!has_results) {
-                std::cout << "0\n";
+            std::cout << "Rows returned: " << query_result.row_count << "\n";
+            if (ctx_.output_row_limit_enabled && query_result.row_count > rows_to_print.size()) {
+                std::cout << "Rows shown: " << rows_to_print.size()
+                          << " (last rows; change with \\limit)\n";
+            } else {
+                std::cout << "Rows shown: " << rows_to_print.size() << "\n";
             }
             std::cout << "--- End ---\n";
         }
