@@ -21,6 +21,7 @@ public:
 
     /// Выполняет JIT-компиляцию и запуск на GPU, возвращает сырые данные ответа и tuple_size
     QueryResult executeQuery(const std::string& sql);
+    QueryResult executeQuery(const std::string& sql, const QueryFetchOptions& fetch_options);
 
     /// Возвращает сгенерированный JIT-код без его компиляции
     std::string generateQueryCode(const std::string& sql);

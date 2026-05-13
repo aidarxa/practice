@@ -45,6 +45,10 @@ struct JITContext {
     std::unordered_map<std::string, std::string> col_to_reg;
     std::unordered_map<std::string, std::string> col_to_valid_reg;
 
+    // Catalog-derived nullability cache used by codegen to completely avoid
+    // validity loads/checks for non-nullable columns in hot kernels.
+    std::set<std::string> nullable_columns;
+
     // table_name → row-id vector register. Used by projection/materialization
     // after PK/FK joins: the hash table carries only build row_id, and
     // late columns are gathered by row_id at the end of the pipeline.

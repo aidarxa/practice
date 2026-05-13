@@ -6,3 +6,5 @@ deps/
 sql-parser/*
 test/queries/result/
 todo.md
+olap_bench/bench/*
+olap_bench/meta/*

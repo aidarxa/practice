@@ -12,6 +12,7 @@ struct CrystalConfig {
     bool dump_generated_code = false;
     bool extended_timing = false;
     bool memory_guard_enabled = true;
+    bool reuse_scratch_buffers = true;
 
     std::size_t output_row_limit = 1000;
     bool output_row_limit_enabled = true;

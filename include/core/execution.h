@@ -29,10 +29,20 @@ struct QueryTimingStats {
     double codegen_ms = 0.0;
     double compile_ms = 0.0;
     double library_load_ms = 0.0;
+    // Time measured inside generated execute_query(): queue submissions,
+    // required q.wait(), and generated-kernel temporary cleanup.
+    double gpu_execute_ms = 0.0;
+    // Backward-compatible alias for old code paths; kept in sync with
+    // gpu_execute_ms at reporting boundaries.
     double jit_execute_ms = 0.0;
     double host_fetch_ms = 0.0;
-    double gpu_and_host_fetch_ms = 0.0;
+    double engine_ms = 0.0;
     double total_engine_ms = 0.0;
+};
+
+struct QueryFetchOptions {
+    bool limit_enabled = false;
+    std::size_t row_limit = 0;
 };
 
 
@@ -60,6 +70,13 @@ struct QueryResult {
     std::vector<std::vector<double>> column_f64;
     std::vector<std::vector<uint64_t>> column_validity_bitmap;
     bool has_columnar_result = false;
+
+    // If only a display window was fetched from GPU, row_count still stores
+    // the full logical result size, while materialized_row_offset/count
+    // identify the host-resident row interval [offset, offset+count).
+    bool partial_result = false;
+    size_t materialized_row_offset = 0;
+    size_t materialized_row_count = 0;
 
     size_t tuple_size = 1;
     std::vector<ResultColumnDesc> columns;
@@ -124,6 +141,9 @@ struct ExecutionContext {
     size_t result_column_count_{0};
     size_t result_column_row_capacity_{0};
     std::vector<ResultColumnDeviceBuffer> result_column_storage_;
+    std::unordered_map<std::string, std::unique_ptr<DynamicDeviceBuffer<int>>> scratch_i32_buffers_;
+    std::unordered_map<std::string, std::unique_ptr<DynamicDeviceBuffer<unsigned long long>>> scratch_u64_buffers_;
+    size_t scratch_device_bytes_{0};
     size_t expected_result_validity_words_{0};
     QueryTimingStats timing_;
     CrystalConfig config_;
@@ -157,6 +177,28 @@ struct ExecutionContext {
     template<typename T>
     ColumnView<T> getColumnView(const std::string& name) {
         return ColumnView<T>{getBuffer<T>(name), getNullBitmap(name), getNullBitmap(name) != nullptr};
+    }
+
+    int* getScratchIntBuffer(const std::string& name, size_t element_count) {
+        auto& buf = scratch_i32_buffers_[name];
+        if (!buf) buf = std::make_unique<DynamicDeviceBuffer<int>>(*q_, 0);
+        const size_t old_capacity = buf->capacity();
+        buf->ensureCapacity(element_count == 0 ? 1 : element_count);
+        if (buf->capacity() > old_capacity) {
+            scratch_device_bytes_ += (buf->capacity() - old_capacity) * sizeof(int);
+        }
+        return buf->data();
+    }
+
+    unsigned long long* getScratchUInt64Buffer(const std::string& name, size_t element_count) {
+        auto& buf = scratch_u64_buffers_[name];
+        if (!buf) buf = std::make_unique<DynamicDeviceBuffer<unsigned long long>>(*q_, 0);
+        const size_t old_capacity = buf->capacity();
+        buf->ensureCapacity(element_count == 0 ? 1 : element_count);
+        if (buf->capacity() > old_capacity) {
+            scratch_device_bytes_ += (buf->capacity() - old_capacity) * sizeof(unsigned long long);
+        }
+        return buf->data();
     }
 
     unsigned long long* getResultPointer() const {

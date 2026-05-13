@@ -84,6 +84,7 @@ static bool readConfigFile(const std::string& path, CrystalConfig& cfg) {
         else if (key == "dump_generated_code" || key == "dump_code") cfg.dump_generated_code = parseBool(value, key);
         else if (key == "extended_timing" || key == "timing") cfg.extended_timing = parseBool(value, key);
         else if (key == "memory_guard_enabled") cfg.memory_guard_enabled = parseBool(value, key);
+        else if (key == "reuse_scratch_buffers" || key == "scratch_buffer_reuse") cfg.reuse_scratch_buffers = parseBool(value, key);
         else if (key == "output_limit" || key == "output_row_limit") {
             const std::string v = lower(value);
             if (v == "off" || v == "all" || v == "unlimited") {

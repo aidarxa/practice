@@ -214,7 +214,10 @@ struct AggregateDef {
     // hidden non-null counter at AggregateNode level. COUNT never needs one.
     uint64_t storageSlotCount() const { return 1; }
 
-    bool needsNonNullCount() const { return !isCount(); }
+    // Only AVG needs a persistent hidden count state to compute the final
+    // denominator. SUM/MIN/MAX validity is represented by the result validity
+    // bitmap, which is set when at least one valid input updates the state.
+    bool needsNonNullCount() const { return isAvg(); }
 
     // Explicit move-only: нет копирования из-за unique_ptr
     AggregateDef(const AggregateDef&) = delete;

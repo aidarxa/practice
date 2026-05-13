@@ -1,0 +1,852 @@
+{
+  "suite": "crystal_sycl_olap_benchmarks",
+  "version": 1,
+  "description": "Classified OLAP benchmark SQL suite for current and future Crystal-SYCL functionality.",
+  "default_run_statuses": [
+    "current"
+  ],
+  "classes": [
+    {
+      "id": "00_health",
+      "name": "health",
+      "status": "current",
+      "queries": [
+        {
+          "id": "health_01_count_lineorder",
+          "path": "sql/00_health/health_01_count_lineorder.sql",
+          "status": "current",
+          "tags": [
+            "health"
+          ],
+          "timeout_sec": 120
+        },
+        {
+          "id": "health_02_count_customer",
+          "path": "sql/00_health/health_02_count_customer.sql",
+          "status": "current",
+          "tags": [
+            "health"
+          ],
+          "timeout_sec": 120
+        },
+        {
+          "id": "health_03_count_part",
+          "path": "sql/00_health/health_03_count_part.sql",
+          "status": "current",
+          "tags": [
+            "health"
+          ],
+          "timeout_sec": 120
+        },
+        {
+          "id": "health_04_count_supplier",
+          "path": "sql/00_health/health_04_count_supplier.sql",
+          "status": "current",
+          "tags": [
+            "health"
+          ],
+          "timeout_sec": 120
+        },
+        {
+          "id": "health_05_count_ddate",
+          "path": "sql/00_health/health_05_count_ddate.sql",
+          "status": "current",
+          "tags": [
+            "health"
+          ],
+          "timeout_sec": 120
+        }
+      ]
+    },
+    {
+      "id": "01_scan_filter",
+      "name": "scan filter",
+      "status": "current",
+      "queries": [
+        {
+          "id": "filter_01_eq",
+          "path": "sql/01_scan_filter/filter_01_eq.sql",
+          "status": "current",
+          "tags": [
+            "scan_filter"
+          ],
+          "timeout_sec": 120
+        },
+        {
+          "id": "filter_02_range",
+          "path": "sql/01_scan_filter/filter_02_range.sql",
+          "status": "current",
+          "tags": [
+            "scan_filter"
+          ],
+          "timeout_sec": 120
+        },
+        {
+          "id": "filter_03_or",
+          "path": "sql/01_scan_filter/filter_03_or.sql",
+          "status": "current",
+          "tags": [
+            "scan_filter"
+          ],
+          "timeout_sec": 120
+        },
+        {
+          "id": "filter_04_arithmetic",
+          "path": "sql/01_scan_filter/filter_04_arithmetic.sql",
+          "status": "current",
+          "tags": [
+            "scan_filter"
+          ],
+          "timeout_sec": 120
+        },
+        {
+          "id": "filter_05_not_is_null",
+          "path": "sql/01_scan_filter/filter_05_not_is_null.sql",
+          "status": "current",
+          "tags": [
+            "scan_filter"
+          ],
+          "timeout_sec": 120
+        },
+        {
+          "id": "filter_06_complex_boolean",
+          "path": "sql/01_scan_filter/filter_06_complex_boolean.sql",
+          "status": "current",
+          "tags": [
+            "scan_filter"
+          ],
+          "timeout_sec": 120
+        }
+      ]
+    },
+    {
+      "id": "02_projection",
+      "name": "projection",
+      "status": "current",
+      "queries": [
+        {
+          "id": "proj_01_single_column",
+          "path": "sql/02_projection/proj_01_single_column.sql",
+          "status": "current",
+          "tags": [
+            "projection"
+          ],
+          "timeout_sec": 120
+        },
+        {
+          "id": "proj_02_two_columns",
+          "path": "sql/02_projection/proj_02_two_columns.sql",
+          "status": "current",
+          "tags": [
+            "projection"
+          ],
+          "timeout_sec": 120
+        },
+        {
+          "id": "proj_03_arithmetic_expr",
+          "path": "sql/02_projection/proj_03_arithmetic_expr.sql",
+          "status": "current",
+          "tags": [
+            "projection"
+          ],
+          "timeout_sec": 120
+        },
+        {
+          "id": "proj_04_boolean_expr",
+          "path": "sql/02_projection/proj_04_boolean_expr.sql",
+          "status": "current",
+          "tags": [
+            "projection"
+          ],
+          "timeout_sec": 120
+        },
+        {
+          "id": "proj_05_select_star_small_dimension",
+          "path": "sql/02_projection/proj_05_select_star_small_dimension.sql",
+          "status": "current",
+          "tags": [
+            "projection"
+          ],
+          "timeout_sec": 120
+        }
+      ]
+    },
+    {
+      "id": "03_aggregate_scalar",
+      "name": "aggregate scalar",
+      "status": "current",
+      "queries": [
+        {
+          "id": "agg_01_count_star",
+          "path": "sql/03_aggregate_scalar/agg_01_count_star.sql",
+          "status": "current",
+          "tags": [
+            "aggregate_scalar"
+          ],
+          "timeout_sec": 120
+        },
+        {
+          "id": "agg_02_count_expr",
+          "path": "sql/03_aggregate_scalar/agg_02_count_expr.sql",
+          "status": "current",
+          "tags": [
+            "aggregate_scalar"
+          ],
+          "timeout_sec": 120
+        },
+        {
+          "id": "agg_03_sum_min_max",
+          "path": "sql/03_aggregate_scalar/agg_03_sum_min_max.sql",
+          "status": "current",
+          "tags": [
+            "aggregate_scalar"
+          ],
+          "timeout_sec": 120
+        },
+        {
+          "id": "agg_04_avg",
+          "path": "sql/03_aggregate_scalar/agg_04_avg.sql",
+          "status": "current",
+          "tags": [
+            "aggregate_scalar"
+          ],
+          "timeout_sec": 120
+        },
+        {
+          "id": "agg_05_all_basic_aggs",
+          "path": "sql/03_aggregate_scalar/agg_05_all_basic_aggs.sql",
+          "status": "current",
+          "tags": [
+            "aggregate_scalar"
+          ],
+          "timeout_sec": 120
+        },
+        {
+          "id": "agg_06_aggregate_expression",
+          "path": "sql/03_aggregate_scalar/agg_06_aggregate_expression.sql",
+          "status": "current",
+          "tags": [
+            "aggregate_scalar"
+          ],
+          "timeout_sec": 120
+        }
+      ]
+    },
+    {
+      "id": "04_group_by",
+      "name": "group by",
+      "status": "current",
+      "queries": [
+        {
+          "id": "group_01_year_sum",
+          "path": "sql/04_group_by/group_01_year_sum.sql",
+          "status": "current",
+          "tags": [
+            "group_by"
+          ],
+          "timeout_sec": 120
+        },
+        {
+          "id": "group_02_year_brand_sum_q21_shape",
+          "path": "sql/04_group_by/group_02_year_brand_sum_q21_shape.sql",
+          "status": "current",
+          "tags": [
+            "group_by"
+          ],
+          "timeout_sec": 120
+        },
+        {
+          "id": "group_03_customer_nation_supplier_nation",
+          "path": "sql/04_group_by/group_03_customer_nation_supplier_nation.sql",
+          "status": "current",
+          "tags": [
+            "group_by"
+          ],
+          "timeout_sec": 120
+        },
+        {
+          "id": "group_04_group_by_expression_future",
+          "path": "sql/04_group_by/group_04_group_by_expression_future.sql",
+          "status": "future",
+          "tags": [
+            "group_by"
+          ],
+          "timeout_sec": 120
+        }
+      ]
+    },
+    {
+      "id": "05_join_pk_fk",
+      "name": "join pk fk",
+      "status": "current",
+      "queries": [
+        {
+          "id": "join_01_customer_filter",
+          "path": "sql/05_join_pk_fk/join_01_customer_filter.sql",
+          "status": "current",
+          "tags": [
+            "join_pk_fk"
+          ],
+          "timeout_sec": 120
+        },
+        {
+          "id": "join_02_supplier_filter",
+          "path": "sql/05_join_pk_fk/join_02_supplier_filter.sql",
+          "status": "current",
+          "tags": [
+            "join_pk_fk"
+          ],
+          "timeout_sec": 120
+        },
+        {
+          "id": "join_03_part_filter",
+          "path": "sql/05_join_pk_fk/join_03_part_filter.sql",
+          "status": "current",
+          "tags": [
+            "join_pk_fk"
+          ],
+          "timeout_sec": 120
+        },
+        {
+          "id": "join_04_date_filter",
+          "path": "sql/05_join_pk_fk/join_04_date_filter.sql",
+          "status": "current",
+          "tags": [
+            "join_pk_fk"
+          ],
+          "timeout_sec": 120
+        },
+        {
+          "id": "join_05_four_table_count",
+          "path": "sql/05_join_pk_fk/join_05_four_table_count.sql",
+          "status": "current",
+          "tags": [
+            "join_pk_fk"
+          ],
+          "timeout_sec": 120
+        }
+      ]
+    },
+    {
+      "id": "06_projection_join",
+      "name": "projection join",
+      "status": "current",
+      "queries": [
+        {
+          "id": "proj_join_01_selected_columns",
+          "path": "sql/06_projection_join/proj_join_01_selected_columns.sql",
+          "status": "current",
+          "tags": [
+            "projection_join"
+          ],
+          "timeout_sec": 120
+        },
+        {
+          "id": "proj_join_02_star_customer",
+          "path": "sql/06_projection_join/proj_join_02_star_customer.sql",
+          "status": "current",
+          "tags": [
+            "projection_join"
+          ],
+          "timeout_sec": 120
+        },
+        {
+          "id": "proj_join_03_three_table_selected",
+          "path": "sql/06_projection_join/proj_join_03_three_table_selected.sql",
+          "status": "current",
+          "tags": [
+            "projection_join"
+          ],
+          "timeout_sec": 120
+        },
+        {
+          "id": "proj_join_04_expression_after_join",
+          "path": "sql/06_projection_join/proj_join_04_expression_after_join.sql",
+          "status": "current",
+          "tags": [
+            "projection_join"
+          ],
+          "timeout_sec": 120
+        }
+      ]
+    },
+    {
+      "id": "07_ssb_standard",
+      "name": "ssb standard",
+      "status": "current",
+      "queries": [
+        {
+          "id": "q11",
+          "path": "sql/07_ssb_standard/q11.sql",
+          "status": "current",
+          "tags": [
+            "ssb_standard"
+          ],
+          "timeout_sec": 120
+        },
+        {
+          "id": "q12",
+          "path": "sql/07_ssb_standard/q12.sql",
+          "status": "current",
+          "tags": [
+            "ssb_standard"
+          ],
+          "timeout_sec": 120
+        },
+        {
+          "id": "q13",
+          "path": "sql/07_ssb_standard/q13.sql",
+          "status": "current",
+          "tags": [
+            "ssb_standard"
+          ],
+          "timeout_sec": 120
+        },
+        {
+          "id": "q21",
+          "path": "sql/07_ssb_standard/q21.sql",
+          "status": "current",
+          "tags": [
+            "ssb_standard"
+          ],
+          "timeout_sec": 120
+        },
+        {
+          "id": "q22",
+          "path": "sql/07_ssb_standard/q22.sql",
+          "status": "current",
+          "tags": [
+            "ssb_standard"
+          ],
+          "timeout_sec": 120
+        },
+        {
+          "id": "q23",
+          "path": "sql/07_ssb_standard/q23.sql",
+          "status": "current",
+          "tags": [
+            "ssb_standard"
+          ],
+          "timeout_sec": 120
+        },
+        {
+          "id": "q31",
+          "path": "sql/07_ssb_standard/q31.sql",
+          "status": "current",
+          "tags": [
+            "ssb_standard"
+          ],
+          "timeout_sec": 120
+        },
+        {
+          "id": "q32",
+          "path": "sql/07_ssb_standard/q32.sql",
+          "status": "current",
+          "tags": [
+            "ssb_standard"
+          ],
+          "timeout_sec": 120
+        },
+        {
+          "id": "q33",
+          "path": "sql/07_ssb_standard/q33.sql",
+          "status": "current",
+          "tags": [
+            "ssb_standard"
+          ],
+          "timeout_sec": 120
+        },
+        {
+          "id": "q34",
+          "path": "sql/07_ssb_standard/q34.sql",
+          "status": "current",
+          "tags": [
+            "ssb_standard"
+          ],
+          "timeout_sec": 120
+        },
+        {
+          "id": "q41",
+          "path": "sql/07_ssb_standard/q41.sql",
+          "status": "current",
+          "tags": [
+            "ssb_standard"
+          ],
+          "timeout_sec": 120
+        },
+        {
+          "id": "q42",
+          "path": "sql/07_ssb_standard/q42.sql",
+          "status": "current",
+          "tags": [
+            "ssb_standard"
+          ],
+          "timeout_sec": 120
+        },
+        {
+          "id": "q43",
+          "path": "sql/07_ssb_standard/q43.sql",
+          "status": "current",
+          "tags": [
+            "ssb_standard"
+          ],
+          "timeout_sec": 120
+        }
+      ]
+    },
+    {
+      "id": "08_custom",
+      "name": "custom",
+      "status": "current",
+      "queries": [
+        {
+          "id": "custom1",
+          "path": "sql/08_custom/custom1.sql",
+          "status": "current",
+          "tags": [
+            "custom"
+          ],
+          "timeout_sec": 120
+        },
+        {
+          "id": "custom2",
+          "path": "sql/08_custom/custom2.sql",
+          "status": "current",
+          "tags": [
+            "custom"
+          ],
+          "timeout_sec": 120
+        },
+        {
+          "id": "custom3",
+          "path": "sql/08_custom/custom3.sql",
+          "status": "current",
+          "tags": [
+            "custom"
+          ],
+          "timeout_sec": 120
+        },
+        {
+          "id": "custom4",
+          "path": "sql/08_custom/custom4.sql",
+          "status": "current",
+          "tags": [
+            "custom"
+          ],
+          "timeout_sec": 120
+        },
+        {
+          "id": "custom5",
+          "path": "sql/08_custom/custom5.sql",
+          "status": "current",
+          "tags": [
+            "custom"
+          ],
+          "timeout_sec": 120
+        }
+      ]
+    },
+    {
+      "id": "09_nullable",
+      "name": "nullable",
+      "status": "current",
+      "queries": [
+        {
+          "id": "nullable_agg",
+          "path": "sql/09_nullable/nullable_agg.sql",
+          "status": "current",
+          "tags": [
+            "nullable"
+          ],
+          "timeout_sec": 120
+        },
+        {
+          "id": "nullable_is_null",
+          "path": "sql/09_nullable/nullable_is_null.sql",
+          "status": "current",
+          "tags": [
+            "nullable"
+          ],
+          "timeout_sec": 120
+        },
+        {
+          "id": "nullable_where",
+          "path": "sql/09_nullable/nullable_where.sql",
+          "status": "current",
+          "tags": [
+            "nullable"
+          ],
+          "timeout_sec": 120
+        },
+        {
+          "id": "three_valued_logic",
+          "path": "sql/09_nullable/three_valued_logic.sql",
+          "status": "current",
+          "tags": [
+            "nullable"
+          ],
+          "timeout_sec": 120
+        }
+      ]
+    },
+    {
+      "id": "10_order_limit_topn_future",
+      "name": "order limit topn future",
+      "status": "future",
+      "queries": [
+        {
+          "id": "topn_01_order_by_sum_desc_limit",
+          "path": "sql/10_order_limit_topn_future/topn_01_order_by_sum_desc_limit.sql",
+          "status": "future",
+          "tags": [
+            "order_limit_topn_future"
+          ],
+          "timeout_sec": 120
+        },
+        {
+          "id": "topn_02_order_by_projection",
+          "path": "sql/10_order_limit_topn_future/topn_02_order_by_projection.sql",
+          "status": "future",
+          "tags": [
+            "order_limit_topn_future"
+          ],
+          "timeout_sec": 120
+        }
+      ]
+    },
+    {
+      "id": "11_having_future",
+      "name": "having future",
+      "status": "future",
+      "queries": [
+        {
+          "id": "having_01_sum_threshold",
+          "path": "sql/11_having_future/having_01_sum_threshold.sql",
+          "status": "future",
+          "tags": [
+            "having_future"
+          ],
+          "timeout_sec": 120
+        }
+      ]
+    },
+    {
+      "id": "12_distinct_future",
+      "name": "distinct future",
+      "status": "future",
+      "queries": [
+        {
+          "id": "distinct_01_single_column",
+          "path": "sql/12_distinct_future/distinct_01_single_column.sql",
+          "status": "future",
+          "tags": [
+            "distinct_future"
+          ],
+          "timeout_sec": 120
+        },
+        {
+          "id": "distinct_02_count_distinct",
+          "path": "sql/12_distinct_future/distinct_02_count_distinct.sql",
+          "status": "future",
+          "tags": [
+            "distinct_future"
+          ],
+          "timeout_sec": 120
+        },
+        {
+          "id": "distinct_03_multi_column",
+          "path": "sql/12_distinct_future/distinct_03_multi_column.sql",
+          "status": "future",
+          "tags": [
+            "distinct_future"
+          ],
+          "timeout_sec": 120
+        }
+      ]
+    },
+    {
+      "id": "13_outer_join_future",
+      "name": "outer join future",
+      "status": "future",
+      "queries": [
+        {
+          "id": "outer_01_left_join_customer",
+          "path": "sql/13_outer_join_future/outer_01_left_join_customer.sql",
+          "status": "future",
+          "tags": [
+            "outer_join_future"
+          ],
+          "timeout_sec": 120
+        }
+      ]
+    },
+    {
+      "id": "14_subquery_cte_future",
+      "name": "subquery cte future",
+      "status": "future",
+      "queries": [
+        {
+          "id": "cte_01_basic",
+          "path": "sql/14_subquery_cte_future/cte_01_basic.sql",
+          "status": "future",
+          "tags": [
+            "subquery_cte_future"
+          ],
+          "timeout_sec": 120
+        },
+        {
+          "id": "subquery_01_derived_table",
+          "path": "sql/14_subquery_cte_future/subquery_01_derived_table.sql",
+          "status": "future",
+          "tags": [
+            "subquery_cte_future"
+          ],
+          "timeout_sec": 120
+        }
+      ]
+    },
+    {
+      "id": "15_window_future",
+      "name": "window future",
+      "status": "future",
+      "queries": [
+        {
+          "id": "window_01_row_number",
+          "path": "sql/15_window_future/window_01_row_number.sql",
+          "status": "future",
+          "tags": [
+            "window_future"
+          ],
+          "timeout_sec": 120
+        },
+        {
+          "id": "window_02_running_sum",
+          "path": "sql/15_window_future/window_02_running_sum.sql",
+          "status": "future",
+          "tags": [
+            "window_future"
+          ],
+          "timeout_sec": 120
+        }
+      ]
+    },
+    {
+      "id": "16_case_future",
+      "name": "case future",
+      "status": "future",
+      "queries": [
+        {
+          "id": "case_01_bucketed_sum",
+          "path": "sql/16_case_future/case_01_bucketed_sum.sql",
+          "status": "future",
+          "tags": [
+            "case_future"
+          ],
+          "timeout_sec": 120
+        }
+      ]
+    },
+    {
+      "id": "17_alias_selfjoin_future",
+      "name": "alias selfjoin future",
+      "status": "future",
+      "queries": [
+        {
+          "id": "alias_01_self_join_customer_nation",
+          "path": "sql/17_alias_selfjoin_future/alias_01_self_join_customer_nation.sql",
+          "status": "future",
+          "tags": [
+            "alias_selfjoin_future"
+          ],
+          "timeout_sec": 120
+        }
+      ]
+    },
+    {
+      "id": "18_mht_nonunique_future",
+      "name": "mht nonunique future",
+      "status": "future",
+      "queries": [
+        {
+          "id": "mht_01_non_unique_join_city",
+          "path": "sql/18_mht_nonunique_future/mht_01_non_unique_join_city.sql",
+          "status": "future",
+          "tags": [
+            "mht_nonunique_future"
+          ],
+          "timeout_sec": 120
+        },
+        {
+          "id": "mht_02_or_join_dedup",
+          "path": "sql/18_mht_nonunique_future/mht_02_or_join_dedup.sql",
+          "status": "future",
+          "tags": [
+            "mht_nonunique_future"
+          ],
+          "timeout_sec": 120
+        }
+      ]
+    },
+    {
+      "id": "19_type_system_future",
+      "name": "type system future",
+      "status": "future",
+      "queries": [
+        {
+          "id": "types_01_decimal_avg",
+          "path": "sql/19_type_system_future/types_01_decimal_avg.sql",
+          "status": "future",
+          "tags": [
+            "type_system_future"
+          ],
+          "timeout_sec": 120
+        },
+        {
+          "id": "types_02_date_extract",
+          "path": "sql/19_type_system_future/types_02_date_extract.sql",
+          "status": "future",
+          "tags": [
+            "type_system_future"
+          ],
+          "timeout_sec": 120
+        },
+        {
+          "id": "types_03_string_like",
+          "path": "sql/19_type_system_future/types_03_string_like.sql",
+          "status": "future",
+          "tags": [
+            "type_system_future"
+          ],
+          "timeout_sec": 120
+        }
+      ]
+    },
+    {
+      "id": "20_memory_stress",
+      "name": "memory stress",
+      "status": "current_heavy",
+      "queries": [
+        {
+          "id": "stress_01_wide_star_customer",
+          "path": "sql/20_memory_stress/stress_01_wide_star_customer.sql",
+          "status": "current_heavy",
+          "tags": [
+            "memory_stress",
+            "heavy"
+          ],
+          "timeout_sec": 300
+        },
+        {
+          "id": "stress_02_wide_star_customer_supplier",
+          "path": "sql/20_memory_stress/stress_02_wide_star_customer_supplier.sql",
+          "status": "current_heavy",
+          "tags": [
+            "memory_stress",
+            "heavy"
+          ],
+          "timeout_sec": 300
+        }
+      ]
+    }
+  ]
+}

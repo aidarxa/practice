@@ -32,6 +32,7 @@ const char* ExprPrinter::exprTypeName(ExprType t) {
         case ExprType::LITERAL_FLOAT: return "LITERAL_FLOAT";
         case ExprType::OP_AND:        return "AND";
         case ExprType::OP_OR:         return "OR";
+        case ExprType::OP_NOT:        return "NOT";
         case ExprType::OP_EQ:         return "=";
         case ExprType::OP_NEQ:        return "<>";
         case ExprType::OP_LT:         return "<";
@@ -254,6 +255,13 @@ std::unique_ptr<ExprNode> QueryTranslator::translateExpr(const hsql::Expr* expr)
                 }
                 return std::make_unique<BinaryExpr>(
                     ExprType::OP_IS_NOT_NULL, translateExpr(expr->expr->expr), nullptr);
+            }
+            if (expr->opType == hsql::kOpNot) {
+                if (!expr->expr) {
+                    throw std::runtime_error("QueryTranslator: NOT missing operand");
+                }
+                return std::make_unique<BinaryExpr>(
+                    ExprType::OP_NOT, translateExpr(expr->expr), nullptr);
             }
 
             // BETWEEN не обрабатываем — должно быть развёрнуто в >= и <= на уровне SQL

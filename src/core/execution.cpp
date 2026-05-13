@@ -177,12 +177,14 @@ void DynamicLibraryExecutor::execute(const std::string& lib_path, ExecutionConte
         ctx->timing_.library_load_ms += elapsedMs(load_start, load_end);
     }
 
+    const double generated_reported_before = ctx ? ctx->timing_.gpu_execute_ms : 0.0;
     const auto exec_start = Clock::now();
     func(ctx);
     const auto exec_end = Clock::now();
-    if (ctx) {
-        ctx->timing_.jit_execute_ms += elapsedMs(exec_start, exec_end);
+    if (ctx && ctx->timing_.gpu_execute_ms <= generated_reported_before) {
+        ctx->timing_.gpu_execute_ms += elapsedMs(exec_start, exec_end);
     }
+    if (ctx) ctx->timing_.jit_execute_ms = ctx->timing_.gpu_execute_ms;
 }
 
 // --- QueryEngine ---
@@ -481,11 +483,11 @@ static std::vector<ResultColumnDesc> inferResultColumns(const OperatorNode* node
         }
         for (const auto& agg_def : agg->aggregates) {
             if (agg_def.isAvg()) {
-                descs.push_back({LogicalType::Float64, 0, true});
+                descs.push_back({LogicalType::Float64, 0, expressionMayBeNullable(agg_def.agg_expr.get(), catalog)});
             } else if (agg_def.isCount()) {
                 descs.push_back({LogicalType::UInt64, 0, false});
             } else {
-                descs.push_back({LogicalType::UInt64, 0, true});
+                descs.push_back({LogicalType::UInt64, 0, expressionMayBeNullable(agg_def.agg_expr.get(), catalog)});
             }
         }
         return descs;
@@ -595,13 +597,13 @@ void QueryEngine::executeQuery(const std::string& sql, ExecutionContext* ctx) {
     ctx->ensureResultValidityCapacity(ctx->expected_result_size_);
 
     // ШАГ 5: Проверка кеша
-    static constexpr const char* kJitAbiVersion = "v20_typed_columnar_nullable_tests";
+    static constexpr const char* kJitAbiVersion = "v26_nullable_finalizer_fetch_metrics";
     std::string query_hash = std::string("query_") + kJitAbiVersion + "_" + std::to_string(std::hash<std::string>{}(sql));
     auto cached_lib = cache_->get(query_hash);
     if (cached_lib.has_value()) {
         // Cache HIT: размер уже рассчитан, буфер подготовлен — просто выполняем
         executor_->execute(cached_lib.value(), ctx);
-        if (ctx) ctx->timing_.total_engine_ms = elapsedMs(engine_start, Clock::now());
+        if (ctx) ctx->timing_.engine_ms = elapsedMs(engine_start, Clock::now());
         return;
     }
 
@@ -623,7 +625,7 @@ void QueryEngine::executeQuery(const std::string& sql, ExecutionContext* ctx) {
 
     // ШАГ 8: Выполнение
     executor_->execute(lib_path, ctx);
-    if (ctx) ctx->timing_.total_engine_ms = elapsedMs(engine_start, Clock::now());
+    if (ctx) ctx->timing_.engine_ms = elapsedMs(engine_start, Clock::now());
 }
 
 } // namespace db

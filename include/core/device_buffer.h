@@ -81,12 +81,16 @@ public:
     }
 
     void copyToHost(std::vector<T>& host_vec, size_t elements_to_copy) {
-        if (elements_to_copy > capacity_) {
-            throw std::runtime_error("copyToHost: elements_to_copy exceeds buffer capacity");
+        copyRangeToHost(host_vec, 0, elements_to_copy);
+    }
+
+    void copyRangeToHost(std::vector<T>& host_vec, size_t offset, size_t elements_to_copy) {
+        if (offset > capacity_ || elements_to_copy > capacity_ - offset) {
+            throw std::runtime_error("copyRangeToHost: requested range exceeds buffer capacity");
         }
         host_vec.resize(elements_to_copy);
         if (elements_to_copy > 0 && d_data_ != nullptr) {
-            q_.copy(d_data_, host_vec.data(), elements_to_copy).wait();
+            q_.copy(d_data_ + offset, host_vec.data(), elements_to_copy).wait();
         }
     }
 

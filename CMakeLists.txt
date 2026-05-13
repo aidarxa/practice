@@ -145,3 +145,8 @@ add_executable(test_nullable_semantics
 target_include_directories(test_nullable_semantics PRIVATE
     "${CMAKE_SOURCE_DIR}/include"
 )
+
+# --- Test target (SQL three-valued logic truth table model) ---
+add_executable(test_sql_3vl
+    test/test_sql_3vl.cpp
+)

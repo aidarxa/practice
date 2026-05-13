@@ -16,6 +16,7 @@ enum class ExprType {
     LITERAL_FLOAT, // вещественный литерал
     OP_AND,        // логическое И
     OP_OR,         // логическое ИЛИ
+    OP_NOT,        // логическое НЕ
     OP_EQ,         // =
     OP_NEQ,        // <>
     OP_LT,         // <

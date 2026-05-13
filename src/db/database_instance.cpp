@@ -1,6 +1,7 @@
 #include "db/database_instance.h"
 #include "core/catalog_cache.h"
 #include "crystal/utils.h"
+#include "core/inline_math.h"
 
 #include <iostream>
 #include <iomanip>
@@ -173,13 +174,19 @@ void DatabaseInstance::loadData() {
 }
 
 QueryResult DatabaseInstance::executeQuery(const std::string& sql) {
+    return executeQuery(sql, QueryFetchOptions{});
+}
+
+QueryResult DatabaseInstance::executeQuery(const std::string& sql, const QueryFetchOptions& fetch_options) {
     // QueryEngine::executeQuery самостоятельно вызовет ensureCapacity и zero
     // на основе рассчитанного expected_result_size_.
     engine_->executeQuery(sql, ctx_.get());
 
-    const auto fetch_start = Clock::now();
-    // Ждём завершения всех GPU операций перед копированием на хост.
+    // Ждём завершения всех GPU операций перед копированием на хост. Обычно generated
+    // function уже сделал q.wait(); если нет, ожидание относится к GPU execution,
+    // а не к объёму результата. Host fetch timing начинается после этого барьера.
     q_.wait();
+    const auto fetch_start = Clock::now();
 
     QueryResult result;
     result.tuple_size = ctx_->tuple_size_ == 0 ? 1 : ctx_->tuple_size_;
@@ -195,14 +202,22 @@ QueryResult DatabaseInstance::executeQuery(const std::string& sql) {
         result.column_u64.resize(ctx_->result_column_count_);
         result.column_f64.resize(ctx_->result_column_count_);
         result.column_validity_bitmap.resize(ctx_->result_column_count_);
-        const size_t rows_to_copy = result.row_count;
+        size_t row_offset = 0;
+        size_t rows_to_copy = result.row_count;
+        if (fetch_options.limit_enabled && fetch_options.row_limit > 0 && result.row_count > fetch_options.row_limit) {
+            row_offset = result.row_count - fetch_options.row_limit;
+            rows_to_copy = fetch_options.row_limit;
+            result.partial_result = true;
+        }
+        result.materialized_row_offset = row_offset;
+        result.materialized_row_count = rows_to_copy;
         const size_t validity_words = (rows_to_copy + 63ULL) / 64ULL;
         for (size_t col = 0; col < ctx_->result_column_count_; ++col) {
             const db::LogicalType type = (col < result.columns.size()) ? result.columns[col].type : db::LogicalType::UInt64;
             if (col < ctx_->result_column_storage_.size()) {
                 const auto& storage = ctx_->result_column_storage_[col];
                 if (type == db::LogicalType::Float64 && storage.f64) {
-                    storage.f64->copyToHost(result.column_f64[col], rows_to_copy);
+                    storage.f64->copyRangeToHost(result.column_f64[col], row_offset, rows_to_copy);
                     result.column_data[col].resize(rows_to_copy);
                     for (size_t r = 0; r < rows_to_copy; ++r) {
                         unsigned long long bits = 0ULL;
@@ -211,32 +226,114 @@ QueryResult DatabaseInstance::executeQuery(const std::string& sql) {
                         result.column_data[col][r] = bits;
                     }
                 } else if (type == db::LogicalType::Int64 && storage.i64) {
-                    storage.i64->copyToHost(result.column_i64[col], rows_to_copy);
+                    storage.i64->copyRangeToHost(result.column_i64[col], row_offset, rows_to_copy);
                     result.column_data[col].resize(rows_to_copy);
                     for (size_t r = 0; r < rows_to_copy; ++r) {
                         result.column_data[col][r] = static_cast<unsigned long long>(result.column_i64[col][r]);
                     }
                 } else if (storage.u64) {
-                    storage.u64->copyToHost(result.column_u64[col], rows_to_copy);
+                    storage.u64->copyRangeToHost(result.column_u64[col], row_offset, rows_to_copy);
                     result.column_data[col].resize(rows_to_copy);
                     for (size_t r = 0; r < rows_to_copy; ++r) {
                         result.column_data[col][r] = static_cast<unsigned long long>(result.column_u64[col][r]);
                     }
                 }
-                if (storage.validity) {
-                    storage.validity->copyToHost(result.column_validity_bitmap[col], validity_words);
+                if (storage.validity && col < result.columns.size() && result.columns[col].nullable) {
+                    if (row_offset == 0) {
+                        storage.validity->copyToHost(result.column_validity_bitmap[col], validity_words);
+                    } else {
+                        // Copy the minimal source bitmap word range and rebase bits to row 0.
+                        const size_t first_word = row_offset >> 6U;
+                        const size_t last_bit = row_offset + rows_to_copy;
+                        const size_t source_words = ((last_bit + 63ULL) >> 6U) - first_word;
+                        std::vector<uint64_t> source_bitmap;
+                        storage.validity->copyRangeToHost(source_bitmap, first_word, source_words);
+                        result.column_validity_bitmap[col].assign(validity_words, 0ULL);
+                        for (size_t r = 0; r < rows_to_copy; ++r) {
+                            const size_t src_row = row_offset + r;
+                            const size_t src_local_bit = src_row - first_word * 64ULL;
+                            const bool valid = ((source_bitmap[src_local_bit >> 6U] >> (src_local_bit & 63U)) & 1ULL) != 0ULL;
+                            if (valid) result.column_validity_bitmap[col][r >> 6U] |= (1ULL << (r & 63U));
+                        }
+                    }
                 }
             }
         }
         result.timing = ctx_->timing_;
         result.timing.host_fetch_ms = elapsedMs(fetch_start, Clock::now());
-        result.timing.gpu_and_host_fetch_ms = result.timing.jit_execute_ms + result.timing.host_fetch_ms;
+        result.timing.gpu_execute_ms = result.timing.gpu_execute_ms == 0.0 ? result.timing.jit_execute_ms : result.timing.gpu_execute_ms;
+        result.timing.jit_execute_ms = result.timing.gpu_execute_ms;
         return result;
     }
 
     // Legacy row-wise path used by hash/group aggregate kernels.
     size_t copy_size = ctx_->expected_result_size_;
     if (copy_size == 0) copy_size = 1; // защита от нулевого размера
+
+    if (!ctx_->result_is_dense_ && ctx_->expected_result_validity_words_ == 0 && result.tuple_size > 1 && copy_size >= result.tuple_size) {
+        // Sparse aggregate buffers are internal GPU state. Do not scan them on the
+        // host to find non-empty buckets. Compact the sparse rows on GPU into a
+        // dense scratch buffer, then copy only the requested display window.
+        const size_t physical_rows = copy_size / result.tuple_size;
+        unsigned long long* d_sparse_values = ctx_->getScratchUInt64Buffer("__sparse_result_values", copy_size);
+        unsigned long long* d_sparse_count = ctx_->getScratchUInt64Buffer("__sparse_result_count", 1);
+        q_.memset(d_sparse_values, 0, copy_size * sizeof(unsigned long long));
+        q_.memset(d_sparse_count, 0, sizeof(unsigned long long));
+
+        unsigned long long* d_source = ctx_->result_buffer_->data();
+        const size_t tuple_size_device = result.tuple_size;
+        q_.submit([&](sycl::handler& h) {
+            h.parallel_for<class CompactSparseAggregateResult>(sycl::range<1>(physical_rows), [=](sycl::id<1> gid) {
+                const unsigned long long row = static_cast<unsigned long long>(gid[0]);
+                const unsigned long long base = row * static_cast<unsigned long long>(tuple_size_device);
+                bool present = false;
+                for (unsigned long long c = 0; c < static_cast<unsigned long long>(tuple_size_device); ++c) {
+                    const unsigned long long idx = base + c;
+                    if (d_source[idx] != 0ULL) {
+                        present = true;
+                        break;
+                    }
+                }
+                if (!present) return;
+                const unsigned long long out_row = db::atomic_fetch_add_ull(d_sparse_count[0], 1ULL);
+                const unsigned long long out_base = out_row * static_cast<unsigned long long>(tuple_size_device);
+                for (unsigned long long c = 0; c < static_cast<unsigned long long>(tuple_size_device); ++c) {
+                    const unsigned long long src_idx = base + c;
+                    const unsigned long long dst_idx = out_base + c;
+                    d_sparse_values[dst_idx] = d_source[src_idx];
+                }
+            });
+        });
+        q_.wait();
+
+        unsigned long long sparse_row_count = 0ULL;
+        q_.memcpy(&sparse_row_count, d_sparse_count, sizeof(unsigned long long)).wait();
+        result.row_count = static_cast<size_t>(sparse_row_count);
+        result.dense_result = true;
+        result.partial_result = false;
+        size_t row_offset = 0;
+        size_t rows_to_copy = result.row_count;
+        if (fetch_options.limit_enabled && fetch_options.row_limit > 0 && result.row_count > fetch_options.row_limit) {
+            row_offset = result.row_count - fetch_options.row_limit;
+            rows_to_copy = fetch_options.row_limit;
+            result.partial_result = true;
+        }
+        result.materialized_row_offset = row_offset;
+        result.materialized_row_count = rows_to_copy;
+        const size_t values_to_copy = rows_to_copy * result.tuple_size;
+        if (values_to_copy != 0) {
+            auto& sparse_value_buffer = ctx_->scratch_u64_buffers_.at("__sparse_result_values");
+            sparse_value_buffer->copyRangeToHost(result.data, row_offset * result.tuple_size, values_to_copy);
+        }
+        // Validity for fast sparse SSB aggregates is absent by design: all copied
+        // cells are non-null. Nullable sparse paths use dense/columnar finalization.
+        result.has_cell_validity = false;
+        result.timing = ctx_->timing_;
+        result.timing.host_fetch_ms = elapsedMs(fetch_start, Clock::now());
+        result.timing.gpu_execute_ms = result.timing.gpu_execute_ms == 0.0 ? result.timing.jit_execute_ms : result.timing.gpu_execute_ms;
+        result.timing.jit_execute_ms = result.timing.gpu_execute_ms;
+        return result;
+    }
 
     std::vector<unsigned long long> h_result;
     ctx_->result_buffer_->copyToHost(h_result, copy_size);
@@ -297,7 +394,9 @@ QueryResult DatabaseInstance::executeQuery(const std::string& sql) {
         result.has_columnar_result = true;
     };
 
-    build_columnar_result();
+    // Do not eagerly transpose legacy sparse buffers to columnar host vectors.
+    // Sparse aggregate output is usually small to print but can have a large physical
+    // hash domain; eager transpose was dominating Host result fetch time.
 
     if (ctx_->result_is_dense_) {
         result.row_count = ctx_->result_row_count_;
@@ -329,9 +428,12 @@ QueryResult DatabaseInstance::executeQuery(const std::string& sql) {
         }
         result.row_count = non_empty_rows;
     }
+    result.materialized_row_offset = 0;
+    result.materialized_row_count = result.row_count;
     result.timing = ctx_->timing_;
     result.timing.host_fetch_ms = elapsedMs(fetch_start, Clock::now());
-    result.timing.gpu_and_host_fetch_ms = result.timing.jit_execute_ms + result.timing.host_fetch_ms;
+    result.timing.gpu_execute_ms = result.timing.gpu_execute_ms == 0.0 ? result.timing.jit_execute_ms : result.timing.gpu_execute_ms;
+    result.timing.jit_execute_ms = result.timing.gpu_execute_ms;
     return result;
 }
 

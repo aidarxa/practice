@@ -23,6 +23,7 @@ static void extractTableNamesImpl(const ExprNode* expr,
         }
         case ExprType::OP_AND:
         case ExprType::OP_OR:
+        case ExprType::OP_NOT:
         case ExprType::OP_EQ:
         case ExprType::OP_NEQ:
         case ExprType::OP_LT:

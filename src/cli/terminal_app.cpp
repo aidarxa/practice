@@ -49,22 +49,37 @@ static bool resultCellIsValid(const db::QueryResult& result, size_t value_idx) {
     return ((result.cell_validity_bitmap[word] >> (value_idx & 63U)) & 1ULL) != 0ULL;
 }
 
+static size_t materializedRowIndex(const db::QueryResult& result, size_t row) {
+    if (!result.partial_result) return row;
+    if (row < result.materialized_row_offset) return static_cast<size_t>(-1);
+    const size_t local = row - result.materialized_row_offset;
+    if (local >= result.materialized_row_count) return static_cast<size_t>(-1);
+    return local;
+}
+
 static bool resultColumnCellIsValid(const db::QueryResult& result, size_t row, size_t col) {
+    const size_t local_row = materializedRowIndex(result, row);
+    if (local_row == static_cast<size_t>(-1)) return false;
+    if (col < result.columns.size() && !result.columns[col].nullable) {
+        return true;
+    }
     if (!result.has_columnar_result || col >= result.column_validity_bitmap.size()) {
-        return resultCellIsValid(result, row * result.tuple_size + col);
+        return resultCellIsValid(result, local_row * result.tuple_size + col);
     }
     const auto& bitmap = result.column_validity_bitmap[col];
     if (bitmap.empty()) return true;
-    const size_t word = row >> 6U;
+    const size_t word = local_row >> 6U;
     if (word >= bitmap.size()) return false;
-    return ((bitmap[word] >> (row & 63U)) & 1ULL) != 0ULL;
+    return ((bitmap[word] >> (local_row & 63U)) & 1ULL) != 0ULL;
 }
 
 static unsigned long long resultCellRaw(const db::QueryResult& result, size_t row, size_t col) {
-    if (result.has_columnar_result && col < result.column_data.size() && row < result.column_data[col].size()) {
-        return result.column_data[col][row];
+    const size_t local_row = materializedRowIndex(result, row);
+    if (local_row == static_cast<size_t>(-1)) return 0ULL;
+    if (result.has_columnar_result && col < result.column_data.size() && local_row < result.column_data[col].size()) {
+        return result.column_data[col][local_row];
     }
-    return result.data[row * result.tuple_size + col];
+    return result.data[local_row * result.tuple_size + col];
 }
 
 std::string formatResultValue(unsigned long long raw,
@@ -90,17 +105,20 @@ std::string formatResultCell(const db::QueryResult& result, size_t row, size_t c
     const auto type = (col < result.columns.size()) ? result.columns[col].type : db::LogicalType::UInt64;
     std::ostringstream oss;
     if (type == db::LogicalType::Float64) {
-        if (col < result.column_f64.size() && row < result.column_f64[col].size()) {
-            oss << std::setprecision(15) << result.column_f64[col][row];
+        const size_t local_row = materializedRowIndex(result, row);
+        if (col < result.column_f64.size() && local_row < result.column_f64[col].size()) {
+            oss << std::setprecision(15) << result.column_f64[col][local_row];
             return oss.str();
         }
     } else if (type == db::LogicalType::Int64) {
-        if (col < result.column_i64.size() && row < result.column_i64[col].size()) {
-            return std::to_string(result.column_i64[col][row]);
+        const size_t local_row = materializedRowIndex(result, row);
+        if (col < result.column_i64.size() && local_row < result.column_i64[col].size()) {
+            return std::to_string(result.column_i64[col][local_row]);
         }
     } else {
-        if (col < result.column_u64.size() && row < result.column_u64[col].size()) {
-            return std::to_string(result.column_u64[col][row]);
+        const size_t local_row = materializedRowIndex(result, row);
+        if (col < result.column_u64.size() && local_row < result.column_u64[col].size()) {
+            return std::to_string(result.column_u64[col][local_row]);
         }
     }
     return formatResultValue(resultCellRaw(result, row, col), result.columns, col, valid);
@@ -195,10 +213,20 @@ void TerminalApp::executeQuery(const std::string& sql) {
             }
         } else {
             // Выполняем реальный запрос
-            auto query_result = db_->executeQuery(sql);
+            db::QueryFetchOptions fetch_options;
+            fetch_options.limit_enabled = ctx_.output_row_limit_enabled;
+            fetch_options.row_limit = ctx_.output_row_limit;
+            auto query_result = db_->executeQuery(sql, fetch_options);
             const std::vector<unsigned long long>& result = query_result.data;
             size_t tuple_size = query_result.tuple_size;
             const auto& columns = query_result.columns;
+
+            auto sparse_cell_valid = [&](size_t value_idx) -> bool {
+                if (!query_result.has_cell_validity || query_result.cell_validity_bitmap.empty()) return false;
+                const size_t word = value_idx >> 6U;
+                if (word >= query_result.cell_validity_bitmap.size()) return false;
+                return ((query_result.cell_validity_bitmap[word] >> (value_idx & 63U)) & 1ULL) != 0ULL;
+            };
 
             auto is_non_empty_tuple = [&](size_t row) -> bool {
                 if (query_result.dense_result) return row < query_result.row_count;
@@ -207,7 +235,7 @@ void TerminalApp::executeQuery(const std::string& sql) {
                 if (base + tuple_size > result.size()) return false;
                 for (size_t j = 0; j < tuple_size; ++j) {
                     const size_t value_idx = base + j;
-                    if (result[value_idx] != 0ULL || resultCellIsValid(query_result, value_idx)) return true;
+                    if (result[value_idx] != 0ULL || sparse_cell_valid(value_idx)) return true;
                 }
                 return false;
             };
@@ -254,15 +282,13 @@ void TerminalApp::executeQuery(const std::string& sql) {
             if (ctx_.output_row_limit_enabled && query_result.row_count > ctx_.output_row_limit) {
                 std::cout << "Rows shown: " << rows_to_print.size() << "\n";
             }
-            printTimingLine("GPU execution + host fetch time", query_result.timing.gpu_and_host_fetch_ms);
+            printTimingLine("GPU execution time", query_result.timing.gpu_execute_ms);
             if (ctx_.extended_timing) {
                 printTimingLine("Code generation time", query_result.timing.codegen_ms);
                 printTimingLine("ACPP compilation time", query_result.timing.compile_ms);
-                printTimingLine("Library load + execution start time", query_result.timing.library_load_ms);
-                printTimingLine("Generated function execution time", query_result.timing.jit_execute_ms);
-                printTimingLine("Host result fetch time", query_result.timing.host_fetch_ms);
-                printTimingLine("Engine processing time", query_result.timing.total_engine_ms);
-                printTimingLine("Total query processing time", elapsedMs(total_start, Clock::now()));
+                printTimingLine("Library load time", query_result.timing.library_load_ms);
+                printTimingLine("Result materialization/fetch time", query_result.timing.host_fetch_ms);
+                printTimingLine("Engine processing time", query_result.timing.engine_ms);
             }
             std::cout << "--- End ---\n";
         }
