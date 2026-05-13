@@ -80,6 +80,7 @@ struct QueryResult {
 
     size_t tuple_size = 1;
     std::vector<ResultColumnDesc> columns;
+    std::vector<std::string> column_names;
 
     // Number of logical rows returned by the query. This is not necessarily
     // data.size() / tuple_size for sparse hash-aggregate result buffers where
@@ -135,6 +136,7 @@ struct ExecutionContext {
     std::unordered_map<std::string, uint64_t*> null_bitmaps_;
     size_t tuple_size_ = 1;
     std::vector<ResultColumnDesc> result_columns_;
+    std::vector<std::string> result_column_names_;
     size_t result_row_count_{0};
     bool result_is_dense_{false};
     bool result_is_columnar_{false};

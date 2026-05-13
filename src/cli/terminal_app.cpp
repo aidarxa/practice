@@ -261,6 +261,15 @@ void TerminalApp::executeQuery(const std::string& sql) {
             }
 
             std::cout << "--- Result ---\n";
+            if (!query_result.column_names.empty()) {
+                std::cout << "Columns: ";
+                const size_t width = tuple_size == 0 ? query_result.column_names.size() : std::min(tuple_size, query_result.column_names.size());
+                for (size_t j = 0; j < width; ++j) {
+                    std::cout << query_result.column_names[j];
+                    if (j + 1 < width) std::cout << " | ";
+                }
+                std::cout << "\n";
+            }
             if (rows_to_print.empty()) {
                 std::cout << "0\n";
             } else {

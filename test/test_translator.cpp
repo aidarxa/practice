@@ -464,6 +464,155 @@ static void test_translator_print_q21() {
     std::cout << "Test 10: PASSED (visual)\n";
 }
 
+
+// ============================================================================
+// Test 11: QueryTranslator — table/column aliases + HAVING
+// ============================================================================
+static void test_translator_aliases_and_having() {
+    std::cout << "Test 11: Translator table aliases, column aliases, HAVING... ";
+
+    std::string sql =
+        "SELECT d.d_year AS order_year, SUM(lo.lo_revenue) AS revenue "
+        "FROM lineorder lo, ddate d "
+        "WHERE lo.lo_orderdate = d.d_datekey "
+        "GROUP BY d.d_year "
+        "HAVING revenue > 1000000000000 "
+        "ORDER BY revenue DESC "
+        "LIMIT 5";
+
+    hsql::SQLParserResult result;
+    auto* ast = parseSQL(sql, result);
+    assert(ast != nullptr && "SQL parse failed");
+
+    QueryTranslator translator;
+    auto root = translator.translate(ast);
+    assert(root != nullptr);
+    assert(root->getType() == OperatorType::SORT_LIMIT);
+
+    auto* sort = static_cast<SortLimitNode*>(root.get());
+    assert(sort->has_limit);
+    assert(sort->limit == 5);
+    assert(sort->sort_keys.size() == 1);
+    assert(sort->sort_keys[0].column_index == 1);
+    assert(sort->sort_keys[0].descending);
+    assert(sort->getChildren().size() == 1);
+    assert(sort->getChildren()[0]->getType() == OperatorType::AGGREGATE);
+
+    auto* agg = static_cast<AggregateNode*>(sort->getChildren()[0].get());
+    assert(agg->group_by_exprs.size() == 1);
+    assert(agg->aggregates.size() == 1);
+    assert(agg->having_predicate != nullptr);
+    assert(agg->output_aliases.size() == 2);
+    assert(agg->output_aliases[0] == "order_year");
+    assert(agg->output_aliases[1] == "revenue");
+
+    auto* group_col = static_cast<ColumnRefExpr*>(agg->group_by_exprs[0].get());
+    assert(group_col->table_name == "DDATE");
+    assert(group_col->column_name == "d_year");
+
+    auto* agg_col = static_cast<ColumnRefExpr*>(agg->aggregates[0].agg_expr.get());
+    assert(agg_col->table_name == "LINEORDER");
+    assert(agg_col->column_name == "lo_revenue");
+
+    std::cout << "PASSED\n";
+}
+
+// ============================================================================
+// Test 12: QueryTranslator — projection alias used by ORDER BY
+// ============================================================================
+static void test_translator_projection_alias_order_by() {
+    std::cout << "Test 12: Translator projection alias in ORDER BY... ";
+
+    std::string sql =
+        "SELECT lo.lo_orderdate AS orderdate "
+        "FROM lineorder lo "
+        "ORDER BY orderdate "
+        "LIMIT 3";
+
+    hsql::SQLParserResult result;
+    auto* ast = parseSQL(sql, result);
+    assert(ast != nullptr && "SQL parse failed");
+
+    QueryTranslator translator;
+    auto root = translator.translate(ast);
+    assert(root != nullptr);
+    assert(root->getType() == OperatorType::SORT_LIMIT);
+
+    auto* sort = static_cast<SortLimitNode*>(root.get());
+    assert(sort->has_limit);
+    assert(sort->limit == 3);
+    assert(sort->sort_keys.size() == 1);
+    assert(sort->sort_keys[0].column_index == 0);
+    assert(!sort->sort_keys[0].descending);
+    assert(sort->getChildren().size() == 1);
+    assert(sort->getChildren()[0]->getType() == OperatorType::PROJECTION);
+
+    auto* projection = static_cast<ProjectionNode*>(sort->getChildren()[0].get());
+    assert(projection->select_exprs.size() == 1);
+    assert(projection->output_aliases.size() == 1);
+    assert(projection->output_aliases[0] == "orderdate");
+
+    auto* col = static_cast<ColumnRefExpr*>(projection->select_exprs[0].get());
+    assert(col->table_name == "LINEORDER");
+    assert(col->column_name == "lo_orderdate");
+
+    assert(projection->getChildren().size() == 1);
+    assert(projection->getChildren()[0]->getType() == OperatorType::TABLE_SCAN);
+    auto* scan = static_cast<TableScanNode*>(projection->getChildren()[0].get());
+    assert(scan->table_name == "LINEORDER");
+    assert(scan->table_alias == "LO");
+
+    std::cout << "PASSED\n";
+}
+
+
+// ============================================================================
+// Test 13: QueryTranslator — native SQL CASE expression
+// ============================================================================
+static void test_translator_case_when_scalar() {
+    std::cout << "Test 13: Translator native SQL CASE expression... ";
+
+    std::string sql =
+        "SELECT CASE WHEN lo_quantity < 10 THEN 0 WHEN lo_quantity < 25 THEN 1 ELSE 2 END AS bucket, "
+        "SUM(CASE WHEN lo_quantity < 25 THEN lo_revenue ELSE 0 END) AS bucket_revenue "
+        "FROM lineorder "
+        "GROUP BY CASE WHEN lo_quantity < 10 THEN 0 WHEN lo_quantity < 25 THEN 1 ELSE 2 END "
+        "ORDER BY bucket_revenue DESC "
+        "LIMIT 2";
+
+    hsql::SQLParserResult result;
+    auto* ast = parseSQL(sql, result);
+    assert(ast != nullptr && "SQL parse failed");
+
+    QueryTranslator translator;
+    auto root = translator.translate(ast);
+    assert(root != nullptr);
+    assert(root->getType() == OperatorType::SORT_LIMIT);
+
+    auto* sort = static_cast<SortLimitNode*>(root.get());
+    assert(sort->has_limit);
+    assert(sort->limit == 2);
+    assert(sort->sort_keys.size() == 1);
+    assert(sort->sort_keys[0].column_index == 1);
+    assert(sort->sort_keys[0].descending);
+    assert(sort->getChildren().size() == 1);
+    assert(sort->getChildren()[0]->getType() == OperatorType::AGGREGATE);
+
+    auto* agg = static_cast<AggregateNode*>(sort->getChildren()[0].get());
+    assert(agg->group_by_exprs.size() == 1);
+    assert(agg->group_by_exprs[0]->getType() == ExprType::CASE_WHEN);
+    auto* outer_case = static_cast<CaseWhenExpr*>(agg->group_by_exprs[0].get());
+    assert(outer_case->else_expr->getType() == ExprType::CASE_WHEN);
+    assert(agg->aggregates.size() == 1);
+    assert(agg->aggregates[0].agg_expr != nullptr);
+    assert(agg->aggregates[0].agg_expr->getType() == ExprType::CASE_WHEN);
+    assert(agg->output_aliases.size() == 2);
+    assert(agg->output_aliases[0] == "bucket");
+    assert(agg->output_aliases[1] == "bucket_revenue");
+
+    std::cout << "PASSED\n";
+}
+
 // ============================================================================
 int main() {
     std::cout << "=== test_translator.cpp ===\n\n";
@@ -478,6 +627,9 @@ int main() {
     test_translator_float_literal();
     test_expr_clone_independence();
     test_translator_print_q21();
+    test_translator_aliases_and_having();
+    test_translator_projection_alias_order_by();
+    test_translator_case_when_scalar();
 
     std::cout << "\nAll tests passed!\n";
     return 0;

@@ -32,6 +32,15 @@ bool MetaCommandHandler::handle(const std::string& command, SessionContext& ctx)
         return false;
     }
 
+    // --- Raw marker echo for benchmark/session tooling ---
+    if (cmd == "\\echo") {
+        std::string rest;
+        std::getline(iss, rest);
+        if (!rest.empty() && rest.front() == ' ') rest.erase(rest.begin());
+        std::cout << rest << "\n";
+        return false;
+    }
+
     // --- AST echo ---
     if (cmd == "\\ast") {
         std::string arg;

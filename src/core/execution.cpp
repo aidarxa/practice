@@ -5,7 +5,9 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cctype>
 #include <cstdlib>
+#include <cstring>
 #include <dlfcn.h>
 #include <filesystem>
 #include <fstream>
@@ -427,6 +429,16 @@ static LogicalType expressionResultType(const ExprNode* expr) {
             return LogicalType::UInt64;
         case ExprType::LITERAL_FLOAT:
             return LogicalType::Float64;
+        case ExprType::LITERAL_NULL:
+            return LogicalType::UInt64;
+        case ExprType::CASE_WHEN: {
+            const auto* c = static_cast<const CaseWhenExpr*>(expr);
+            const auto then_type = expressionResultType(c->then_expr.get());
+            const auto else_type = expressionResultType(c->else_expr.get());
+            if (then_type == LogicalType::Float64 || else_type == LogicalType::Float64) return LogicalType::Float64;
+            if (then_type == LogicalType::Int64 || else_type == LogicalType::Int64) return LogicalType::Int64;
+            return LogicalType::UInt64;
+        }
         default:
             return LogicalType::Int64;
     }
@@ -435,6 +447,8 @@ static LogicalType expressionResultType(const ExprNode* expr) {
 static bool expressionMayBeNullable(const ExprNode* expr, const Catalog& catalog) {
     if (!expr) return true;
     switch (expr->getType()) {
+        case ExprType::LITERAL_NULL:
+            return true;
         case ExprType::STAR:
         case ExprType::LITERAL_INT:
         case ExprType::LITERAL_FLOAT:
@@ -467,6 +481,11 @@ static bool expressionMayBeNullable(const ExprNode* expr, const Catalog& catalog
         case ExprType::OP_IS_NULL:
         case ExprType::OP_IS_NOT_NULL:
             return false;
+        case ExprType::CASE_WHEN: {
+            const auto* c = static_cast<const CaseWhenExpr*>(expr);
+            return expressionMayBeNullable(c->then_expr.get(), catalog) ||
+                   expressionMayBeNullable(c->else_expr.get(), catalog);
+        }
         default:
             return true;
     }
@@ -514,6 +533,80 @@ static std::vector<ResultColumnDesc> inferResultColumns(const OperatorNode* node
     }
     return descs;
 }
+
+
+static std::string defaultExpressionColumnName(const ExprNode* expr) {
+    if (!expr) return "expr";
+    switch (expr->getType()) {
+        case ExprType::COLUMN_REF:
+            return static_cast<const ColumnRefExpr*>(expr)->column_name;
+        case ExprType::STAR:
+            return "*";
+        case ExprType::CASE_WHEN:
+            return "case_when";
+        case ExprType::LITERAL_INT:
+        case ExprType::LITERAL_FLOAT:
+            return "literal";
+        case ExprType::LITERAL_NULL:
+            return "NULL";
+        default:
+            return "expr";
+    }
+}
+
+static std::vector<std::string> inferResultColumnNames(const OperatorNode* node,
+                                                       const Catalog& catalog) {
+    std::vector<std::string> names;
+    if (!node) return names;
+
+    if (const auto* agg = findAggregateNode(node)) {
+        for (std::size_t i = 0; i < agg->group_by_exprs.size(); ++i) {
+            std::string name;
+            if (i < agg->output_aliases.size()) name = agg->output_aliases[i];
+            if (name.empty()) name = defaultExpressionColumnName(agg->group_by_exprs[i].get());
+            names.push_back(name);
+        }
+        for (std::size_t i = 0; i < agg->aggregates.size(); ++i) {
+            const std::size_t slot = agg->group_by_exprs.size() + i;
+            std::string name;
+            if (slot < agg->output_aliases.size()) name = agg->output_aliases[slot];
+            if (name.empty()) name = agg->aggregates[i].func_name;
+            names.push_back(name);
+        }
+        return names;
+    }
+
+    if (const auto* proj = findProjectionNode(node)) {
+        std::vector<const TableScanNode*> scans;
+        if (!proj->getChildren().empty()) {
+            collectTableScansForResultLayout(proj->getChildren()[0].get(), scans);
+        }
+        std::size_t visible_idx = 0;
+        for (std::size_t expr_idx = 0; expr_idx < proj->select_exprs.size(); ++expr_idx) {
+            const auto& expr = proj->select_exprs[expr_idx];
+            if (!expr) continue;
+            if (expr->getType() == ExprType::STAR) {
+                for (const auto* scan : scans) {
+                    const auto& meta = catalog.getTableMetadata(scan->table_name);
+                    for (const auto& col_name : meta.getColumnNames()) {
+                        names.push_back(col_name);
+                        ++visible_idx;
+                    }
+                }
+                continue;
+            }
+            std::string name;
+            if (expr_idx < proj->output_aliases.size()) name = proj->output_aliases[expr_idx];
+            if (name.empty()) name = defaultExpressionColumnName(expr.get());
+            names.push_back(name);
+            ++visible_idx;
+        }
+        return names;
+    }
+    return names;
+}
+
+
 
 // Парсинг SQL → SelectStatement. Бросает runtime_error при ошибке.
 static hsql::SelectStatement* parseSql(const std::string& sql,
@@ -585,6 +678,7 @@ void QueryEngine::executeQuery(const std::string& sql, ExecutionContext* ctx) {
     }
 
     ctx->result_columns_ = inferResultColumns(optimized_tree.get(), *catalog_);
+    ctx->result_column_names_ = inferResultColumnNames(optimized_tree.get(), *catalog_);
     ctx->resetResultShapeFlags();
     ctx->result_is_dense_ = findProjectionNode(optimized_tree.get()) != nullptr;
 
@@ -597,7 +691,7 @@ void QueryEngine::executeQuery(const std::string& sql, ExecutionContext* ctx) {
     ctx->ensureResultValidityCapacity(ctx->expected_result_size_);
 
     // ШАГ 5: Проверка кеша
-    static constexpr const char* kJitAbiVersion = "v26_nullable_finalizer_fetch_metrics";
+    static constexpr const char* kJitAbiVersion = "v27_p1_case_alias_having";
     std::string query_hash = std::string("query_") + kJitAbiVersion + "_" + std::to_string(std::hash<std::string>{}(sql));
     auto cached_lib = cache_->get(query_hash);
     if (cached_lib.has_value()) {

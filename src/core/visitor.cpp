@@ -51,6 +51,7 @@ static const char* exprTypeName(ExprType t) {
         case ExprType::COLUMN_REF:    return "COLUMN_REF";
         case ExprType::LITERAL_INT:   return "LITERAL_INT";
         case ExprType::LITERAL_FLOAT: return "LITERAL_FLOAT";
+        case ExprType::LITERAL_NULL:  return "LITERAL_NULL";
         case ExprType::OP_AND:        return "OP_AND";
         case ExprType::OP_OR:         return "OP_OR";
         case ExprType::OP_NOT:        return "OP_NOT";
@@ -66,6 +67,7 @@ static const char* exprTypeName(ExprType t) {
         case ExprType::OP_DIV:        return "OP_DIV";
         case ExprType::OP_IS_NULL:    return "OP_IS_NULL";
         case ExprType::OP_IS_NOT_NULL:return "OP_IS_NOT_NULL";
+        case ExprType::CASE_WHEN:     return "CASE_WHEN";
         case ExprType::STAR:          return "STAR";
         default:                      return "UNKNOWN_EXPR_TYPE";
     }
@@ -89,6 +91,16 @@ static LogicalType resultLogicalTypeForExpr(const ExprNode* expr) {
             return LogicalType::UInt64;
         case ExprType::LITERAL_FLOAT:
             return LogicalType::Float64;
+        case ExprType::LITERAL_NULL:
+            return LogicalType::UInt64;
+        case ExprType::CASE_WHEN: {
+            const auto* c = static_cast<const CaseWhenExpr*>(expr);
+            const auto then_type = resultLogicalTypeForExpr(c->then_expr.get());
+            const auto else_type = resultLogicalTypeForExpr(c->else_expr.get());
+            if (then_type == LogicalType::Float64 || else_type == LogicalType::Float64) return LogicalType::Float64;
+            if (then_type == LogicalType::Int64 || else_type == LogicalType::Int64) return LogicalType::Int64;
+            return LogicalType::UInt64;
+        }
         default:
             return LogicalType::Int64;
     }
@@ -116,6 +128,8 @@ static bool catalogColumnNullable(const Catalog& catalog, const std::string& col
 static bool resultColumnNullableForExpr(const ExprNode* expr, const Catalog& catalog) {
     if (!expr) return true;
     switch (expr->getType()) {
+        case ExprType::LITERAL_NULL:
+            return true;
         case ExprType::STAR:
         case ExprType::LITERAL_INT:
         case ExprType::LITERAL_FLOAT:
@@ -144,6 +158,11 @@ static bool resultColumnNullableForExpr(const ExprNode* expr, const Catalog& cat
         case ExprType::OP_GTE: {
             const auto* b = static_cast<const BinaryExpr*>(expr);
             return resultColumnNullableForExpr(b->left.get(), catalog) || resultColumnNullableForExpr(b->right.get(), catalog);
+        }
+        case ExprType::CASE_WHEN: {
+            const auto* c = static_cast<const CaseWhenExpr*>(expr);
+            return resultColumnNullableForExpr(c->then_expr.get(), catalog) ||
+                   resultColumnNullableForExpr(c->else_expr.get(), catalog);
         }
         default:
             return true;
@@ -190,6 +209,272 @@ static std::string castToResultColumnType(const std::string& value, LogicalType 
         case LogicalType::UInt64:  return "static_cast<std::uint64_t>(" + value + ")";
     }
     return "static_cast<std::uint64_t>(" + value + ")";
+}
+
+static std::string resultColumnValueByteSizeExpr(LogicalType type) {
+    switch (type) {
+        case LogicalType::Float64: return "sizeof(double)";
+        case LogicalType::Int64:   return "sizeof(std::int64_t)";
+        case LogicalType::UInt64:  return "sizeof(std::uint64_t)";
+    }
+    return "sizeof(std::uint64_t)";
+}
+
+static std::string resultColumnReadExpr(int col, const std::string& row_expr, LogicalType type) {
+    switch (type) {
+        case LogicalType::Float64: return "d_result_col_" + std::to_string(col) + "[" + row_expr + "]";
+        case LogicalType::Int64:   return "d_result_col_" + std::to_string(col) + "[" + row_expr + "]";
+        case LogicalType::UInt64:  return "d_result_col_" + std::to_string(col) + "[" + row_expr + "]";
+    }
+    return "d_result_col_" + std::to_string(col) + "[" + row_expr + "]";
+}
+
+static void collectSortTableScans(const OperatorNode* node, std::vector<const TableScanNode*>& out) {
+    if (!node) return;
+    if (node->getType() == OperatorType::TABLE_SCAN) {
+        out.push_back(static_cast<const TableScanNode*>(node));
+    }
+    for (const auto& child : node->getChildren()) collectSortTableScans(child.get(), out);
+}
+
+static void appendProjectionLayoutForSort(const ProjectionNode* proj,
+                                          const Catalog& catalog,
+                                          std::vector<LogicalType>& types,
+                                          std::vector<bool>& nullable) {
+    std::vector<const TableScanNode*> scans;
+    if (proj && !proj->getChildren().empty()) collectSortTableScans(proj->getChildren()[0].get(), scans);
+    if (!proj) return;
+    for (const auto& expr : proj->select_exprs) {
+        if (!expr) continue;
+        if (expr->getType() == ExprType::STAR) {
+            for (const auto* scan : scans) {
+                const auto& meta = catalog.getTableMetadata(scan->table_name);
+                for (const auto& col_name : meta.getColumnNames()) {
+                    types.push_back(LogicalType::Int64);
+                    nullable.push_back(meta.isColumnNullable(col_name));
+                }
+            }
+        } else {
+            types.push_back(resultLogicalTypeForExpr(expr.get()));
+            nullable.push_back(resultColumnNullableForExpr(expr.get(), catalog));
+        }
+    }
+}
+
+static void appendAggregateLayoutForSort(const AggregateNode* agg,
+                                         const Catalog& catalog,
+                                         std::vector<LogicalType>& types,
+                                         std::vector<bool>& nullable) {
+    if (!agg) return;
+    const int visible = static_cast<int>(agg->visibleTupleSize());
+    for (int col = 0; col < visible; ++col) {
+        types.push_back(resultLogicalTypeForAggregateOutput(agg, col));
+        nullable.push_back(resultColumnNullableForAggregateOutput(agg, col, catalog));
+    }
+}
+
+static void collectResultLayoutForSort(const OperatorNode* node,
+                                       const Catalog& catalog,
+                                       std::vector<LogicalType>& types,
+                                       std::vector<bool>& nullable) {
+    if (!node) return;
+    if (node->getType() == OperatorType::PROJECTION) {
+        appendProjectionLayoutForSort(static_cast<const ProjectionNode*>(node), catalog, types, nullable);
+        return;
+    }
+    if (node->getType() == OperatorType::AGGREGATE) {
+        appendAggregateLayoutForSort(static_cast<const AggregateNode*>(node), catalog, types, nullable);
+        return;
+    }
+    for (const auto& child : node->getChildren()) {
+        collectResultLayoutForSort(child.get(), catalog, types, nullable);
+        if (!types.empty()) return;
+    }
+}
+
+static void registerSortLimitKernelClasses(JITContext& ctx, int tuple_size) {
+    auto add = [&](const std::string& name) {
+        if (std::find(ctx.kernel_class_names.begin(), ctx.kernel_class_names.end(), name) == ctx.kernel_class_names.end()) {
+            ctx.kernel_class_names.push_back(name);
+        }
+    };
+    add("SortLimitInitIndices");
+    add("SortLimitBitonicSort");
+    for (int col = 0; col < tuple_size; ++col) add("SortLimitReorderCol" + std::to_string(col));
+}
+
+static void emitRightBeforeLeftComparison(std::stringstream& out,
+                                          const std::vector<LogicalType>& result_types,
+                                          const std::vector<bool>& nullable,
+                                          const std::vector<SortKeyDef>& sort_keys,
+                                          const std::string& left_idx,
+                                          const std::string& right_idx,
+                                          const std::string& output_var,
+                                          const std::string& indent) {
+    out << indent << output_var << " = false;\n";
+    out << indent << "if (" << right_idx << " != " << left_idx << ") {\n";
+    out << indent << "    if (" << right_idx << " == sort_invalid_idx) {\n";
+    out << indent << "        " << output_var << " = false;\n";
+    out << indent << "    } else if (" << left_idx << " == sort_invalid_idx) {\n";
+    out << indent << "        " << output_var << " = true;\n";
+    out << indent << "    } else {\n";
+    out << indent << "        bool sort_decided = false;\n";
+    for (std::size_t k = 0; k < sort_keys.size(); ++k) {
+        const auto& key = sort_keys[k];
+        const int col = static_cast<int>(key.column_index);
+        const LogicalType type = (col >= 0 && col < static_cast<int>(result_types.size())) ? result_types[static_cast<std::size_t>(col)] : LogicalType::UInt64;
+        const bool is_nullable = (col >= 0 && col < static_cast<int>(nullable.size())) ? nullable[static_cast<std::size_t>(col)] : true;
+        if (is_nullable) {
+            out << indent << "        if (!sort_decided) {\n";
+            out << indent << "            const bool sort_left_valid_" << k << " = db::bitmap_valid_at(d_result_validity_col_" << col << ", " << left_idx << ");\n";
+            out << indent << "            const bool sort_right_valid_" << k << " = db::bitmap_valid_at(d_result_validity_col_" << col << ", " << right_idx << ");\n";
+            out << indent << "            if (sort_left_valid_" << k << " != sort_right_valid_" << k << ") {\n";
+            out << indent << "                " << output_var << " = sort_right_valid_" << k << ";\n";
+            out << indent << "                sort_decided = true;\n";
+            out << indent << "            } else if (sort_left_valid_" << k << ") {\n";
+        } else {
+            out << indent << "        if (!sort_decided) {\n";
+            out << indent << "            {\n";
+        }
+        out << indent << "                auto sort_left_value_" << k << " = " << resultColumnReadExpr(col, left_idx, type) << ";\n";
+        out << indent << "                auto sort_right_value_" << k << " = " << resultColumnReadExpr(col, right_idx, type) << ";\n";
+        out << indent << "                if (sort_right_value_" << k << " < sort_left_value_" << k << ") {\n";
+        out << indent << "                    " << output_var << " = " << (key.descending ? "false" : "true") << ";\n";
+        out << indent << "                    sort_decided = true;\n";
+        out << indent << "                } else if (sort_left_value_" << k << " < sort_right_value_" << k << ") {\n";
+        out << indent << "                    " << output_var << " = " << (key.descending ? "true" : "false") << ";\n";
+        out << indent << "                    sort_decided = true;\n";
+        out << indent << "                }\n";
+        if (is_nullable) {
+            out << indent << "            }\n";
+            out << indent << "        }\n";
+        } else {
+            out << indent << "            }\n";
+            out << indent << "        }\n";
+        }
+    }
+    out << indent << "        if (!sort_decided) " << output_var << " = (" << right_idx << " < " << left_idx << ");\n";
+    out << indent << "    }\n";
+    out << indent << "}\n";
+}
+
+static void emitSortLimitPostExecution(const SortLimitNode* node,
+                                       JITContext& ctx,
+                                       const Catalog& catalog) {
+    if (!node) return;
+    std::vector<LogicalType> result_types;
+    std::vector<bool> nullable;
+    if (!node->getChildren().empty()) {
+        collectResultLayoutForSort(node->getChildren()[0].get(), catalog, result_types, nullable);
+    }
+    int tuple_size = static_cast<int>(result_types.empty() ? static_cast<std::size_t>(ctx.tuple_size) : result_types.size());
+    if (tuple_size <= 0) tuple_size = 1;
+    while (static_cast<int>(result_types.size()) < tuple_size) result_types.push_back(LogicalType::UInt64);
+    while (static_cast<int>(nullable.size()) < tuple_size) nullable.push_back(true);
+
+    for (const auto& key : node->sort_keys) {
+        if (key.column_index >= static_cast<std::size_t>(tuple_size)) {
+            throw std::runtime_error("ORDER BY key index exceeds generated result width");
+        }
+    }
+
+    ctx.tuple_size = tuple_size;
+
+    std::stringstream& out = ctx.post_execution_code;
+    out << "    {\n";
+    out << "        const std::size_t sort_input_rows = ctx->result_row_count_;\n";
+    if (node->has_limit) {
+        out << "        const std::size_t sort_output_rows = sort_input_rows < " << node->limit << "ULL ? sort_input_rows : " << node->limit << "ULL;\n";
+    } else {
+        out << "        const std::size_t sort_output_rows = sort_input_rows;\n";
+    }
+    if (node->sort_keys.empty()) {
+        out << "        ctx->result_row_count_ = sort_output_rows;\n";
+        out << "        ctx->result_is_dense_ = true;\n";
+        out << "        ctx->expected_result_size_ = sort_output_rows == 0 ? static_cast<std::size_t>(" << tuple_size << ") : sort_output_rows * static_cast<std::size_t>(" << tuple_size << ");\n";
+        out << "    }\n\n";
+        return;
+    }
+
+    registerSortLimitKernelClasses(ctx, tuple_size);
+    out << "        if (sort_input_rows > 1) {\n";
+    out << "            std::uint64_t sort_padded_rows = 1ULL;\n";
+    out << "            while (sort_padded_rows < static_cast<std::uint64_t>(sort_input_rows)) {\n";
+    out << "                if (sort_padded_rows > (std::numeric_limits<std::uint64_t>::max() >> 1)) throw std::overflow_error(\"ORDER BY padded row count overflow\");\n";
+    out << "                sort_padded_rows <<= 1ULL;\n";
+    out << "            }\n";
+    out << "            const std::uint64_t sort_invalid_idx = std::numeric_limits<std::uint64_t>::max();\n";
+    out << "            std::uint64_t* d_sort_indices = sycl::malloc_device<std::uint64_t>(static_cast<std::size_t>(sort_padded_rows), q);\n";
+    for (int col = 0; col < tuple_size; ++col) {
+        const LogicalType type = result_types[static_cast<std::size_t>(col)];
+        out << "            " << resultColumnPointerType(type) << " d_result_col_" << col << " = ctx->" << resultColumnGetter(type) << "(" << col << ");\n";
+        out << "            std::uint64_t* d_result_validity_col_" << col << " = ctx->getResultColumnValidityPointer(" << col << ");\n";
+    }
+    out << "            q.submit([&](sycl::handler& h) {\n";
+    out << "                h.parallel_for<class SortLimitInitIndices>(sycl::range<1>(static_cast<std::size_t>(sort_padded_rows)), [=](sycl::id<1> gid) {\n";
+    out << "                    const std::uint64_t i = static_cast<std::uint64_t>(gid[0]);\n";
+    out << "                    d_sort_indices[i] = (i < static_cast<std::uint64_t>(sort_input_rows)) ? i : sort_invalid_idx;\n";
+    out << "                });\n";
+    out << "            });\n";
+    out << "            for (std::uint64_t sort_k = 2ULL; sort_k <= sort_padded_rows; sort_k <<= 1ULL) {\n";
+    out << "                for (std::uint64_t sort_j = sort_k >> 1ULL; sort_j > 0ULL; sort_j >>= 1ULL) {\n";
+    out << "                    q.submit([&](sycl::handler& h) {\n";
+    out << "                        h.parallel_for<class SortLimitBitonicSort>(sycl::range<1>(static_cast<std::size_t>(sort_padded_rows)), [=](sycl::id<1> gid) {\n";
+    out << "                            const std::uint64_t sort_i = static_cast<std::uint64_t>(gid[0]);\n";
+    out << "                            const std::uint64_t sort_ixj = sort_i ^ sort_j;\n";
+    out << "                            if (sort_ixj > sort_i) {\n";
+    out << "                                const std::uint64_t sort_left_idx = d_sort_indices[sort_i];\n";
+    out << "                                const std::uint64_t sort_right_idx = d_sort_indices[sort_ixj];\n";
+    out << "                                bool sort_right_before_left = false;\n";
+    emitRightBeforeLeftComparison(out, result_types, nullable, node->sort_keys,
+                                  "sort_left_idx", "sort_right_idx", "sort_right_before_left", "                                ");
+    out << "                                const bool sort_left_before_right = (sort_left_idx != sort_right_idx) && !sort_right_before_left;\n";
+    out << "                                const bool sort_ascending_stage = ((sort_i & sort_k) == 0ULL);\n";
+    out << "                                const bool sort_swap = sort_ascending_stage ? sort_right_before_left : sort_left_before_right;\n";
+    out << "                                if (sort_swap) {\n";
+    out << "                                    d_sort_indices[sort_i] = sort_right_idx;\n";
+    out << "                                    d_sort_indices[sort_ixj] = sort_left_idx;\n";
+    out << "                                }\n";
+    out << "                            }\n";
+    out << "                        });\n";
+    out << "                    });\n";
+    out << "                }\n";
+    out << "            }\n";
+    out << "            const std::size_t sort_validity_words = (sort_output_rows + 63ULL) / 64ULL;\n";
+    out << "            if (sort_output_rows != 0 && sort_output_rows > std::numeric_limits<std::size_t>::max() / static_cast<std::size_t>(" << tuple_size << ")) {\n";
+    out << "                throw std::overflow_error(\"ORDER BY/LIMIT result size overflow\");\n";
+    out << "            }\n";
+    for (int col = 0; col < tuple_size; ++col) {
+        const LogicalType type = result_types[static_cast<std::size_t>(col)];
+        const std::string type_name = resultColumnPointerType(type).substr(0, resultColumnPointerType(type).size() - 1);
+        out << "            " << type_name << "* d_sort_tmp_col_" << col << " = sycl::malloc_device<" << type_name << ">(sort_output_rows == 0 ? 1 : sort_output_rows, q);\n";
+        out << "            std::uint64_t* d_sort_tmp_validity_col_" << col << " = sycl::malloc_device<std::uint64_t>(sort_validity_words == 0 ? 1 : sort_validity_words, q);\n";
+        out << "            q.memset(d_sort_tmp_validity_col_" << col << ", 0, (sort_validity_words == 0 ? 1 : sort_validity_words) * sizeof(std::uint64_t));\n";
+        out << "            q.submit([&](sycl::handler& h) {\n";
+        out << "                h.parallel_for<class SortLimitReorderCol" << col << ">(sycl::range<1>(sort_output_rows), [=](sycl::id<1> gid) {\n";
+        out << "                    const std::uint64_t out_row = static_cast<std::uint64_t>(gid[0]);\n";
+        out << "                    const std::uint64_t src_row = d_sort_indices[out_row];\n";
+        out << "                    if (src_row == sort_invalid_idx) return;\n";
+        out << "                    d_sort_tmp_col_" << col << "[out_row] = d_result_col_" << col << "[src_row];\n";
+        if (nullable[static_cast<std::size_t>(col)]) {
+            out << "                    if (db::bitmap_valid_at(d_result_validity_col_" << col << ", src_row)) db::atomic_set_valid_bit(d_sort_tmp_validity_col_" << col << ", out_row);\n";
+        } else {
+            out << "                    db::atomic_set_valid_bit(d_sort_tmp_validity_col_" << col << ", out_row);\n";
+        }
+        out << "                });\n";
+        out << "            });\n";
+        out << "            if (sort_output_rows != 0) q.memcpy(d_result_col_" << col << ", d_sort_tmp_col_" << col << ", sort_output_rows * " << resultColumnValueByteSizeExpr(type) << ");\n";
+        out << "            q.memcpy(d_result_validity_col_" << col << ", d_sort_tmp_validity_col_" << col << ", (sort_validity_words == 0 ? 1 : sort_validity_words) * sizeof(std::uint64_t));\n";
+        out << "            q.wait();\n";
+        out << "            sycl::free(d_sort_tmp_col_" << col << ", q);\n";
+        out << "            sycl::free(d_sort_tmp_validity_col_" << col << ", q);\n";
+    }
+    out << "            sycl::free(d_sort_indices, q);\n";
+    out << "        }\n";
+    out << "        ctx->result_row_count_ = sort_output_rows;\n";
+    out << "        ctx->result_is_dense_ = true;\n";
+    out << "        ctx->expected_result_size_ = sort_output_rows == 0 ? static_cast<std::size_t>(" << tuple_size << ") : sort_output_rows * static_cast<std::size_t>(" << tuple_size << ");\n";
+    out << "    }\n\n";
 }
 
 static bool isComparisonOp(ExprType t) {
@@ -401,6 +686,13 @@ static void collectExpressionColumns(const ExprNode* e, std::vector<std::string>
         if (std::find(cols.begin(), cols.end(), col->column_name) == cols.end()) cols.push_back(col->column_name);
         return;
     }
+    if (e->getType() == ExprType::CASE_WHEN) {
+        const auto* c = static_cast<const CaseWhenExpr*>(e);
+        collectExpressionColumns(c->condition.get(), cols);
+        collectExpressionColumns(c->then_expr.get(), cols);
+        collectExpressionColumns(c->else_expr.get(), cols);
+        return;
+    }
     if (isBinaryExprType(e->getType())) {
         const auto* b = static_cast<const BinaryExpr*>(e);
         if (b->left) collectExpressionColumns(b->left.get(), cols);
@@ -452,6 +744,8 @@ static std::string expressionValueNoEmit(const ExprNode* e, const JITContext& ct
             return std::to_string(static_cast<const LiteralIntExpr*>(e)->value);
         case ExprType::LITERAL_FLOAT:
             return std::to_string(static_cast<const LiteralFloatExpr*>(e)->value);
+        case ExprType::LITERAL_NULL:
+            return "0";
         case ExprType::STAR:
             return "1";
         case ExprType::OP_ADD:
@@ -510,6 +804,13 @@ static std::string expressionValueNoEmit(const ExprNode* e, const JITContext& ct
             const auto* b = static_cast<const BinaryExpr*>(e);
             return booleanOrValue(expressionValueNoEmit(b->left.get(), ctx), expressionValueNoEmit(b->right.get(), ctx));
         }
+        case ExprType::CASE_WHEN: {
+            const auto* c = static_cast<const CaseWhenExpr*>(e);
+            const std::string cond_valid = expressionValidExpr(c->condition.get(), ctx);
+            const std::string cond_value = expressionValueNoEmit(c->condition.get(), ctx);
+            const std::string choose_then = combineAndTerms({cond_valid, cond_value});
+            return "((" + choose_then + ") ? (" + expressionValueNoEmit(c->then_expr.get(), ctx) + ") : (" + expressionValueNoEmit(c->else_expr.get(), ctx) + "))";
+        }
     }
     return "0";
 }
@@ -517,6 +818,8 @@ static std::string expressionValueNoEmit(const ExprNode* e, const JITContext& ct
 static std::string expressionValidExpr(const ExprNode* e, const JITContext& ctx) {
     if (!e) return "1";
     switch (e->getType()) {
+        case ExprType::LITERAL_NULL:
+            return "0";
         case ExprType::STAR:
         case ExprType::LITERAL_INT:
         case ExprType::LITERAL_FLOAT:
@@ -570,6 +873,16 @@ static std::string expressionValidExpr(const ExprNode* e, const JITContext& ctx)
             const std::string both_known = combineAndTerms({lv, rv});
             return booleanOrValue(booleanOrValue(left_true_known, right_true_known), both_known);
         }
+        case ExprType::CASE_WHEN: {
+            const auto* c = static_cast<const CaseWhenExpr*>(e);
+            const std::string cond_valid = expressionValidExpr(c->condition.get(), ctx);
+            const std::string cond_value = expressionValueNoEmit(c->condition.get(), ctx);
+            const std::string then_selected = combineAndTerms({cond_valid, cond_value});
+            const std::string else_selected = booleanNotValue(then_selected);
+            return booleanOrValue(
+                combineAndTerms({then_selected, expressionValidExpr(c->then_expr.get(), ctx)}),
+                combineAndTerms({else_selected, expressionValidExpr(c->else_expr.get(), ctx)}));
+        }
     }
     return "1";
 }
@@ -621,8 +934,37 @@ void JITExprVisitor::visit(const LiteralFloatExpr& /*node*/) {
     // No standalone code generation
 }
 
+void JITExprVisitor::visit(const LiteralNullExpr& /*node*/) {
+    // No standalone code generation
+}
+
 void JITExprVisitor::visit(const StarExpr& /*node*/) {
     // Star is handled by aggregate/projection-specific code.
+}
+
+void JITExprVisitor::visit(const CaseWhenExpr& node) {
+    const std::string value = translateInlineExpr(&node, true);
+    const std::string valid = expressionValidExpr(&node, ctx_);
+    const std::string condition = combineAndTerms({valid, value});
+    stream_ << "            #pragma unroll\n"
+            << "            for (int i = 0; i < ITEMS_PER_THREAD; ++i) {\n"
+            << "                if (tid + BLOCK_THREADS * i < num_tile_items) {\n";
+    if (is_or_context_) {
+        if (*first_pred_) {
+            stream_ << "                    " << target_mask_ << "[i] = " << condition << ";\n";
+            *first_pred_ = false;
+        } else {
+            stream_ << "                    " << target_mask_ << "[i] = " << target_mask_ << "[i] || " << condition << ";\n";
+        }
+    } else {
+        if (*first_pred_) {
+            stream_ << "                    " << target_mask_ << "[i] = " << condition << ";\n";
+            *first_pred_ = false;
+        } else {
+            stream_ << "                    " << target_mask_ << "[i] = " << target_mask_ << "[i] && " << condition << ";\n";
+        }
+    }
+    stream_ << "                }\n            }\n";
 }
 
 // ============================================================================
@@ -684,6 +1026,8 @@ std::string JITExprVisitor::translateInlineExpr(const ExprNode* expr, bool is_pr
             return std::to_string(static_cast<const LiteralIntExpr*>(expr)->value);
         case ExprType::LITERAL_FLOAT:
             return std::to_string(static_cast<const LiteralFloatExpr*>(expr)->value);
+        case ExprType::LITERAL_NULL:
+            return "0";
         case ExprType::STAR:
             return "1";
             
@@ -748,6 +1092,16 @@ std::string JITExprVisitor::translateInlineExpr(const ExprNode* expr, bool is_pr
                 return "(!(" + valid + "))";
             }
             return "(" + valid + ")";
+        }
+        case ExprType::CASE_WHEN: {
+            const auto* c = static_cast<const CaseWhenExpr*>(expr);
+            (void)translateInlineExpr(c->condition.get(), is_probe);
+            (void)translateInlineExpr(c->then_expr.get(), is_probe);
+            (void)translateInlineExpr(c->else_expr.get(), is_probe);
+            const std::string cond_valid = expressionValidExpr(c->condition.get(), ctx_);
+            const std::string cond_value = expressionValueNoEmit(c->condition.get(), ctx_);
+            const std::string choose_then = combineAndTerms({cond_valid, cond_value});
+            return "((" + choose_then + ") ? (" + expressionValueNoEmit(c->then_expr.get(), ctx_) + ") : (" + expressionValueNoEmit(c->else_expr.get(), ctx_) + "))";
         }
         default: 
             return "";
@@ -1055,6 +1409,12 @@ static void extractColumnsForTable(const ExprNode* e, const std::string& table_n
             }
         }
     } 
+    else if (e->getType() == ExprType::CASE_WHEN) {
+        const auto* c = static_cast<const CaseWhenExpr*>(e);
+        extractColumnsForTable(c->condition.get(), table_name, cols);
+        extractColumnsForTable(c->then_expr.get(), table_name, cols);
+        extractColumnsForTable(c->else_expr.get(), table_name, cols);
+    }
     // Безопасный каст: только если это действительно бинарный оператор (тип >= OP_AND)
     else if (isBinaryExprType(e->getType())) {
         const auto* bin = static_cast<const BinaryExpr*>(e);
@@ -1147,6 +1507,16 @@ void JITOperatorVisitor::visit(const ProjectionNode& node) {
     produce(&node, ctx_);
 }
 
+void JITOperatorVisitor::visit(const SortLimitNode& node) {
+    repairOperatorParents(&node);
+    agg_cols_.clear();
+    filter_cols_.clear();
+    collectAllColumnsFromTree(&node);
+    markColumnSetNullability(ctx_, catalog_, agg_cols_);
+    markColumnSetNullability(ctx_, catalog_, filter_cols_);
+    produce(&node, ctx_);
+}
+
 void JITOperatorVisitor::visit(const TableScanNode& /*node*/) {}
 void JITOperatorVisitor::visit(const FilterNode&    /*node*/) {}
 void JITOperatorVisitor::visit(const HashJoinNode&  /*node*/) {}
@@ -1162,6 +1532,7 @@ void JITOperatorVisitor::produce(const OperatorNode* node, JITContext& ctx) {
     else if (node->getType() == OperatorType::HASH_JOIN) produceHashJoin(static_cast<const HashJoinNode*>(node), ctx);
     else if (node->getType() == OperatorType::AGGREGATE) produceAggregate(static_cast<const AggregateNode*>(node), ctx);
     else if (node->getType() == OperatorType::PROJECTION) produceProjection(static_cast<const ProjectionNode*>(node), ctx);
+    else if (node->getType() == OperatorType::SORT_LIMIT) produceSortLimit(static_cast<const SortLimitNode*>(node), ctx);
 }
 
 void JITOperatorVisitor::consume(const OperatorNode* node, JITContext& ctx, const OperatorNode* sender, const std::vector<std::string>& active_vars) {
@@ -1190,7 +1561,13 @@ void JITOperatorVisitor::produceTableScan(const TableScanNode* node, JITContext&
     std::vector<std::string> active_vars;
     findAllColumnsForTable(root, node->table_name, active_vars);
 
-    const bool exact_projection = root && root->getType() == OperatorType::PROJECTION;
+    bool exact_projection = false;
+    for (const OperatorNode* n = node->parent_; n; n = n->parent_) {
+        if (n->getType() == OperatorType::PROJECTION) {
+            exact_projection = true;
+            break;
+        }
+    }
 
     auto emit_one_scan_pipeline = [&](const std::string& pipeline_name,
                                       ProjectionPass projection_pass) {
@@ -1310,6 +1687,8 @@ void JITOperatorVisitor::consumeVector(const OperatorNode* node, JITContext& ctx
             consumeAggregateVector(static_cast<const AggregateNode*>(node), ctx, sender, active_vars); break;
         case OperatorType::PROJECTION:
             consumeProjectionVector(static_cast<const ProjectionNode*>(node), ctx, sender, active_vars); break;
+        case OperatorType::SORT_LIMIT:
+            consumeSortLimitVector(static_cast<const SortLimitNode*>(node), ctx, sender, active_vars); break;
         default: break;
     }
 }
@@ -1329,6 +1708,8 @@ void JITOperatorVisitor::consumeItem(const OperatorNode* node, JITContext& ctx,
             consumeAggregateItem(static_cast<const AggregateNode*>(node), ctx, sender, active_vars); break;
         case OperatorType::PROJECTION:
             consumeProjectionItem(static_cast<const ProjectionNode*>(node), ctx, sender, active_vars); break;
+        case OperatorType::SORT_LIMIT:
+            consumeSortLimitItem(static_cast<const SortLimitNode*>(node), ctx, sender, active_vars); break;
         default: break;
     }
 }
@@ -1434,6 +1815,9 @@ void JITOperatorVisitor::consumeFilterItem(const FilterNode* node, JITContext& c
 }
 
 void JITOperatorVisitor::produceAggregate(const AggregateNode* node, JITContext& ctx) {
+    if (node && node->having_predicate) {
+        ctx.requires_dense_result = true;
+    }
     if (!node->getChildren().empty()) {
         produce(node->getChildren()[0].get(), ctx);
     }
@@ -1443,6 +1827,16 @@ void JITOperatorVisitor::produceProjection(const ProjectionNode* node, JITContex
     if (!node->getChildren().empty()) {
         produce(node->getChildren()[0].get(), ctx);
     }
+}
+
+void JITOperatorVisitor::produceSortLimit(const SortLimitNode* node, JITContext& ctx) {
+    if (node) {
+        ctx.requires_dense_result = true;
+    }
+    if (node && !node->getChildren().empty()) {
+        produce(node->getChildren()[0].get(), ctx);
+    }
+    emitSortLimitPostExecution(node, ctx, catalog_);
 }
 
 static std::string translateMathExprPush(
@@ -1499,6 +1893,20 @@ static std::string translateMathExprPush(
             if (cast_to_ull) return "(unsigned long long)" + res;
             return res;
         }
+        case ExprType::OP_EQ:
+        case ExprType::OP_NEQ:
+        case ExprType::OP_LT:
+        case ExprType::OP_LTE:
+        case ExprType::OP_GT:
+        case ExprType::OP_GTE:
+        case ExprType::OP_AND:
+        case ExprType::OP_OR:
+        case ExprType::OP_NOT:
+        case ExprType::CASE_WHEN: {
+            std::string res = expressionValueNoEmit(expr, ctx);
+            if (cast_to_ull) return "(unsigned long long)(" + res + ")";
+            return res;
+        }
         default:
             return "0";
     }
@@ -1511,6 +1919,28 @@ static std::string resolveLoadedRegOrThrow(const std::string& col_name, const JI
             "Column '" + col_name + "' is not loaded into register before aggregate codegen");
     }
     return it->second;
+}
+
+static void caseIntegerRangeOrThrow(const ExprNode* expr,
+                                    int64_t& min_value,
+                                    int64_t& max_value,
+                                    bool& nullable) {
+    std::vector<int64_t> values;
+    bool may_be_null = false;
+    collectCaseIntegerOutputs(expr, values, may_be_null);
+    if (values.empty()) {
+        if (may_be_null) {
+            min_value = 0;
+            max_value = 0;
+            nullable = true;
+            return;
+        }
+        throw std::runtime_error("GROUP BY CASE has no integer output values");
+    }
+    const auto [lo, hi] = std::minmax_element(values.begin(), values.end());
+    min_value = *lo;
+    max_value = *hi;
+    nullable = may_be_null;
 }
 
 // ============================================================================
@@ -1526,35 +1956,53 @@ static std::pair<std::string, uint64_t> generatePerfectHash(
     uint64_t total_size = 1;
 
     for (std::size_t i = 0; i < group_by.size(); ++i) {
-        if (group_by[i]->getType() != ExprType::COLUMN_REF) continue;
-        const auto* col = static_cast<const ColumnRefExpr*>(group_by[i].get());
-        const std::string& col_name = col->column_name;
-        const std::string  table_name = getTableName(col_name);
-
         uint64_t min_val = 0;
         uint64_t card    = 1;
         bool nullable = false;
-        try {
-            const auto& meta = catalog.getTableMetadata(table_name);
-            nullable = meta.isColumnNullable(col_name);
-            if (meta.hasColumnStats(col_name)) {
-                const auto& stats = meta.getColumnStats(col_name);
-                min_val = (uint64_t)stats.min_value_;
-                card    = stats.cardinality_;
-            }
-        } catch (...) {}
+        std::string value_expr;
+        std::string valid_expr = "1";
 
-        const std::string reg_name = resolveLoadedRegOrThrow(col_name, ctx);
-        const auto valid_it = ctx.col_to_valid_reg.find(col_name);
-        const std::string valid_expr = (valid_it == ctx.col_to_valid_reg.end() || valid_it->second.empty()) ? "1" : (valid_it->second + "[i]");
+        if (group_by[i]->getType() == ExprType::COLUMN_REF) {
+            const auto* col = static_cast<const ColumnRefExpr*>(group_by[i].get());
+            const std::string& col_name = col->column_name;
+            const std::string  table_name = getTableName(col_name);
+
+            try {
+                const auto& meta = catalog.getTableMetadata(table_name);
+                nullable = meta.isColumnNullable(col_name);
+                if (meta.hasColumnStats(col_name)) {
+                    const auto& stats = meta.getColumnStats(col_name);
+                    min_val = (uint64_t)stats.min_value_;
+                    card    = stats.cardinality_;
+                }
+            } catch (...) {}
+
+            const std::string reg_name = resolveLoadedRegOrThrow(col_name, ctx);
+            const auto valid_it = ctx.col_to_valid_reg.find(col_name);
+            valid_expr = (valid_it == ctx.col_to_valid_reg.end() || valid_it->second.empty()) ? "1" : (valid_it->second + "[i]");
+            value_expr = reg_name + "[i]";
+        } else if (group_by[i]->getType() == ExprType::CASE_WHEN) {
+            int64_t lo = 0;
+            int64_t hi = 0;
+            bool case_nullable = false;
+            caseIntegerRangeOrThrow(group_by[i].get(), lo, hi, case_nullable);
+            min_val = static_cast<uint64_t>(lo);
+            card = static_cast<uint64_t>(hi - lo + 1);
+            value_expr = expressionValueNoEmit(group_by[i].get(), ctx);
+            valid_expr = expressionValidExpr(group_by[i].get(), ctx);
+            nullable = case_nullable || !isLiteralTrue(valid_expr);
+        } else {
+            throw std::runtime_error(std::string("GROUP BY expression is not supported by perfect hash codegen: ") + exprTypeName(group_by[i]->getType()));
+        }
+
         std::string term;
         if (nullable) {
             // SQL GROUP BY puts all NULL values of the same key into one group.
             // Reserve code 0 for NULL, shift non-NULL values by +1.
-            term = "((" + valid_expr + ") ? (" + reg_name + "[i] - " + std::to_string(min_val) + " + 1) : 0)";
+            term = "((" + valid_expr + ") ? (" + value_expr + " - " + std::to_string(min_val) + " + 1) : 0)";
             card += 1;
         } else {
-            term = "(" + reg_name + "[i] - " + std::to_string(min_val) + ")";
+            term = "(" + value_expr + " - " + std::to_string(min_val) + ")";
         }
         if (hash_expr.empty()) {
             hash_expr = term;
@@ -1584,6 +2032,12 @@ static void extractAllColumns(const ExprNode* e, std::vector<std::string>& cols)
             cols.push_back(col->column_name);
         }
     } 
+    else if (e->getType() == ExprType::CASE_WHEN) {
+        const auto* c = static_cast<const CaseWhenExpr*>(e);
+        extractAllColumns(c->condition.get(), cols);
+        extractAllColumns(c->then_expr.get(), cols);
+        extractAllColumns(c->else_expr.get(), cols);
+    }
     else if (isBinaryExprType(e->getType())) {
         const auto* bin = static_cast<const BinaryExpr*>(e);
         if (bin->left) extractAllColumns(bin->left.get(), cols);
@@ -1596,6 +2050,12 @@ static void extractAllColumns(const ExprNode* e, std::set<std::string>& cols) {
     if (e->getType() == ExprType::COLUMN_REF) {
         cols.insert(static_cast<const ColumnRefExpr*>(e)->column_name);
     } 
+    else if (e->getType() == ExprType::CASE_WHEN) {
+        const auto* c = static_cast<const CaseWhenExpr*>(e);
+        extractAllColumns(c->condition.get(), cols);
+        extractAllColumns(c->then_expr.get(), cols);
+        extractAllColumns(c->else_expr.get(), cols);
+    }
     else if (isBinaryExprType(e->getType())) {
         const auto* bin = static_cast<const BinaryExpr*>(e);
         if (bin->left) extractAllColumns(bin->left.get(), cols);
@@ -1650,6 +2110,7 @@ static bool expressionHasKnownNonZeroDomain(const ExprNode* expr, const Catalog&
 static bool aggregateFastSparseOutputEligible(const AggregateNode* node, const Catalog& catalog) {
     if (!node) return false;
     if (node->needsHiddenCountSlot()) return false; // AVG requires finalization.
+    if (node->having_predicate) return false;
     if (!aggregateOutputsAllNonNullable(node, catalog)) return false;
     for (const auto& agg : node->aggregates) {
         if (!(agg.isCount() || agg.isSum())) return false;
@@ -1669,6 +2130,218 @@ static std::string aggregateInputExpr(const AggregateDef& agg, JITContext& ctx, 
         return cast_to_ull ? "(unsigned long long)1" : "1";
     }
     return translateMathExprPush(agg.agg_expr.get(), ctx, cast_to_ull);
+}
+
+static bool isAggregateResultSlotRef(const ExprNode* expr, int& slot) {
+    slot = -1;
+    if (!expr || expr->getType() != ExprType::COLUMN_REF) return false;
+    const auto* col = static_cast<const ColumnRefExpr*>(expr);
+    if (col->table_name != "__RESULT__") return false;
+    static constexpr const char* prefix = "__result_col_";
+    const std::string& name = col->column_name;
+    if (name.rfind(prefix, 0) != 0) return false;
+    try {
+        const long long parsed = std::stoll(name.substr(std::char_traits<char>::length(prefix)));
+        if (parsed < 0 || parsed > std::numeric_limits<int>::max()) return false;
+        slot = static_cast<int>(parsed);
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
+static std::string aggregateTupleExprValue(const ExprNode* expr,
+                                           const AggregateNode* node,
+                                           const Catalog& catalog,
+                                           const std::string& base_expr);
+static std::string aggregateTupleExprValid(const ExprNode* expr,
+                                           const AggregateNode* node,
+                                           const Catalog& catalog,
+                                           const std::string& base_expr);
+
+static std::string aggregateTupleSlotValue(int slot,
+                                           const AggregateNode* node,
+                                           const std::string& base_expr) {
+    const LogicalType type = resultLogicalTypeForAggregateOutput(node, slot);
+    const std::string raw = "d_result[" + base_expr + " + " + std::to_string(slot) + "]";
+    if (type == LogicalType::Float64) return "db::bit_cast_ull_to_double(" + raw + ")";
+    if (type == LogicalType::Int64) return "static_cast<std::int64_t>(" + raw + ")";
+    return "static_cast<std::uint64_t>(" + raw + ")";
+}
+
+static std::string aggregateTupleExprValue(const ExprNode* expr,
+                                           const AggregateNode* node,
+                                           const Catalog& catalog,
+                                           const std::string& base_expr) {
+    (void)catalog;
+    if (!expr) return "0";
+    int slot = -1;
+    if (isAggregateResultSlotRef(expr, slot)) {
+        return aggregateTupleSlotValue(slot, node, base_expr);
+    }
+    switch (expr->getType()) {
+        case ExprType::LITERAL_INT:
+            return std::to_string(static_cast<const LiteralIntExpr*>(expr)->value);
+        case ExprType::LITERAL_FLOAT:
+            return std::to_string(static_cast<const LiteralFloatExpr*>(expr)->value);
+        case ExprType::LITERAL_NULL:
+            return "0";
+        case ExprType::STAR:
+            return "1";
+        case ExprType::OP_ADD:
+        case ExprType::OP_SUB:
+        case ExprType::OP_MUL:
+        case ExprType::OP_DIV: {
+            const auto* b = static_cast<const BinaryExpr*>(expr);
+            const std::string l = aggregateTupleExprValue(b->left.get(), node, catalog, base_expr);
+            const std::string r = aggregateTupleExprValue(b->right.get(), node, catalog, base_expr);
+            switch (expr->getType()) {
+                case ExprType::OP_ADD: return "db::safe_add(" + l + ", " + r + ")";
+                case ExprType::OP_SUB: return "db::safe_sub(" + l + ", " + r + ")";
+                case ExprType::OP_MUL: return "db::safe_mul(" + l + ", " + r + ")";
+                case ExprType::OP_DIV: return "db::safe_div(" + l + ", " + r + ")";
+                default: break;
+            }
+            return "0";
+        }
+        case ExprType::OP_EQ:
+        case ExprType::OP_NEQ:
+        case ExprType::OP_LT:
+        case ExprType::OP_LTE:
+        case ExprType::OP_GT:
+        case ExprType::OP_GTE: {
+            const auto* b = static_cast<const BinaryExpr*>(expr);
+            const std::string l = aggregateTupleExprValue(b->left.get(), node, catalog, base_expr);
+            const std::string r = aggregateTupleExprValue(b->right.get(), node, catalog, base_expr);
+            switch (expr->getType()) {
+                case ExprType::OP_EQ:  return "db::safe_eq(" + l + ", " + r + ")";
+                case ExprType::OP_NEQ: return "db::safe_neq(" + l + ", " + r + ")";
+                case ExprType::OP_LT:  return "db::safe_lt(" + l + ", " + r + ")";
+                case ExprType::OP_LTE: return "db::safe_lte(" + l + ", " + r + ")";
+                case ExprType::OP_GT:  return "db::safe_gt(" + l + ", " + r + ")";
+                case ExprType::OP_GTE: return "db::safe_gte(" + l + ", " + r + ")";
+                default: break;
+            }
+            return "0";
+        }
+        case ExprType::OP_IS_NULL:
+        case ExprType::OP_IS_NOT_NULL: {
+            const auto* b = static_cast<const BinaryExpr*>(expr);
+            const std::string valid = aggregateTupleExprValid(b->left.get(), node, catalog, base_expr);
+            if (isLiteralTrue(valid)) return expr->getType() == ExprType::OP_IS_NULL ? "0" : "1";
+            if (isLiteralFalse(valid)) return expr->getType() == ExprType::OP_IS_NULL ? "1" : "0";
+            return expr->getType() == ExprType::OP_IS_NULL ? "(!(" + valid + "))" : "(" + valid + ")";
+        }
+        case ExprType::OP_NOT: {
+            const auto* b = static_cast<const BinaryExpr*>(expr);
+            return booleanNotValue(aggregateTupleExprValue(b->left.get(), node, catalog, base_expr));
+        }
+        case ExprType::OP_AND: {
+            const auto* b = static_cast<const BinaryExpr*>(expr);
+            return booleanAndValue(aggregateTupleExprValue(b->left.get(), node, catalog, base_expr),
+                                   aggregateTupleExprValue(b->right.get(), node, catalog, base_expr));
+        }
+        case ExprType::OP_OR: {
+            const auto* b = static_cast<const BinaryExpr*>(expr);
+            return booleanOrValue(aggregateTupleExprValue(b->left.get(), node, catalog, base_expr),
+                                  aggregateTupleExprValue(b->right.get(), node, catalog, base_expr));
+        }
+        case ExprType::CASE_WHEN: {
+            const auto* c = static_cast<const CaseWhenExpr*>(expr);
+            const std::string cv = aggregateTupleExprValid(c->condition.get(), node, catalog, base_expr);
+            const std::string cond = aggregateTupleExprValue(c->condition.get(), node, catalog, base_expr);
+            const std::string selected = isLiteralTrue(cv) ? "(" + cond + ")" : "((" + cv + ") && (" + cond + "))";
+            const std::string then_v = aggregateTupleExprValue(c->then_expr.get(), node, catalog, base_expr);
+            const std::string else_v = c->else_expr ? aggregateTupleExprValue(c->else_expr.get(), node, catalog, base_expr) : "0";
+            return "((" + selected + ") ? (" + then_v + ") : (" + else_v + "))";
+        }
+        case ExprType::COLUMN_REF:
+            throw std::runtime_error("HAVING codegen received non-result ColumnRef");
+    }
+    return "0";
+}
+
+static std::string aggregateTupleExprValid(const ExprNode* expr,
+                                           const AggregateNode* node,
+                                           const Catalog& catalog,
+                                           const std::string& base_expr) {
+    if (!expr) return "1";
+    int slot = -1;
+    if (isAggregateResultSlotRef(expr, slot)) {
+        (void)catalog;
+        return "db::bitmap_valid_at(d_result_validity, " + base_expr + " + " + std::to_string(slot) + ")";
+    }
+    switch (expr->getType()) {
+        case ExprType::LITERAL_NULL:
+            return "0";
+        case ExprType::STAR:
+        case ExprType::LITERAL_INT:
+        case ExprType::LITERAL_FLOAT:
+        case ExprType::OP_IS_NULL:
+        case ExprType::OP_IS_NOT_NULL:
+            return "1";
+        case ExprType::OP_ADD:
+        case ExprType::OP_SUB:
+        case ExprType::OP_MUL:
+        case ExprType::OP_DIV:
+        case ExprType::OP_EQ:
+        case ExprType::OP_NEQ:
+        case ExprType::OP_LT:
+        case ExprType::OP_LTE:
+        case ExprType::OP_GT:
+        case ExprType::OP_GTE: {
+            const auto* b = static_cast<const BinaryExpr*>(expr);
+            return combineAndTerms({aggregateTupleExprValid(b->left.get(), node, catalog, base_expr),
+                                    aggregateTupleExprValid(b->right.get(), node, catalog, base_expr)});
+        }
+        case ExprType::OP_NOT: {
+            const auto* b = static_cast<const BinaryExpr*>(expr);
+            return aggregateTupleExprValid(b->left.get(), node, catalog, base_expr);
+        }
+        case ExprType::OP_AND: {
+            const auto* b = static_cast<const BinaryExpr*>(expr);
+            const std::string lv = aggregateTupleExprValid(b->left.get(), node, catalog, base_expr);
+            const std::string rv = aggregateTupleExprValid(b->right.get(), node, catalog, base_expr);
+            const std::string lval = aggregateTupleExprValue(b->left.get(), node, catalog, base_expr);
+            const std::string rval = aggregateTupleExprValue(b->right.get(), node, catalog, base_expr);
+            return booleanOrValue(booleanOrValue(combineAndTerms({lv, booleanNotValue(lval)}),
+                                                combineAndTerms({rv, booleanNotValue(rval)})),
+                                  combineAndTerms({lv, rv}));
+        }
+        case ExprType::OP_OR: {
+            const auto* b = static_cast<const BinaryExpr*>(expr);
+            const std::string lv = aggregateTupleExprValid(b->left.get(), node, catalog, base_expr);
+            const std::string rv = aggregateTupleExprValid(b->right.get(), node, catalog, base_expr);
+            const std::string lval = aggregateTupleExprValue(b->left.get(), node, catalog, base_expr);
+            const std::string rval = aggregateTupleExprValue(b->right.get(), node, catalog, base_expr);
+            return booleanOrValue(booleanOrValue(combineAndTerms({lv, lval}),
+                                                combineAndTerms({rv, rval})),
+                                  combineAndTerms({lv, rv}));
+        }
+        case ExprType::CASE_WHEN: {
+            const auto* c = static_cast<const CaseWhenExpr*>(expr);
+            const std::string cv = aggregateTupleExprValid(c->condition.get(), node, catalog, base_expr);
+            const std::string cond = aggregateTupleExprValue(c->condition.get(), node, catalog, base_expr);
+            const std::string selected = isLiteralTrue(cv) ? "(" + cond + ")" : "((" + cv + ") && (" + cond + "))";
+            const std::string then_valid = aggregateTupleExprValid(c->then_expr.get(), node, catalog, base_expr);
+            const std::string else_valid = c->else_expr ? aggregateTupleExprValid(c->else_expr.get(), node, catalog, base_expr) : "0";
+            return "(((" + selected + ") && (" + then_valid + ")) || (!(" + selected + ") && (" + else_valid + ")))";
+        }
+        case ExprType::COLUMN_REF:
+            throw std::runtime_error("HAVING validity codegen received non-result ColumnRef");
+    }
+    return "1";
+}
+
+static std::string aggregateHavingPassExpr(const AggregateNode* node,
+                                           const Catalog& catalog,
+                                           const std::string& base_expr) {
+    if (!node || !node->having_predicate) return "true";
+    const std::string valid = aggregateTupleExprValid(node->having_predicate.get(), node, catalog, base_expr);
+    const std::string value = aggregateTupleExprValue(node->having_predicate.get(), node, catalog, base_expr);
+    if (isLiteralTrue(valid)) return "(" + value + ")";
+    if (isLiteralFalse(valid)) return "false";
+    return "((" + valid + ") && (" + value + "))";
 }
 
 static void collectAggregateColumns(const AggregateNode* node, std::vector<std::string>& cols) {
@@ -1836,15 +2509,21 @@ static void emitAggregateDenseColumnarMaterialization(const AggregateNode* node,
     out << "            h.parallel_for<class " << count_kernel << ">(sycl::range<1>(aggregate_group_count == 0ULL ? 1ULL : aggregate_group_count), [=](sycl::id<1> gid) {\n";
     out << "                unsigned long long g = static_cast<unsigned long long>(gid[0]);\n";
     out << "                if (g >= aggregate_group_count) return;\n";
+    out << "                bool present = false;\n";
+    out << "                unsigned long long base = g * aggregate_tuple_size;\n";
     if (node->group_by_exprs.empty()) {
-        out << "                d_aggregate_counts[g] = 1ULL;\n";
+        out << "                present = true;\n";
     } else {
-        out << "                bool present = false;\n";
-        out << "                unsigned long long base = g * aggregate_tuple_size;\n";
         out << "                for (unsigned long long c = 0; c < aggregate_tuple_size; ++c) {\n";
         out << "                    if (db::bitmap_valid_at(d_result_validity, base + c) || d_result[base + c] != 0ULL) { present = true; break; }\n";
         out << "                }\n";
+    }
+    const std::string having_pass = aggregateHavingPassExpr(node, catalog, "base");
+    if (having_pass == "true" || having_pass == "(true)" || having_pass == "1" || having_pass == "(1)") {
         out << "                d_aggregate_counts[g] = present ? 1ULL : 0ULL;\n";
+    } else {
+        out << "                bool having_pass = " << having_pass << ";\n";
+        out << "                d_aggregate_counts[g] = (present && having_pass) ? 1ULL : 0ULL;\n";
     }
     out << "            });\n";
     out << "        });\n";
@@ -1956,7 +2635,7 @@ void JITOperatorVisitor::consumeAggregateVector(const AggregateNode* node, JITCo
     const bool needs_hidden_count = node->needsHiddenCountSlot();
     const int storage_ts = (int)node->storageTupleSize();
     const int hidden_count_slot = visible_ts;
-    const bool fast_sparse_output = aggregateFastSparseOutputEligible(node, catalog_);
+    const bool fast_sparse_output = aggregateFastSparseOutputEligible(node, catalog_) && !ctx.requires_dense_result;
 
     if (!has_group_by) {
         ctx.tuple_size = visible_ts;
@@ -2075,18 +2754,16 @@ void JITOperatorVisitor::consumeAggregateVector(const AggregateNode* node, JITCo
         code << "                    int out = hash * " << storage_ts << ";\n";
 
         int slot = 0;
+        JITExprVisitor group_expr_vis(ctx, code, "flags");
         for (const auto& g : node->group_by_exprs) {
-            if (g->getType() == ExprType::COLUMN_REF) {
-                const auto* col = static_cast<const ColumnRefExpr*>(g.get());
-                const std::string reg_name = resolveLoadedRegOrThrow(col->column_name, ctx);
-                std::string valid = expressionValidExpr(g.get(), ctx);
-                code << "                    d_result[out + " << slot << "] = " << reg_name << "[i];\n";
-                if (!fast_sparse_output) {
-                    if (isTriviallyTrueExpr(valid)) {
-                        code << "                    db::atomic_set_valid_bit(d_result_validity, out + " << slot << ");\n";
-                    } else {
-                        code << "                    if (" << valid << ") db::atomic_set_valid_bit(d_result_validity, out + " << slot << ");\n";
-                    }
+            const std::string group_value = group_expr_vis.translateInlineExpr(g.get(), true);
+            std::string valid = expressionValidExpr(g.get(), ctx);
+            code << "                    d_result[out + " << slot << "] = static_cast<unsigned long long>(" << group_value << ");\n";
+            if (!fast_sparse_output) {
+                if (isTriviallyTrueExpr(valid)) {
+                    code << "                    db::atomic_set_valid_bit(d_result_validity, out + " << slot << ");\n";
+                } else {
+                    code << "                    if (" << valid << ") db::atomic_set_valid_bit(d_result_validity, out + " << slot << ");\n";
                 }
             }
             ++slot;
@@ -2177,20 +2854,18 @@ void JITOperatorVisitor::consumeAggregateItem(const AggregateNode* node, JITCont
         code << "                        int hash = " << hash_expr << ";\n";
         int slot = 0;
         for (const auto& g : node->group_by_exprs) {
-            if (g->getType() == ExprType::COLUMN_REF) {
-                const std::string value = itemExprValue(g.get(), ctx);
-                std::string valid = itemExprValid(g.get(), ctx);
-                code << "                        d_result[(unsigned long long)hash*" << storage_ts
-                     << "+" << slot << "] = (unsigned long long)(" << value << ");\n";
-                code << "                        if (" << valid << ") db::atomic_set_valid_bit(d_result_validity, (unsigned long long)hash*"
-                     << storage_ts << "+" << slot << ");\n";
-            }
+            const std::string value = itemExprValue(g.get(), ctx);
+            std::string valid = itemExprValid(g.get(), ctx);
+            code << "                        d_result[(unsigned long long)hash*" << storage_ts
+                 << "+" << slot << "] = (unsigned long long)(" << value << ");\n";
+            code << "                        if (" << valid << ") db::atomic_set_valid_bit(d_result_validity, (unsigned long long)hash*"
+                 << storage_ts << "+" << slot << ");\n";
             ++slot;
         }
         for (const auto& agg : node->aggregates) {
             std::string val = agg.hasStarArgument() ? "1" : itemExprValue(agg.agg_expr.get(), ctx);
             std::string valid = agg.hasStarArgument() ? "1" : itemExprValid(agg.agg_expr.get(), ctx);
-            std::string ref = "d_result[out + " + std::to_string(slot) + "]";
+            std::string ref = "d_result[(unsigned long long)hash*" + std::to_string(storage_ts) + "+" + std::to_string(slot) + "]";
             code << "                        if (" << valid << ") {\n";
             if (agg.isMin()) {
                 code << "                            db::atomic_min_ull(" << ref << ", " << val << ");\n";
@@ -2512,6 +3187,8 @@ static std::string itemExprValue(const ExprNode* e, JITContext& ctx) {
             return std::to_string(static_cast<const LiteralIntExpr*>(e)->value);
         case ExprType::LITERAL_FLOAT:
             return std::to_string(static_cast<const LiteralFloatExpr*>(e)->value);
+        case ExprType::LITERAL_NULL:
+            return "0";
         case ExprType::STAR:
             return "1";
         case ExprType::OP_ADD:
@@ -2570,6 +3247,11 @@ static std::string itemExprValue(const ExprNode* e, JITContext& ctx) {
             const auto* b = static_cast<const BinaryExpr*>(e);
             return booleanOrValue(itemExprValue(b->left.get(), ctx), itemExprValue(b->right.get(), ctx));
         }
+        case ExprType::CASE_WHEN: {
+            const auto* c = static_cast<const CaseWhenExpr*>(e);
+            const std::string choose_then = combineAndTerms({itemExprValid(c->condition.get(), ctx), itemExprValue(c->condition.get(), ctx)});
+            return "((" + choose_then + ") ? (" + itemExprValue(c->then_expr.get(), ctx) + ") : (" + itemExprValue(c->else_expr.get(), ctx) + "))";
+        }
     }
     return "0";
 }
@@ -2577,6 +3259,8 @@ static std::string itemExprValue(const ExprNode* e, JITContext& ctx) {
 static std::string itemExprValid(const ExprNode* e, JITContext& ctx) {
     if (!e) return "1";
     switch (e->getType()) {
+        case ExprType::LITERAL_NULL:
+            return "0";
         case ExprType::STAR:
         case ExprType::LITERAL_INT:
         case ExprType::LITERAL_FLOAT:
@@ -2622,6 +3306,13 @@ static std::string itemExprValid(const ExprNode* e, JITContext& ctx) {
                                                 combineAndTerms({rv, rval})),
                                   combineAndTerms({lv, rv}));
         }
+        case ExprType::CASE_WHEN: {
+            const auto* c = static_cast<const CaseWhenExpr*>(e);
+            const std::string choose_then = combineAndTerms({itemExprValid(c->condition.get(), ctx), itemExprValue(c->condition.get(), ctx)});
+            return booleanOrValue(
+                combineAndTerms({choose_then, itemExprValid(c->then_expr.get(), ctx)}),
+                combineAndTerms({booleanNotValue(choose_then), itemExprValid(c->else_expr.get(), ctx)}));
+        }
     }
     return "1";
 }
@@ -2634,23 +3325,39 @@ static std::pair<std::string, uint64_t> generatePerfectHashItem(
     std::string hash_expr;
     uint64_t total_size = 1;
     for (const auto& g : group_by) {
-        if (!g || g->getType() != ExprType::COLUMN_REF) continue;
-        const auto* col = static_cast<const ColumnRefExpr*>(g.get());
-        const std::string table_name = getTableName(col->column_name);
+        if (!g) continue;
         uint64_t min_val = 0;
         uint64_t card = 1;
         bool nullable = false;
-        try {
-            const auto& meta = catalog.getTableMetadata(table_name);
-            nullable = meta.isColumnNullable(col->column_name);
-            if (meta.hasColumnStats(col->column_name)) {
-                const auto& st = meta.getColumnStats(col->column_name);
-                min_val = static_cast<uint64_t>(st.min_value_);
-                card = st.cardinality_;
-            }
-        } catch (...) {}
-        const std::string value = itemExprValue(g.get(), ctx);
-        const std::string valid = itemExprValid(g.get(), ctx);
+        std::string value;
+        std::string valid = "1";
+        if (g->getType() == ExprType::COLUMN_REF) {
+            const auto* col = static_cast<const ColumnRefExpr*>(g.get());
+            const std::string table_name = getTableName(col->column_name);
+            try {
+                const auto& meta = catalog.getTableMetadata(table_name);
+                nullable = meta.isColumnNullable(col->column_name);
+                if (meta.hasColumnStats(col->column_name)) {
+                    const auto& st = meta.getColumnStats(col->column_name);
+                    min_val = static_cast<uint64_t>(st.min_value_);
+                    card = st.cardinality_;
+                }
+            } catch (...) {}
+            value = itemExprValue(g.get(), ctx);
+            valid = itemExprValid(g.get(), ctx);
+        } else if (g->getType() == ExprType::CASE_WHEN) {
+            int64_t lo = 0;
+            int64_t hi = 0;
+            bool case_nullable = false;
+            caseIntegerRangeOrThrow(g.get(), lo, hi, case_nullable);
+            min_val = static_cast<uint64_t>(lo);
+            card = static_cast<uint64_t>(hi - lo + 1);
+            value = itemExprValue(g.get(), ctx);
+            valid = itemExprValid(g.get(), ctx);
+            nullable = case_nullable || !isLiteralTrue(valid);
+        } else {
+            throw std::runtime_error(std::string("GROUP BY expression is not supported by item hash codegen: ") + exprTypeName(g->getType()));
+        }
         std::string term;
         if (nullable) {
             term = "((" + valid + ") ? (" + value + " - " + std::to_string(min_val) + " + 1) : 0)";
@@ -2726,6 +3433,24 @@ void JITOperatorVisitor::consumeProjectionItem(const ProjectionNode* node, JITCo
                 code << "                        if (" << valid << ") db::atomic_set_valid_bit(d_result_validity_col_" << slot << ", out_row);\n";
             }
         }
+    }
+}
+
+void JITOperatorVisitor::consumeSortLimitVector(const SortLimitNode* node, JITContext& ctx,
+                                                const OperatorNode* /*sender*/,
+                                                const std::vector<std::string>& active_vars) {
+    if (node && node->parent_) {
+        consume_mode_ = ConsumeMode::Vector;
+        consume(node->parent_, ctx, node, active_vars);
+    }
+}
+
+void JITOperatorVisitor::consumeSortLimitItem(const SortLimitNode* node, JITContext& ctx,
+                                              const OperatorNode* /*sender*/,
+                                              const std::vector<std::string>& active_vars) {
+    if (node && node->parent_) {
+        consume_mode_ = ConsumeMode::Item;
+        consume(node->parent_, ctx, node, active_vars);
     }
 }
 
@@ -3647,6 +4372,7 @@ std::string JITOperatorVisitor::generateCode() const {
     code << "#include <stdexcept>\n";
     code << "#include <vector>\n";
     code << "#include <cstddef>\n";
+    code << "#include <cstdint>\n";
     code << "#include <chrono>\n";
     code << "#include \"crystal/load.h\"\n";
     code << "#include \"crystal/pred.h\"\n";

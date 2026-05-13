@@ -592,12 +592,12 @@
     {
       "id": "10_order_limit_topn_future",
       "name": "order limit topn future",
-      "status": "future",
+      "status": "current",
       "queries": [
         {
           "id": "topn_01_order_by_sum_desc_limit",
           "path": "sql/10_order_limit_topn_future/topn_01_order_by_sum_desc_limit.sql",
-          "status": "future",
+          "status": "current",
           "tags": [
             "order_limit_topn_future"
           ],
@@ -606,7 +606,7 @@
         {
           "id": "topn_02_order_by_projection",
           "path": "sql/10_order_limit_topn_future/topn_02_order_by_projection.sql",
-          "status": "future",
+          "status": "current",
           "tags": [
             "order_limit_topn_future"
           ],
@@ -616,15 +616,15 @@
     },
     {
       "id": "11_having_future",
-      "name": "having future",
-      "status": "future",
+      "name": "having",
+      "status": "current",
       "queries": [
         {
           "id": "having_01_sum_threshold",
           "path": "sql/11_having_future/having_01_sum_threshold.sql",
-          "status": "future",
+          "status": "current",
           "tags": [
-            "having_future"
+            "having"
           ],
           "timeout_sec": 120
         }
@@ -732,15 +732,30 @@
     },
     {
       "id": "16_case_future",
-      "name": "case future",
-      "status": "future",
+      "name": "case when",
+      "status": "current",
       "queries": [
         {
           "id": "case_01_bucketed_sum",
           "path": "sql/16_case_future/case_01_bucketed_sum.sql",
-          "status": "future",
+          "status": "current",
           "tags": [
-            "case_future"
+            "case",
+            "group_by",
+            "aggregate"
+          ],
+          "timeout_sec": 120
+        },
+        {
+          "id": "case_02_conditional_sum",
+          "path": "sql/16_case_future/case_02_conditional_sum.sql",
+          "status": "current",
+          "tags": [
+            "case",
+            "conditional_aggregation",
+            "join",
+            "order_by",
+            "limit"
           ],
           "timeout_sec": 120
         }
@@ -757,6 +772,17 @@
           "status": "future",
           "tags": [
             "alias_selfjoin_future"
+          ],
+          "timeout_sec": 120
+        },
+        {
+          "id": "alias_02_table_column_aliases",
+          "path": "sql/17_alias_selfjoin_future/alias_02_table_column_aliases.sql",
+          "status": "current",
+          "tags": [
+            "alias",
+            "having",
+            "order_by"
           ],
           "timeout_sec": 120
         }

@@ -191,6 +191,7 @@ QueryResult DatabaseInstance::executeQuery(const std::string& sql, const QueryFe
     QueryResult result;
     result.tuple_size = ctx_->tuple_size_ == 0 ? 1 : ctx_->tuple_size_;
     result.columns = ctx_->result_columns_;
+    result.column_names = ctx_->result_column_names_;
     result.dense_result = ctx_->result_is_dense_;
 
     if (ctx_->result_is_columnar_) {

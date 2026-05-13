@@ -22,21 +22,33 @@ The suite is intended for correctness regression, generated-code inspection, and
 | `07_ssb_standard` | Standard SSB query set already used as baseline. |
 | `08_custom` | Custom regression queries. |
 | `09_nullable` | NULL, `IS NULL`, `IS NOT NULL`, 3-valued logic smoke tests. |
-| `10_order_limit_topn_future` | `ORDER BY`, `LIMIT`, Top-N targets. |
-| `11_having_future` | `HAVING` targets. |
+| `10_order_limit_topn_future` | `ORDER BY`, `LIMIT`, and Top-N regression queries. The directory name is historical; ORDER/LIMIT queries are current. |
+| `11_having_future` | Current `HAVING` regression queries. The directory name is historical. |
 | `12_distinct_future` | `DISTINCT` and `COUNT(DISTINCT)` targets. |
 | `13_outer_join_future` | Outer join targets. |
 | `14_subquery_cte_future` | Derived tables and CTE targets. |
 | `15_window_future` | Window function targets. |
-| `16_case_future` | `CASE WHEN` targets. |
-| `17_alias_selfjoin_future` | Aliases and self-join targets. |
+| `16_case_future` | Current native SQL `CASE` regression queries. The directory name is historical. |
+| `17_alias_selfjoin_future` | Ordinary alias regressions plus self-join future targets. |
 | `18_mht_nonunique_future` | Non-unique join / MHT / OR-dedup targets. |
 | `19_type_system_future` | Decimal, date extraction, string predicates. |
 | `20_memory_stress` | Wide materialization and memory-guard stress tests. |
 
-## Isolated benchmark run
 
-Run each query in a fresh `db_cli` process:
+## P1 feature status
+
+The P1 feature set is implemented with explicit scope limits:
+
+- `ORDER BY` / `LIMIT`: current, implemented as GPU full Bitonic Sort over the dense final result. Optimized heap/selection Top-N remains future work.
+- `HAVING`: current for aggregate/group expressions present in SELECT output. Hidden aggregate slots remain future work.
+- Table aliases: current for non-self-join queries. Self-join aliases remain future work.
+- Column aliases: current for output metadata and for `ORDER BY` / `HAVING` references.
+- `CASE`: native parser AST support for searched CASE, simple CASE, multiple WHEN branches, and optional ELSE as SQL NULL.
+- Nullable mini dataset: current under `test/nullable_data`.
+
+## Benchmark run
+
+By default the runner starts one `db_cli` process and executes the selected warmups/runs sequentially in that session:
 
 ```bash
 python3 bench/olap_bench/tools/run_olap_bench.py \
@@ -47,6 +59,8 @@ python3 bench/olap_bench/tools/run_olap_bench.py \
   --limit 1000 \
   --out bench/olap_bench/results/latest
 ```
+
+To intentionally restart `db_cli` for every query/run, pass `--mode isolated`.
 
 By default, the runner executes only `current` queries. To include heavy or future queries:
 

@@ -100,6 +100,11 @@ struct JITContext {
     std::stringstream post_execution_code;
     std::set<std::string> emitted_auxiliary_kernels;
 
+    // ORDER BY/LIMIT is applied after the child pipeline has materialized the
+    // visible result.  It therefore requires dense columnar output from an
+    // aggregate child and disables sparse aggregate output.
+    bool requires_dense_result = false;
+
     // ---------- helpers ----------
     std::string getNewMask() {
         return "mask_" + std::to_string(++mask_counter);
@@ -143,7 +148,9 @@ public:
     void visit(const ColumnRefExpr&   node) override;
     void visit(const LiteralIntExpr&  node) override;
     void visit(const LiteralFloatExpr& node) override;
+    void visit(const LiteralNullExpr& node) override;
     void visit(const BinaryExpr&      node) override;
+    void visit(const CaseWhenExpr&    node) override;
     void visit(const StarExpr&        node) override;
 
     // Translates AST expressions into inline C++ code
@@ -201,6 +208,7 @@ public:
     void visit(const HashJoinNode&  node) override;
     void visit(const AggregateNode& node) override;
     void visit(const ProjectionNode& node) override;
+    void visit(const SortLimitNode& node) override;
 
     // ---- Push-model dispatchers ----
     void produce(const OperatorNode* node, JITContext& ctx);
@@ -262,6 +270,7 @@ private:
     void produceHashJoin  (const HashJoinNode*   node, JITContext& ctx);
     void produceAggregate (const AggregateNode*  node, JITContext& ctx);
     void produceProjection(const ProjectionNode* node, JITContext& ctx);
+    void produceSortLimit (const SortLimitNode*  node, JITContext& ctx);
 
     // ---- Vector-mode consume handlers (block level, outside scalar loop) ----
     void consumeFilterVector   (const FilterNode*    node, JITContext& ctx,
@@ -276,6 +285,9 @@ private:
     void consumeProjectionVector(const ProjectionNode* node, JITContext& ctx,
                                  const OperatorNode* sender,
                                  const std::vector<std::string>& active_vars);
+    void consumeSortLimitVector(const SortLimitNode* node, JITContext& ctx,
+                                const OperatorNode* sender,
+                                const std::vector<std::string>& active_vars);
 
     // ---- Item-mode consume handlers (scalar level, inside scalar loop) ----
     void consumeFilterItem   (const FilterNode*    node, JITContext& ctx,
@@ -290,6 +302,9 @@ private:
     void consumeProjectionItem(const ProjectionNode* node, JITContext& ctx,
                                const OperatorNode* sender,
                                const std::vector<std::string>& active_vars);
+    void consumeSortLimitItem(const SortLimitNode* node, JITContext& ctx,
+                              const OperatorNode* sender,
+                              const std::vector<std::string>& active_vars);
 
     enum class ConsumeMode : uint8_t {
         Vector = 0,

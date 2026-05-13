@@ -8,12 +8,48 @@
 #include <string>
 #include <vector>
 #include <algorithm>
+#include <cstddef>
 #include <cstdint>
 #include <limits>
 #include <stdexcept>
 #include <functional>
 
 namespace db {
+
+
+inline void collectCaseIntegerOutputs(const ExprNode* expr,
+                                      std::vector<int64_t>& values,
+                                      bool& may_be_null) {
+    if (!expr) {
+        may_be_null = true;
+        return;
+    }
+    if (expr->getType() == ExprType::LITERAL_INT) {
+        values.push_back(static_cast<const LiteralIntExpr*>(expr)->value);
+        return;
+    }
+    if (expr->getType() == ExprType::LITERAL_NULL) {
+        may_be_null = true;
+        return;
+    }
+    if (expr->getType() == ExprType::CASE_WHEN) {
+        const auto* c = static_cast<const CaseWhenExpr*>(expr);
+        collectCaseIntegerOutputs(c->then_expr.get(), values, may_be_null);
+        collectCaseIntegerOutputs(c->else_expr.get(), values, may_be_null);
+        return;
+    }
+    throw std::runtime_error("GROUP BY CASE currently requires integer THEN/ELSE result expressions");
+}
+
+inline uint64_t integerCaseCardinality(const ExprNode* expr, bool include_null_bucket) {
+    std::vector<int64_t> values;
+    bool may_be_null = false;
+    collectCaseIntegerOutputs(expr, values, may_be_null);
+    if (values.empty()) return may_be_null ? 1ULL : 0ULL;
+    const auto [min_it, max_it] = std::minmax_element(values.begin(), values.end());
+    const uint64_t range = static_cast<uint64_t>(*max_it - *min_it + 1);
+    return range + ((include_null_bucket && may_be_null) ? 1ULL : 0ULL);
+}
 
 // ============================================================================
 // 1. OperatorType
@@ -24,6 +60,7 @@ enum class OperatorType {
     HASH_JOIN,
     AGGREGATE,
     PROJECTION,
+    SORT_LIMIT,
 };
 
 // ============================================================================
@@ -35,6 +72,7 @@ class FilterNode;
 class HashJoinNode;
 class AggregateNode;
 class ProjectionNode;
+class SortLimitNode;
 
 // ============================================================================
 // 3. Абстрактный базовый класс узла оператора (реляционная алгебра)
@@ -76,8 +114,10 @@ public:
 class TableScanNode final : public OperatorNode {
 public:
     std::string table_name;
+    std::string table_alias;
 
-    explicit TableScanNode(std::string name) : table_name(std::move(name)) {}
+    explicit TableScanNode(std::string name, std::string alias = "")
+        : table_name(std::move(name)), table_alias(std::move(alias)) {}
 
     OperatorType getType() const override { return OperatorType::TABLE_SCAN; }
     void accept(OperatorVisitor& visitor) const override;
@@ -117,6 +157,7 @@ public:
 class ProjectionNode final : public OperatorNode {
 public:
     std::vector<std::unique_ptr<ExprNode>> select_exprs;
+    std::vector<std::string> output_aliases;
 
     ProjectionNode() = default;
 
@@ -164,6 +205,26 @@ public:
         if (tuple_size == 0) tuple_size = 1;
         return row_count * tuple_size;
     }
+};
+
+struct SortKeyDef {
+    std::size_t column_index = 0;
+    bool descending = false;
+};
+
+// ORDER BY / LIMIT over the final visible result.
+// The child must produce a dense, columnar result. The JIT visitor enforces this
+// for aggregate children by disabling the sparse fast-output path when needed.
+class SortLimitNode final : public OperatorNode {
+public:
+    std::vector<SortKeyDef> sort_keys;
+    bool has_limit = false;
+    std::size_t limit = 0;
+
+    SortLimitNode() = default;
+
+    OperatorType getType() const override { return OperatorType::SORT_LIMIT; }
+    void accept(OperatorVisitor& visitor) const override;
 };
 
 // ============================================================================
@@ -232,6 +293,8 @@ class AggregateNode final : public OperatorNode {
 public:
     std::vector<std::unique_ptr<ExprNode>> group_by_exprs; // выражения GROUP BY
     std::vector<AggregateDef>              aggregates;     // список агрегаций
+    std::unique_ptr<ExprNode>              having_predicate; // normalized post-aggregate predicate over visible slots
+    std::vector<std::string>               output_aliases;   // visible output aliases, group cols first, aggregates after
 
     AggregateNode() = default;
 
@@ -272,28 +335,32 @@ public:
 
         uint64_t total_groups = 1;
         for (const auto& g : group_by_exprs) {
-            if (g->getType() != ExprType::COLUMN_REF) continue;
-            const auto* col = static_cast<const ColumnRefExpr*>(g.get());
-            const std::string& col_name = col->column_name;
-            // Определяем таблицу по первому символу имени колонки (как в crystal/utils.h)
-            std::string table_name = getTableName(col_name);
-
             uint64_t cardinality = 1;
-            try {
-                const auto& meta = catalog.getTableMetadata(table_name);
-                if (meta.hasColumnStats(col_name)) {
-                    cardinality = meta.getColumnStats(col_name).cardinality_;
-                } else {
-                    // Фолбэк: используем размер таблицы как верхнюю оценку
-                    cardinality = meta.getSize();
+            if (g->getType() == ExprType::COLUMN_REF) {
+                const auto* col = static_cast<const ColumnRefExpr*>(g.get());
+                const std::string& col_name = col->column_name;
+                // Определяем таблицу по первому символу имени колонки (как в crystal/utils.h)
+                std::string table_name = getTableName(col_name);
+
+                try {
+                    const auto& meta = catalog.getTableMetadata(table_name);
+                    if (meta.hasColumnStats(col_name)) {
+                        cardinality = meta.getColumnStats(col_name).cardinality_;
+                    } else {
+                        // Фолбэк: используем размер таблицы как верхнюю оценку
+                        cardinality = meta.getSize();
+                    }
+                    if (meta.isColumnNullable(col_name)) {
+                        // One extra GROUP BY bucket for SQL NULL.
+                        ++cardinality;
+                    }
+                } catch (...) {
+                    // Таблица не найдена — минимальный фолбэк
+                    cardinality = 1;
                 }
-                if (meta.isColumnNullable(col_name)) {
-                    // One extra GROUP BY bucket for SQL NULL.
-                    ++cardinality;
-                }
-            } catch (...) {
-                // Таблица не найдена — минимальный фолбэк
-                cardinality = 1;
+            } else if (g->getType() == ExprType::CASE_WHEN) {
+                cardinality = integerCaseCardinality(g.get(), true);
+                if (cardinality == 0) cardinality = 1;
             }
             total_groups *= cardinality;
         }
@@ -313,6 +380,7 @@ public:
     virtual void visit(const HashJoinNode& node)   = 0;
     virtual void visit(const AggregateNode& node)  = 0;
     virtual void visit(const ProjectionNode& node) = 0;
+    virtual void visit(const SortLimitNode& node)  = 0;
 };
 
 // ============================================================================
@@ -330,6 +398,7 @@ public:
     void visit(const HashJoinNode& node)   override;
     void visit(const AggregateNode& node)  override;
     void visit(const ProjectionNode& node) override;
+    void visit(const SortLimitNode& node)  override;
 
 private:
     std::ostream& out_;

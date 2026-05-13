@@ -45,6 +45,13 @@ static void extractTableNamesImpl(const ExprNode* expr,
             extractTableNamesImpl(bin->left.get(), out);
             break;
         }
+        case ExprType::CASE_WHEN: {
+            const auto* c = static_cast<const CaseWhenExpr*>(expr);
+            extractTableNamesImpl(c->condition.get(), out);
+            extractTableNamesImpl(c->then_expr.get(), out);
+            extractTableNamesImpl(c->else_expr.get(), out);
+            break;
+        }
         default:
             break;
     }
