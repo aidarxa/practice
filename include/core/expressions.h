@@ -14,8 +14,10 @@ enum class ExprType {
     COLUMN_REF,    // ссылка на колонку (table.column)
     LITERAL_INT,   // целочисленный литерал
     LITERAL_FLOAT, // вещественный литерал
+    LITERAL_NULL,  // SQL NULL literal
     OP_AND,        // логическое И
     OP_OR,         // логическое ИЛИ
+    OP_NOT,        // логическое НЕ
     OP_EQ,         // =
     OP_NEQ,        // <>
     OP_LT,         // <
@@ -26,6 +28,9 @@ enum class ExprType {
     OP_SUB,        // -
     OP_MUL,        // *
     OP_DIV,        // /
+    OP_IS_NULL,    // IS NULL
+    OP_IS_NOT_NULL,// IS NOT NULL
+    CASE_WHEN,     // searched CASE WHEN condition THEN value ELSE value END
     STAR,          // * in SELECT * or aggregate arguments
 };
 
@@ -36,8 +41,10 @@ class ExprVisitor;
 class ColumnRefExpr;
 class LiteralIntExpr;
 class LiteralFloatExpr;
+class LiteralNullExpr;
 class BinaryExpr;
 class StarExpr;
+class CaseWhenExpr;
 
 // ============================================================================
 // 3. Абстрактный базовый класс узла выражения
@@ -106,6 +113,21 @@ public:
     }
 };
 
+
+// SQL NULL literal. Value codegen emits 0, validity codegen emits false.
+class LiteralNullExpr final : public ExprNode {
+public:
+    LiteralNullExpr() = default;
+
+    ExprType getType() const override { return ExprType::LITERAL_NULL; }
+
+    void accept(ExprVisitor& visitor) const override;
+
+    std::unique_ptr<ExprNode> clone() const override {
+        return std::make_unique<LiteralNullExpr>();
+    }
+};
+
 // Бинарное выражение: left op right
 // Покрывает арифметику, сравнения, логические операторы
 class BinaryExpr final : public ExprNode {
@@ -133,6 +155,39 @@ public:
 };
 
 
+
+// Searched CASE expression with one WHEN arm.
+// Multiple SQL WHEN arms are represented as nested CaseWhenExpr nodes.
+// Simple CASE is normalized by the translator into searched comparisons.
+class CaseWhenExpr final : public ExprNode {
+public:
+    std::unique_ptr<ExprNode> condition;
+    std::unique_ptr<ExprNode> then_expr;
+    std::unique_ptr<ExprNode> else_expr;
+
+    CaseWhenExpr(std::unique_ptr<ExprNode> cond,
+                 std::unique_ptr<ExprNode> then_value,
+                 std::unique_ptr<ExprNode> else_value)
+        : condition(std::move(cond)),
+          then_expr(std::move(then_value)),
+          else_expr(std::move(else_value)) {
+        if (!condition || !then_expr || !else_expr) {
+            throw std::runtime_error("CASE WHEN requires condition, THEN expression, and ELSE expression");
+        }
+    }
+
+    ExprType getType() const override { return ExprType::CASE_WHEN; }
+
+    void accept(ExprVisitor& visitor) const override;
+
+    std::unique_ptr<ExprNode> clone() const override {
+        return std::make_unique<CaseWhenExpr>(
+            condition ? condition->clone() : nullptr,
+            then_expr ? then_expr->clone() : nullptr,
+            else_expr ? else_expr->clone() : nullptr);
+    }
+};
+
 // SQL star: SELECT * and aggregate arguments such as COUNT(*)
 class StarExpr final : public ExprNode {
 public:
@@ -156,7 +211,9 @@ public:
     virtual void visit(const ColumnRefExpr& node)   = 0;
     virtual void visit(const LiteralIntExpr& node)  = 0;
     virtual void visit(const LiteralFloatExpr& node)= 0;
+    virtual void visit(const LiteralNullExpr& node) = 0;
     virtual void visit(const BinaryExpr& node)      = 0;
+    virtual void visit(const CaseWhenExpr& node)    = 0;
     virtual void visit(const StarExpr& node)        = 0;
 };
 
@@ -172,7 +229,9 @@ public:
     void visit(const ColumnRefExpr& node) override;
     void visit(const LiteralIntExpr& node) override;
     void visit(const LiteralFloatExpr& node) override;
+    void visit(const LiteralNullExpr& node) override;
     void visit(const BinaryExpr& node) override;
+    void visit(const CaseWhenExpr& node) override;
     void visit(const StarExpr& node) override;
 
 private:

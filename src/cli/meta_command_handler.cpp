@@ -1,7 +1,9 @@
 #include "cli/meta_command_handler.h"
 
+#include <cstddef>
 #include <iostream>
 #include <sstream>
+#include <string>
 
 namespace db::cli {
 
@@ -27,6 +29,15 @@ bool MetaCommandHandler::handle(const std::string& command, SessionContext& ctx)
             ctx.output_file.clear();
             std::cout << "Output redirected to: stdout\n";
         }
+        return false;
+    }
+
+    // --- Raw marker echo for benchmark/session tooling ---
+    if (cmd == "\\echo") {
+        std::string rest;
+        std::getline(iss, rest);
+        if (!rest.empty() && rest.front() == ' ') rest.erase(rest.begin());
+        std::cout << rest << "\n";
         return false;
     }
 
@@ -87,6 +98,68 @@ bool MetaCommandHandler::handle(const std::string& command, SessionContext& ctx)
         return false;
     }
 
+
+
+    // --- Extended timing output ---
+    if (cmd == "\\timing") {
+        std::string arg;
+        if (iss >> arg) {
+            if (arg == "on") {
+                ctx.extended_timing = true;
+                std::cout << "Extended timing: ON\n";
+            } else if (arg == "off") {
+                ctx.extended_timing = false;
+                std::cout << "Extended timing: OFF\n";
+            } else {
+                std::cerr << "Usage: \\timing on|off\n";
+            }
+        } else {
+            std::cout << "Extended timing: " << (ctx.extended_timing ? "ON" : "OFF") << "\n";
+        }
+        return false;
+    }
+
+    // --- Result output row limit ---
+    if (cmd == "\\limit") {
+        std::string arg;
+        if (!(iss >> arg)) {
+            if (ctx.output_row_limit_enabled) {
+                std::cout << "Output row limit: " << ctx.output_row_limit << " last rows\n";
+            } else {
+                std::cout << "Output row limit: unlimited\n";
+            }
+            return false;
+        }
+
+        if (arg == "off" || arg == "all" || arg == "unlimited") {
+            ctx.output_row_limit_enabled = false;
+            std::cout << "Output row limit: unlimited\n";
+            return false;
+        }
+
+        if (arg == "on") {
+            ctx.output_row_limit_enabled = true;
+            if (ctx.output_row_limit == 0) ctx.output_row_limit = 1000;
+            std::cout << "Output row limit: " << ctx.output_row_limit << " last rows\n";
+            return false;
+        }
+
+        try {
+            std::size_t consumed = 0;
+            unsigned long long value = std::stoull(arg, &consumed, 10);
+            if (consumed != arg.size() || value == 0ULL) {
+                std::cerr << "Usage: \\limit N|all|off (N must be positive)\n";
+                return false;
+            }
+            ctx.output_row_limit_enabled = true;
+            ctx.output_row_limit = static_cast<std::size_t>(value);
+            std::cout << "Output row limit: " << ctx.output_row_limit << " last rows\n";
+        } catch (const std::exception&) {
+            std::cerr << "Usage: \\limit N|all|off\n";
+        }
+        return false;
+    }
+
     // --- Справка ---
     if (cmd == "help") {
         printHelp();
@@ -108,6 +181,7 @@ void MetaCommandHandler::printHelp() {
         "  .exit  | \\q       Exit the program\n"
         "  \\o [filename]     Redirect generated code to file (no arg = stdout)\n"
         "  \\dump on|off      Toggle generated code output instead of execution\n"
+        "  \\limit [N|all|off] Show only the last N result rows (default: 1000)\n"
         "  \\ast on|off       Toggle AST echo\n"
         "  \\logical on|off   Toggle logical plan echo\n"
         "\n"

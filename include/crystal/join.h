@@ -256,22 +256,21 @@ inline void BlockBuildSelectivePHT_2(int tid, K (&keys)[ITEMS_PER_THREAD],
 // ============================================================================
 
 template <typename K>
-inline void ProbePHT_1(K key, int& flag, K* ht, int ht_len, K key_mins) {
-    if (flag) {
-        int hash = HASH(key, ht_len, key_mins);
-        K slot = ht[hash];
-        if (slot == 0) flag = 0;
-    }
+inline bool ProbePHT_1(K key, K* ht, int ht_len, K key_mins) {
+    int hash = HASH(key, ht_len, key_mins);
+    K slot = ht[hash];
+    return slot == key;
 }
 
 template <typename K, typename V>
-inline void ProbePHT_2(K key, V& res, int& flag, K* ht, int ht_len, K key_mins) {
-    if (flag) {
-        int hash = HASH(key, ht_len, key_mins);
-        uint64_t slot = *reinterpret_cast<uint64_t*>(&ht[hash << 1]);
-        if (slot != 0) res = (slot >> 32);
-        else flag = 0;
+inline bool ProbePHT_2(K key, V& res, K* ht, int ht_len, K key_mins) {
+    int hash = HASH(key, ht_len, key_mins);
+    K slot_key = ht[hash << 1];
+    if (slot_key == key) {
+        res = static_cast<V>(ht[(hash << 1) + 1]);
+        return true;
     }
+    return false;
 }
 
 // Multi-value Hash Table (MHT) Probe
@@ -285,7 +284,7 @@ inline void ProbeMultiHT(K key, int& offset, int& count, int& flag, K* ht_dir, i
         // ht_dir[hash * 3 + 1] = Offset
         // ht_dir[hash * 3 + 2] = Count
         K slot_key = ht_dir[hash * 3];
-        if (slot_key != 0) { // Assuming 0 means empty, or we can just check count > 0
+        if (slot_key == key && ht_dir[hash * 3 + 2] > 0) {
             offset = ht_dir[hash * 3 + 1];
             count = ht_dir[hash * 3 + 2];
         } else {

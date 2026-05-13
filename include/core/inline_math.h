@@ -94,7 +94,29 @@ inline int safe_neq(T1 a, T2 b) {
 }
 
 
+inline unsigned long long bit_cast_double_to_ull(double value) {
+    union Bits { double d; unsigned long long u; };
+    Bits bits;
+    bits.d = value;
+    return bits.u;
+}
+
+inline double bit_cast_ull_to_double(unsigned long long value) {
+    union Bits { double d; unsigned long long u; };
+    Bits bits;
+    bits.u = value;
+    return bits.d;
+}
+
 // Atomic helpers used by generated aggregate kernels.
+inline unsigned long long atomic_fetch_add_ull(unsigned long long& target, unsigned long long value) {
+    sycl::atomic_ref<unsigned long long,
+                     sycl::memory_order::relaxed,
+                     sycl::memory_scope::device,
+                     sycl::access::address_space::global_space> at(target);
+    return at.fetch_add(value);
+}
+
 inline void atomic_add_ull(unsigned long long& target, unsigned long long value) {
     sycl::atomic_ref<unsigned long long,
                      sycl::memory_order::relaxed,
@@ -119,6 +141,20 @@ inline void atomic_max_ull(unsigned long long& target, unsigned long long value)
                      sycl::access::address_space::global_space> at(target);
     unsigned long long observed = at.load();
     while (value > observed && !at.compare_exchange_weak(observed, value)) {}
+}
+
+inline void atomic_set_valid_bit(uint64_t* bitmap, unsigned long long bit_idx) {
+    if (bitmap == nullptr) return;
+    sycl::atomic_ref<uint64_t,
+                     sycl::memory_order::relaxed,
+                     sycl::memory_scope::device,
+                     sycl::access::address_space::global_space> at(bitmap[bit_idx >> 6]);
+    at.fetch_or(1ULL << (bit_idx & 63ULL));
+}
+
+inline int bitmap_valid_at(const uint64_t* bitmap, unsigned long long bit_idx) {
+    if (bitmap == nullptr) return 1;
+    return static_cast<int>((bitmap[bit_idx >> 6] >> (bit_idx & 63ULL)) & 1ULL);
 }
 
 } // namespace db

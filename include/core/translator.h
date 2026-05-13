@@ -9,6 +9,9 @@
 
 #include <memory>
 #include <stdexcept>
+#include <string>
+#include <unordered_map>
+#include <vector>
 
 namespace db {
 
@@ -38,6 +41,17 @@ private:
 
     // Рекурсивно транслирует hsql::TableRef в узел оператора.
     std::unique_ptr<OperatorNode> translateFrom(const hsql::TableRef* ref);
+
+    // Table aliases are resolved in the translator so optimizer/JIT receive
+    // canonical catalog table names in ColumnRefExpr::table_name.
+    std::unordered_map<std::string, std::string> table_alias_to_name_;
+    std::unordered_map<std::string, std::size_t> select_alias_to_select_index_;
+
+    std::string resolveTableQualifier(const std::string& qualifier) const;
+    void registerSelectAliases(const hsql::SelectStatement* stmt);
+    std::unique_ptr<ExprNode> translateHavingExpr(const hsql::Expr* expr, const hsql::SelectStatement* stmt);
+    std::unique_ptr<ExprNode> translateCaseExpr(const hsql::Expr* expr);
+    std::unique_ptr<ExprNode> translateHavingCaseExpr(const hsql::Expr* expr, const hsql::SelectStatement* stmt);
 
     // -----------------------------------------------------------------------
     // Трансляция выражений — строит поддерево ExprNode

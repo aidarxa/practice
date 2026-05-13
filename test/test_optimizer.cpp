@@ -15,6 +15,7 @@
 #include <cassert>
 #include <iostream>
 #include <string>
+#include <vector>
 
 using namespace db;
 
@@ -42,6 +43,7 @@ static std::shared_ptr<Catalog> buildTestCatalog() {
                      "s_region", "s_phone"},
                     20000, false);
     s.setColumnStats("s_suppkey", {1, 20000, 20000});
+    s.setColumnPrimaryKey("s_suppkey");
     s.setColumnStats("s_city",   {0, 249,   250});
     s.setColumnStats("s_region", {0, 4,     5});
     s.setColumnStats("s_nation", {0, 24,    25});
@@ -53,6 +55,7 @@ static std::shared_ptr<Catalog> buildTestCatalog() {
                      "c_region", "c_phone", "c_mktsegment"},
                     300000, false);
     c.setColumnStats("c_custkey", {1, 300000, 300000});
+    c.setColumnPrimaryKey("c_custkey");
     c.setColumnStats("c_city",   {0, 249,    250});
     c.setColumnStats("c_region", {0, 4,      5});
     c.setColumnStats("c_nation", {0, 24,     25});
@@ -64,6 +67,7 @@ static std::shared_ptr<Catalog> buildTestCatalog() {
                      "p_color", "p_type", "p_size", "p_container"},
                     800000, false);
     p.setColumnStats("p_partkey",  {1, 800000, 800000});
+    p.setColumnPrimaryKey("p_partkey");
     p.setColumnStats("p_category", {1, 25,     25});
     p.setColumnStats("p_brand1",   {1, 1000,   1000});
     catalog->pushTableMetadata(p);
@@ -77,6 +81,7 @@ static std::shared_ptr<Catalog> buildTestCatalog() {
                      "d_weekdayfl"},
                     2556, false);
     d.setColumnStats("d_datekey", {19920101, 19981230, 2556});
+    d.setColumnPrimaryKey("d_datekey");
     d.setColumnStats("d_year",    {1992, 1998, 7});
     catalog->pushTableMetadata(d);
 
@@ -475,6 +480,120 @@ static void test_jit_visitor_unsupported_predicate_throws() {
     std::cout << "PASSED\n";
 }
 
+
+// ============================================================================
+// Test 9: Catalog uniqueness metadata is explicit and available to codegen
+// ============================================================================
+static void test_catalog_uniqueness_metadata() {
+    std::cout << "Test 9: Catalog uniqueness metadata... ";
+
+    auto catalog = buildTestCatalog();
+
+    const auto& d = catalog->getTableMetadata("DDATE");
+    const auto& p = catalog->getTableMetadata("PART");
+    const auto& s = catalog->getTableMetadata("SUPPLIER");
+    const auto& c = catalog->getTableMetadata("CUSTOMER");
+
+    assert(d.isColumnPrimaryKey("d_datekey"));
+    assert(p.isColumnPrimaryKey("p_partkey"));
+    assert(s.isColumnPrimaryKey("s_suppkey"));
+    assert(c.isColumnPrimaryKey("c_custkey"));
+
+    assert(d.isColumnUnique("d_datekey"));
+    assert(p.isColumnUnique("p_partkey"));
+    assert(s.isColumnUnique("s_suppkey"));
+    assert(c.isColumnUnique("c_custkey"));
+
+    const auto& lo = catalog->getTableMetadata("LINEORDER");
+    assert(!lo.isColumnUnique("lo_custkey"));
+    assert(!lo.isColumnPrimaryKey("lo_custkey"));
+
+    std::cout << "PASSED\n";
+}
+
+
+
+// ============================================================================
+// Test 10: nullable metadata survives stats updates
+// ============================================================================
+static void test_catalog_nullable_metadata() {
+    std::cout << "Test 10: Catalog nullable metadata... ";
+
+    TableMetadata t("T", {"a", "b"}, 10, false);
+    t.setColumnNullable("a", true);
+    t.setColumnStats("a", {1, 9, 9});
+    assert(t.isColumnNullable("a"));
+
+    t.setColumnStats("b", {0, 1, 2, false, false, true});
+    assert(t.isColumnNullable("b"));
+
+    t.setColumnPrimaryKey("a");
+    assert(t.isColumnPrimaryKey("a"));
+    assert(t.isColumnUnique("a"));
+    assert(t.isColumnNullable("a"));
+
+    std::cout << "PASSED\n";
+}
+
+
+
+// ============================================================================
+// Test 11: nullable expression codegen and typed columnar result ABI
+// ============================================================================
+static void test_nullable_expression_codegen_and_typed_result_abi() {
+    std::cout << "Test 11: nullable expression codegen + typed columnar ABI... ";
+
+    auto catalog = buildTestCatalog();
+    // Mark fact aggregate/projection inputs nullable. This synthetic catalog is
+    // enough to validate generated NULL semantics without modifying SSB data.
+    TableMetadata lo = catalog->getTableMetadata("LINEORDER");
+    lo.setColumnNullable("lo_revenue", true);
+    auto nullable_catalog = std::make_shared<Catalog>();
+    nullable_catalog->pushTableMetadata(lo);
+    for (const auto& table : catalog->getTablesMetadata()) {
+        if (table.getName() != "LINEORDER") nullable_catalog->pushTableMetadata(table);
+    }
+
+    auto generate = [&](const std::string& sql) {
+        hsql::SQLParserResult result;
+        auto* ast = parseSQL(sql, result);
+        assert(ast != nullptr);
+        db::QueryTranslator translator;
+        auto tree = translator.translate(ast);
+        db::Optimizer opt;
+        tree = opt.optimize(std::move(tree));
+        db::JITContext jit_ctx;
+        db::JITOperatorVisitor visitor(jit_ctx, *nullable_catalog);
+        tree->accept(visitor);
+        return visitor.generateCode();
+    };
+
+    const std::string agg_code = generate(
+        "SELECT COUNT(*), COUNT(lo_revenue), SUM(lo_revenue), AVG(lo_revenue) "
+        "FROM lineorder");
+    assert(agg_code.find("BlockLoadValidity") != std::string::npos);
+    assert(agg_code.find("items_valid") != std::string::npos);
+    assert(agg_code.find("getResultColumnUInt64Pointer(0)") != std::string::npos);
+    assert(agg_code.find("getResultColumnUInt64Pointer(1)") != std::string::npos);
+    assert(agg_code.find("getResultColumnUInt64Pointer(2)") != std::string::npos);
+    assert(agg_code.find("getResultColumnFloat64Pointer(3)") != std::string::npos);
+
+    const std::string is_null_projection = generate(
+        "SELECT lo_revenue IS NULL FROM lineorder");
+    assert(is_null_projection.find("getResultColumnUInt64Pointer(0)") != std::string::npos);
+    assert(is_null_projection.find("(!(items_valid[i]))") != std::string::npos ||
+           is_null_projection.find("!((items_valid[i]))") != std::string::npos);
+    assert(is_null_projection.find("d_result[out_row") == std::string::npos);
+
+    const std::string where_is_null = generate(
+        "SELECT COUNT(*) FROM lineorder WHERE lo_revenue IS NULL");
+    assert(where_is_null.find("flags[i] = flags[i] && 0") == std::string::npos);
+    assert(where_is_null.find("!(lo_revenue_valid[i])") != std::string::npos ||
+           where_is_null.find("!(items_valid[i])") != std::string::npos);
+
+    std::cout << "PASSED\n";
+}
+
 // ============================================================================
 int main() {
     std::cout << "=== test_optimizer (new pipeline) ===\n\n";
@@ -487,6 +606,9 @@ int main() {
     test_jit_visitor_q31();
     test_jit_visitor_mixed_predicate_universal_path();
     test_jit_visitor_unsupported_predicate_throws();
+    test_catalog_uniqueness_metadata();
+    test_catalog_nullable_metadata();
+    test_nullable_expression_codegen_and_typed_result_abi();
 
     std::cout << "\nAll tests passed!\n";
     return 0;

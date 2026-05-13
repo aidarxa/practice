@@ -1,0 +1,22 @@
+# Crystal-SYCL runtime configuration.
+# Search order: $CRYSTAL_CONFIG, ./crystal.conf, ./crystal-sycl.conf,
+# ~/.config/crystal-sycl/config.conf.
+# Environment variables CRYSTAL_INCLUDE_DIR and CRYSTAL_DEPS_INCLUDE_DIR override
+# the corresponding config-file values.
+
+CRYSTAL_INCLUDE_DIR = ./include
+CRYSTAL_DEPS_INCLUDE_DIR = ./deps/include
+
+# CLI defaults
+dump_generated_code = off
+extended_timing = off
+output_limit = 1000
+
+# Memory guard defaults
+memory_guard_enabled = on
+memory_guard_reserve_fraction = 0.10
+memory_guard_reserve_bytes = 512MiB
+
+# Reuse per-query temporary hash/projection buffers through ExecutionContext high-water marks.
+# Set to false for stricter one-shot allocation/free debugging.
+reuse_scratch_buffers=true

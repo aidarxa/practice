@@ -43,6 +43,16 @@ struct JITContext {
     // ---- Column tracking (probe kernel) ----
     // column_name → register name in the probe kernel.
     std::unordered_map<std::string, std::string> col_to_reg;
+    std::unordered_map<std::string, std::string> col_to_valid_reg;
+
+    // Catalog-derived nullability cache used by codegen to completely avoid
+    // validity loads/checks for non-nullable columns in hot kernels.
+    std::set<std::string> nullable_columns;
+
+    // table_name → row-id vector register. Used by projection/materialization
+    // after PK/FK joins: the hash table carries only build row_id, and
+    // late columns are gathered by row_id at the end of the pipeline.
+    std::unordered_map<std::string, std::string> table_rowid_regs;
 
     // Which columns have already been BlockLoad-ed in the probe kernel.
     std::set<std::string> loaded_in_probe;
@@ -69,6 +79,7 @@ struct JITContext {
 
     // Columns that must be fetched from ctx (EXTERNAL_INPUT):
     std::set<std::string> external_columns; // e.g. "d_lo_orderdate"
+    std::set<std::string> external_null_columns; // nullable bitmap symbols, e.g. "n_lo_orderdate"
 
     // Result buffer size expression (set by AggregateNode/ProjectionNode visitor).
     // For AVG/MIN this is the physical storage size; generated finalization
@@ -77,10 +88,22 @@ struct JITContext {
     int         tuple_size = 1;
     std::string visible_result_size_expr;
 
+    // Exact projection materialization: the first scan pass counts surviving
+    // rows per tile; host prefix-scan computes exact offsets and result size;
+    // the second scan pass writes rows into the exact result buffer.
+    bool projection_exact_materialization = false;
+    std::string projection_row_count_expr;
+    int projection_tuple_size = 0;
+
     // Code emitted after all main pipelines, before q.wait(). Used for
     // aggregate finalization/compaction kernels.
     std::stringstream post_execution_code;
     std::set<std::string> emitted_auxiliary_kernels;
+
+    // ORDER BY/LIMIT is applied after the child pipeline has materialized the
+    // visible result.  It therefore requires dense columnar output from an
+    // aggregate child and disables sparse aggregate output.
+    bool requires_dense_result = false;
 
     // ---------- helpers ----------
     std::string getNewMask() {
@@ -125,7 +148,9 @@ public:
     void visit(const ColumnRefExpr&   node) override;
     void visit(const LiteralIntExpr&  node) override;
     void visit(const LiteralFloatExpr& node) override;
+    void visit(const LiteralNullExpr& node) override;
     void visit(const BinaryExpr&      node) override;
+    void visit(const CaseWhenExpr&    node) override;
     void visit(const StarExpr&        node) override;
 
     // Translates AST expressions into inline C++ code
@@ -183,6 +208,7 @@ public:
     void visit(const HashJoinNode&  node) override;
     void visit(const AggregateNode& node) override;
     void visit(const ProjectionNode& node) override;
+    void visit(const SortLimitNode& node) override;
 
     // ---- Push-model dispatchers ----
     void produce(const OperatorNode* node, JITContext& ctx);
@@ -223,8 +249,11 @@ private:
         std::string key_mins;      // "0" or "1"
         uint8_t     variant;       // 1 = keys only (PHT_1), 2 = key-value pairs (PHT_2)
         bool        use_mht;       // true = Multi-value HT (two-pass), false = Perfect HT
+        bool        payload_is_row_id = false; // PHT_2 payload is build-side row_id, not a value column
         std::vector<std::string> fk_cols; // FK column(s) in the probe/fact table
         std::string val_col;       // payload column (variant 2 / MHT only)
+        std::string row_id_reg;    // vector register name for build-side row_id payload
+        std::string dim_table;     // build-side table name
         std::string dim_prefix;    // "s", "c", "p", "d"
         std::string size_macro;    // "S_LEN", "C_LEN", etc.
         std::string pk_col;        // PK column in the dim table
@@ -241,6 +270,7 @@ private:
     void produceHashJoin  (const HashJoinNode*   node, JITContext& ctx);
     void produceAggregate (const AggregateNode*  node, JITContext& ctx);
     void produceProjection(const ProjectionNode* node, JITContext& ctx);
+    void produceSortLimit (const SortLimitNode*  node, JITContext& ctx);
 
     // ---- Vector-mode consume handlers (block level, outside scalar loop) ----
     void consumeFilterVector   (const FilterNode*    node, JITContext& ctx,
@@ -255,6 +285,9 @@ private:
     void consumeProjectionVector(const ProjectionNode* node, JITContext& ctx,
                                  const OperatorNode* sender,
                                  const std::vector<std::string>& active_vars);
+    void consumeSortLimitVector(const SortLimitNode* node, JITContext& ctx,
+                                const OperatorNode* sender,
+                                const std::vector<std::string>& active_vars);
 
     // ---- Item-mode consume handlers (scalar level, inside scalar loop) ----
     void consumeFilterItem   (const FilterNode*    node, JITContext& ctx,
@@ -269,6 +302,9 @@ private:
     void consumeProjectionItem(const ProjectionNode* node, JITContext& ctx,
                                const OperatorNode* sender,
                                const std::vector<std::string>& active_vars);
+    void consumeSortLimitItem(const SortLimitNode* node, JITContext& ctx,
+                              const OperatorNode* sender,
+                              const std::vector<std::string>& active_vars);
 
     enum class ConsumeMode : uint8_t {
         Vector = 0,
@@ -277,6 +313,13 @@ private:
 
     ExecutionMode execution_mode_ = ExecutionMode::DataCentric;
     ConsumeMode   consume_mode_   = ConsumeMode::Vector;
+
+    enum class ProjectionPass : uint8_t {
+        None = 0,
+        Count,
+        Write
+    };
+    ProjectionPass projection_pass_ = ProjectionPass::None;
 
     // ---- Build kernel emitters ----
     // PHT: emit one build kernel (with optional filter). Populates hash_tables.

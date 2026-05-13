@@ -23,6 +23,7 @@ static void extractTableNamesImpl(const ExprNode* expr,
         }
         case ExprType::OP_AND:
         case ExprType::OP_OR:
+        case ExprType::OP_NOT:
         case ExprType::OP_EQ:
         case ExprType::OP_NEQ:
         case ExprType::OP_LT:
@@ -36,6 +37,19 @@ static void extractTableNamesImpl(const ExprNode* expr,
             const auto* bin = static_cast<const BinaryExpr*>(expr);
             extractTableNamesImpl(bin->left.get(), out);
             extractTableNamesImpl(bin->right.get(), out);
+            break;
+        }
+        case ExprType::OP_IS_NULL:
+        case ExprType::OP_IS_NOT_NULL: {
+            const auto* bin = static_cast<const BinaryExpr*>(expr);
+            extractTableNamesImpl(bin->left.get(), out);
+            break;
+        }
+        case ExprType::CASE_WHEN: {
+            const auto* c = static_cast<const CaseWhenExpr*>(expr);
+            extractTableNamesImpl(c->condition.get(), out);
+            extractTableNamesImpl(c->then_expr.get(), out);
+            extractTableNamesImpl(c->else_expr.get(), out);
             break;
         }
         default:

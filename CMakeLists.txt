@@ -57,6 +57,7 @@ add_executable(db_cli
     src/cli/meta_command_handler.cpp
     src/cli/terminal_app.cpp
     src/core/execution.cpp
+    src/core/config.cpp
     src/core/translator.cpp
     src/core/optimizer_rules.cpp
     src/core/visitor.cpp
@@ -133,4 +134,19 @@ target_link_libraries(test_translator PRIVATE
 target_compile_definitions(test_translator PRIVATE
     CRYSTAL_INCLUDE_DIR_DEFAULT="${CRYSTAL_INCLUDE_DIR}"
     CRYSTAL_DEPS_INCLUDE_DIR_DEFAULT="${CRYSTAL_DEPS_INCLUDE_DIR}"
+)
+
+
+# --- Test target (nullable bitmap decoding and NULL ABI helpers) ---
+add_executable(test_nullable_semantics
+    test/test_nullable_semantics.cpp
+)
+
+target_include_directories(test_nullable_semantics PRIVATE
+    "${CMAKE_SOURCE_DIR}/include"
+)
+
+# --- Test target (SQL three-valued logic truth table model) ---
+add_executable(test_sql_3vl
+    test/test_sql_3vl.cpp
 )

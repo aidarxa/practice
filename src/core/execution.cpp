@@ -3,17 +3,42 @@
 #include "core/translator.h"
 #include "core/visitor.h"
 
+#include <algorithm>
+#include <chrono>
+#include <cctype>
 #include <cstdlib>
+#include <cstring>
 #include <dlfcn.h>
 #include <filesystem>
 #include <fstream>
 #include <functional>
 #include <iostream>
+#include <iomanip>
+#include <limits>
+#include <sstream>
 #include <stdexcept>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
 namespace db {
+
+namespace {
+using Clock = std::chrono::steady_clock;
+static double elapsedMs(const Clock::time_point& start, const Clock::time_point& end) {
+    return std::chrono::duration<double, std::milli>(end - start).count();
+}
+}
+
+
+static std::string tableNameFromColumn(const std::string& col) {
+    if (col.rfind("lo_", 0) == 0) return "LINEORDER";
+    if (col.rfind("s_", 0) == 0) return "SUPPLIER";
+    if (col.rfind("c_", 0) == 0) return "CUSTOMER";
+    if (col.rfind("p_", 0) == 0) return "PART";
+    if (col.rfind("d_", 0) == 0) return "DDATE";
+    return "";
+}
 
 // --- FileBasedQueryCache ---
 
@@ -61,21 +86,16 @@ static std::string escapeShellArg(const std::string& value) {
 
 static std::string getRequiredPath(const char* env_name,
                                    const std::string& configured_value) {
+    const char* env_value = std::getenv(env_name);
+    if (env_value && *env_value) {
+        return std::string(env_value);
+    }
     if (!configured_value.empty()) {
         return configured_value;
     }
-    const char* env_value = std::getenv(env_name);
-    if (!env_value) {
-        throw std::runtime_error(
-            std::string("Missing required path. Set environment variable ") +
-            env_name + " or pass it into AdaptiveCppCompiler constructor.");
-    }
-    std::string path(env_value);
-    if (path.empty()) {
-        throw std::runtime_error(
-            std::string("Environment variable ") + env_name + " is empty.");
-    }
-    return path;
+    throw std::runtime_error(
+        std::string("Missing required path. Set ") + env_name +
+        " in environment, crystal.conf, or CMake defaults.");
 }
 
 static void validateExistingDir(const std::string& path, const std::string& name) {
@@ -133,6 +153,7 @@ std::string AdaptiveCppCompiler::compile(const std::string& source_code, const s
 // --- DynamicLibraryExecutor ---
 
 void DynamicLibraryExecutor::execute(const std::string& lib_path, ExecutionContext* ctx) {
+    const auto load_start = Clock::now();
     void* handle = dlopen(lib_path.c_str(), RTLD_NOW | RTLD_LOCAL);
     if (!handle) {
         throw std::runtime_error("dlopen failed: " + std::string(dlerror()));
@@ -153,9 +174,19 @@ void DynamicLibraryExecutor::execute(const std::string& lib_path, ExecutionConte
 
     typedef void (*JitFunc)(db::ExecutionContext*);
     JitFunc func = reinterpret_cast<JitFunc>(sym);
+    const auto load_end = Clock::now();
+    if (ctx) {
+        ctx->timing_.library_load_ms += elapsedMs(load_start, load_end);
+    }
 
-    // Execute the kernel
+    const double generated_reported_before = ctx ? ctx->timing_.gpu_execute_ms : 0.0;
+    const auto exec_start = Clock::now();
     func(ctx);
+    const auto exec_end = Clock::now();
+    if (ctx && ctx->timing_.gpu_execute_ms <= generated_reported_before) {
+        ctx->timing_.gpu_execute_ms += elapsedMs(exec_start, exec_end);
+    }
+    if (ctx) ctx->timing_.jit_execute_ms = ctx->timing_.gpu_execute_ms;
 }
 
 // --- QueryEngine ---
@@ -198,6 +229,385 @@ static const ProjectionNode* findProjectionNode(const OperatorNode* node) {
     return nullptr;
 }
 
+
+
+static void collectHashJoinTables(const OperatorNode* node,
+                                  const Catalog& catalog,
+                                  std::unordered_set<std::string>& out) {
+    if (!node) return;
+    if (node->getType() == OperatorType::HASH_JOIN) {
+        std::vector<const TableScanNode*> scans;
+        std::function<void(const OperatorNode*)> collect_scans = [&](const OperatorNode* n) {
+            if (!n) return;
+            if (n->getType() == OperatorType::TABLE_SCAN) {
+                scans.push_back(static_cast<const TableScanNode*>(n));
+            }
+            for (const auto& child : n->getChildren()) collect_scans(child.get());
+        };
+        collect_scans(node);
+        for (const auto* scan : scans) {
+            try {
+                const auto& meta = catalog.getTableMetadata(scan->table_name);
+                if (!meta.isFactTable()) out.insert(scan->table_name);
+            } catch (...) {}
+        }
+    }
+    for (const auto& child : node->getChildren()) {
+        collectHashJoinTables(child.get(), catalog, out);
+    }
+}
+
+static uint64_t estimatePhtSlotsForTable(const std::string& table,
+                                         const Catalog& catalog) {
+    if (table == "DDATE") return 61131ULL;
+    return catalog.getTableMetadata(table).getSize();
+}
+
+static uint64_t estimateProjectionInputRows(const OperatorNode* root,
+                                            const Catalog& catalog) {
+    const ProjectionNode* proj = findProjectionNode(root);
+    if (!proj || proj->getChildren().empty()) return 0;
+
+    std::vector<const TableScanNode*> scans;
+    std::function<void(const OperatorNode*)> collect = [&](const OperatorNode* node) {
+        if (!node) return;
+        if (node->getType() == OperatorType::TABLE_SCAN) {
+            scans.push_back(static_cast<const TableScanNode*>(node));
+        }
+        for (const auto& child : node->getChildren()) collect(child.get());
+    };
+    collect(proj->getChildren()[0].get());
+
+    uint64_t row_count = 1;
+    for (const auto* scan : scans) {
+        const auto& meta = catalog.getTableMetadata(scan->table_name);
+        if (row_count == 1 || meta.isFactTable()) row_count = meta.getSize();
+    }
+    return row_count;
+}
+
+static size_t checkedMulSize(size_t a, size_t b, const char* label) {
+    if (a != 0 && b > std::numeric_limits<size_t>::max() / a) {
+        throw std::overflow_error(std::string(label) + ": size_t multiplication overflow");
+    }
+    return a * b;
+}
+
+static size_t estimateJitTemporaryBytes(const OperatorNode* root,
+                                        const Catalog& catalog) {
+    std::unordered_set<std::string> hash_tables;
+    collectHashJoinTables(root, catalog, hash_tables);
+
+    size_t bytes = 0;
+    for (const auto& table : hash_tables) {
+        // PHT_1/PHT_2 are represented as int arrays.  The row-id projection
+        // path still uses PHT_2, i.e. two int slots per hash slot.
+        size_t slots = static_cast<size_t>(estimatePhtSlotsForTable(table, catalog));
+        size_t table_bytes = checkedMulSize(checkedMulSize(2, slots, "PHT slots"),
+                                            sizeof(int), "PHT bytes");
+        if (bytes > std::numeric_limits<size_t>::max() - table_bytes) {
+            throw std::overflow_error("temporary memory estimate overflow");
+        }
+        bytes += table_bytes;
+    }
+
+    if (findProjectionNode(root)) {
+        const uint64_t input_rows = estimateProjectionInputRows(root, catalog);
+        const size_t projection_tiles = static_cast<size_t>((input_rows + 511ULL) / 512ULL);
+        // Exact materialization uses three per-tile ULL arrays:
+        // counts, exclusive offsets, write-local counters, plus one block-sums
+        // array for the GPU prefix scan over tile counts.
+        const size_t projection_scan_blocks = (projection_tiles + 255ULL) / 256ULL;
+        const size_t projection_tile_bytes = checkedMulSize(
+            checkedMulSize(3, projection_tiles, "projection tile buffers"),
+            sizeof(unsigned long long), "projection tile bytes");
+        const size_t projection_scan_bytes = checkedMulSize(
+            projection_scan_blocks, sizeof(unsigned long long),
+            "projection scan block bytes");
+        if (projection_tile_bytes > std::numeric_limits<size_t>::max() - projection_scan_bytes) {
+            throw std::overflow_error("projection temporary memory estimate overflow");
+        }
+        const size_t projection_temp = projection_tile_bytes + projection_scan_bytes;
+        if (bytes > std::numeric_limits<size_t>::max() - projection_temp) {
+            throw std::overflow_error("temporary memory estimate overflow");
+        }
+        bytes += projection_temp;
+    }
+    return bytes;
+}
+
+static std::string formatBytes(size_t bytes) {
+    std::ostringstream out;
+    constexpr double GiB = 1024.0 * 1024.0 * 1024.0;
+    constexpr double MiB = 1024.0 * 1024.0;
+    out << std::fixed << std::setprecision(2);
+    if (bytes >= static_cast<size_t>(GiB)) out << (bytes / GiB) << " GiB";
+    else out << (bytes / MiB) << " MiB";
+    return out.str();
+}
+
+static void preflightDeviceMemoryOrThrow(const ExecutionContext* ctx,
+                                         const OperatorNode* root,
+                                         const Catalog& catalog) {
+    if (!ctx || !ctx->q_ || !ctx->config_.memory_guard_enabled) return;
+    const auto dev = ctx->q_->get_device();
+    const size_t total = static_cast<size_t>(dev.get_info<sycl::info::device::global_mem_size>());
+    if (total == 0) return;
+
+    const size_t result_bytes = checkedMulSize(ctx->expected_result_size_,
+                                               sizeof(unsigned long long),
+                                               "result buffer bytes");
+    const size_t temporary_bytes = estimateJitTemporaryBytes(root, catalog);
+    const size_t loaded_bytes = ctx->loaded_device_bytes_;
+    const size_t existing_result_bytes = ctx->result_buffer_
+        ? checkedMulSize(ctx->result_buffer_->capacity(), sizeof(unsigned long long),
+                         "existing result buffer bytes")
+        : 0;
+
+    // DynamicDeviceBuffer frees the old result buffer before allocating a larger
+    // one.  If the existing buffer is already large enough, it stays resident.
+    const size_t resident_result_bytes = existing_result_bytes >= result_bytes
+        ? existing_result_bytes
+        : result_bytes;
+
+    size_t required = loaded_bytes;
+    auto add = [&](size_t v, const char* label) {
+        if (required > std::numeric_limits<size_t>::max() - v) {
+            throw std::overflow_error(std::string(label) + ": memory estimate overflow");
+        }
+        required += v;
+    };
+    add(resident_result_bytes, "resident result bytes");
+    add(temporary_bytes, "JIT temporary bytes");
+
+    // Keep a conservative reserve for runtime allocations, code objects, queues,
+    // driver bookkeeping, and fragmentation.  A hard allocation failure in ROCm
+    // may destabilize the graphics session, so reject before malloc_device.
+    const size_t fraction_reserve = static_cast<size_t>(static_cast<double>(total) * ctx->config_.memory_guard_reserve_fraction);
+    const size_t reserve = std::max(fraction_reserve, ctx->config_.memory_guard_reserve_bytes);
+    const size_t budget = total > reserve ? total - reserve : total / 2;
+
+    if (required > budget) {
+        std::ostringstream msg;
+        msg << "Insufficient GPU memory for query before JIT execution. "
+            << "Estimated resident requirement: " << formatBytes(required)
+            << " (loaded columns: " << formatBytes(loaded_bytes)
+            << ", result upper bound: " << formatBytes(result_bytes)
+            << ", JIT temporaries: " << formatBytes(temporary_bytes)
+            << "). Device memory: " << formatBytes(total)
+            << ", safety budget: " << formatBytes(budget)
+            << ". Reduce projection width, add selective predicates, or lower scale factor.";
+        throw std::runtime_error(msg.str());
+    }
+}
+
+static void collectTableScansForResultLayout(const OperatorNode* node,
+                                             std::vector<const TableScanNode*>& out) {
+    if (!node) return;
+    if (node->getType() == OperatorType::TABLE_SCAN) {
+        out.push_back(static_cast<const TableScanNode*>(node));
+    }
+    for (const auto& child : node->getChildren()) {
+        collectTableScansForResultLayout(child.get(), out);
+    }
+}
+
+
+static LogicalType expressionResultType(const ExprNode* expr) {
+    if (!expr) return LogicalType::UInt64;
+    switch (expr->getType()) {
+        case ExprType::OP_EQ:
+        case ExprType::OP_NEQ:
+        case ExprType::OP_LT:
+        case ExprType::OP_LTE:
+        case ExprType::OP_GT:
+        case ExprType::OP_GTE:
+        case ExprType::OP_AND:
+        case ExprType::OP_OR:
+        case ExprType::OP_IS_NULL:
+        case ExprType::OP_IS_NOT_NULL:
+            return LogicalType::UInt64;
+        case ExprType::LITERAL_FLOAT:
+            return LogicalType::Float64;
+        case ExprType::LITERAL_NULL:
+            return LogicalType::UInt64;
+        case ExprType::CASE_WHEN: {
+            const auto* c = static_cast<const CaseWhenExpr*>(expr);
+            const auto then_type = expressionResultType(c->then_expr.get());
+            const auto else_type = expressionResultType(c->else_expr.get());
+            if (then_type == LogicalType::Float64 || else_type == LogicalType::Float64) return LogicalType::Float64;
+            if (then_type == LogicalType::Int64 || else_type == LogicalType::Int64) return LogicalType::Int64;
+            return LogicalType::UInt64;
+        }
+        default:
+            return LogicalType::Int64;
+    }
+}
+
+static bool expressionMayBeNullable(const ExprNode* expr, const Catalog& catalog) {
+    if (!expr) return true;
+    switch (expr->getType()) {
+        case ExprType::LITERAL_NULL:
+            return true;
+        case ExprType::STAR:
+        case ExprType::LITERAL_INT:
+        case ExprType::LITERAL_FLOAT:
+            return false;
+        case ExprType::COLUMN_REF: {
+            const auto* c = static_cast<const ColumnRefExpr*>(expr);
+            const std::string table = tableNameFromColumn(c->column_name);
+            try {
+                return catalog.getTableMetadata(table).isColumnNullable(c->column_name);
+            } catch (...) {
+                return true;
+            }
+        }
+        case ExprType::OP_ADD:
+        case ExprType::OP_SUB:
+        case ExprType::OP_MUL:
+        case ExprType::OP_DIV:
+        case ExprType::OP_EQ:
+        case ExprType::OP_NEQ:
+        case ExprType::OP_LT:
+        case ExprType::OP_LTE:
+        case ExprType::OP_GT:
+        case ExprType::OP_GTE:
+        case ExprType::OP_AND:
+        case ExprType::OP_OR: {
+            const auto* b = static_cast<const BinaryExpr*>(expr);
+            return expressionMayBeNullable(b->left.get(), catalog) ||
+                   expressionMayBeNullable(b->right.get(), catalog);
+        }
+        case ExprType::OP_IS_NULL:
+        case ExprType::OP_IS_NOT_NULL:
+            return false;
+        case ExprType::CASE_WHEN: {
+            const auto* c = static_cast<const CaseWhenExpr*>(expr);
+            return expressionMayBeNullable(c->then_expr.get(), catalog) ||
+                   expressionMayBeNullable(c->else_expr.get(), catalog);
+        }
+        default:
+            return true;
+    }
+}
+
+static std::vector<ResultColumnDesc> inferResultColumns(const OperatorNode* node,
+                                                        const Catalog& catalog) {
+    std::vector<ResultColumnDesc> descs;
+    if (!node) return descs;
+
+    if (const auto* agg = findAggregateNode(node)) {
+        for (const auto& gexpr : agg->group_by_exprs) {
+            descs.push_back({expressionResultType(gexpr.get()), 0, expressionMayBeNullable(gexpr.get(), catalog)});
+        }
+        for (const auto& agg_def : agg->aggregates) {
+            if (agg_def.isAvg()) {
+                descs.push_back({LogicalType::Float64, 0, expressionMayBeNullable(agg_def.agg_expr.get(), catalog)});
+            } else if (agg_def.isCount()) {
+                descs.push_back({LogicalType::UInt64, 0, false});
+            } else {
+                descs.push_back({LogicalType::UInt64, 0, expressionMayBeNullable(agg_def.agg_expr.get(), catalog)});
+            }
+        }
+        return descs;
+    }
+
+    if (const auto* proj = findProjectionNode(node)) {
+        std::vector<const TableScanNode*> scans;
+        if (!proj->getChildren().empty()) {
+            collectTableScansForResultLayout(proj->getChildren()[0].get(), scans);
+        }
+        for (const auto& expr : proj->select_exprs) {
+            if (!expr) continue;
+            if (expr->getType() == ExprType::STAR) {
+                for (const auto* scan : scans) {
+                    const auto& meta = catalog.getTableMetadata(scan->table_name);
+                    for (const auto& col_name : meta.getColumnNames()) {
+                        descs.push_back({LogicalType::Int64, 0, meta.isColumnNullable(col_name)});
+                    }
+                }
+            } else {
+                descs.push_back({expressionResultType(expr.get()), 0, expressionMayBeNullable(expr.get(), catalog)});
+            }
+        }
+    }
+    return descs;
+}
+
+
+static std::string defaultExpressionColumnName(const ExprNode* expr) {
+    if (!expr) return "expr";
+    switch (expr->getType()) {
+        case ExprType::COLUMN_REF:
+            return static_cast<const ColumnRefExpr*>(expr)->column_name;
+        case ExprType::STAR:
+            return "*";
+        case ExprType::CASE_WHEN:
+            return "case_when";
+        case ExprType::LITERAL_INT:
+        case ExprType::LITERAL_FLOAT:
+            return "literal";
+        case ExprType::LITERAL_NULL:
+            return "NULL";
+        default:
+            return "expr";
+    }
+}
+
+static std::vector<std::string> inferResultColumnNames(const OperatorNode* node,
+                                                       const Catalog& catalog) {
+    std::vector<std::string> names;
+    if (!node) return names;
+
+    if (const auto* agg = findAggregateNode(node)) {
+        for (std::size_t i = 0; i < agg->group_by_exprs.size(); ++i) {
+            std::string name;
+            if (i < agg->output_aliases.size()) name = agg->output_aliases[i];
+            if (name.empty()) name = defaultExpressionColumnName(agg->group_by_exprs[i].get());
+            names.push_back(name);
+        }
+        for (std::size_t i = 0; i < agg->aggregates.size(); ++i) {
+            const std::size_t slot = agg->group_by_exprs.size() + i;
+            std::string name;
+            if (slot < agg->output_aliases.size()) name = agg->output_aliases[slot];
+            if (name.empty()) name = agg->aggregates[i].func_name;
+            names.push_back(name);
+        }
+        return names;
+    }
+
+    if (const auto* proj = findProjectionNode(node)) {
+        std::vector<const TableScanNode*> scans;
+        if (!proj->getChildren().empty()) {
+            collectTableScansForResultLayout(proj->getChildren()[0].get(), scans);
+        }
+        std::size_t visible_idx = 0;
+        for (std::size_t expr_idx = 0; expr_idx < proj->select_exprs.size(); ++expr_idx) {
+            const auto& expr = proj->select_exprs[expr_idx];
+            if (!expr) continue;
+            if (expr->getType() == ExprType::STAR) {
+                for (const auto* scan : scans) {
+                    const auto& meta = catalog.getTableMetadata(scan->table_name);
+                    for (const auto& col_name : meta.getColumnNames()) {
+                        names.push_back(col_name);
+                        ++visible_idx;
+                    }
+                }
+                continue;
+            }
+            std::string name;
+            if (expr_idx < proj->output_aliases.size()) name = proj->output_aliases[expr_idx];
+            if (name.empty()) name = defaultExpressionColumnName(expr.get());
+            names.push_back(name);
+            ++visible_idx;
+        }
+        return names;
+    }
+    return names;
+}
+
+
+
 // Парсинг SQL → SelectStatement. Бросает runtime_error при ошибке.
 static hsql::SelectStatement* parseSql(const std::string& sql,
                                         hsql::SQLParserResult& result) {
@@ -238,8 +648,13 @@ std::string QueryEngine::generateQueryCode(const std::string& sql) {
 // executeQuery — новый конвейер
 // ============================================================================
 void QueryEngine::executeQuery(const std::string& sql, ExecutionContext* ctx) {
+    const auto engine_start = Clock::now();
     if (sql.empty()) {
         throw std::runtime_error("Empty query");
+    }
+
+    if (ctx) {
+        ctx->resetForQuery();
     }
 
     // ШАГ 1: Парсинг SQL
@@ -253,39 +668,58 @@ void QueryEngine::executeQuery(const std::string& sql, ExecutionContext* ctx) {
     const AggregateNode* agg_node = findAggregateNode(optimized_tree.get());
     if (agg_node) {
         ctx->expected_result_size_ = agg_node->calculateResultSize(*catalog_);
-    } else if (const ProjectionNode* proj_node = findProjectionNode(optimized_tree.get())) {
-        ctx->expected_result_size_ = proj_node->calculateResultSize(*catalog_);
+    } else if (findProjectionNode(optimized_tree.get())) {
+        // Projection uses generated two-pass exact materialization:
+        // Count pass -> host prefix scan -> exact ensureCapacity() -> write pass.
+        // Do not allocate the upper-bound result buffer before JIT execution.
+        ctx->expected_result_size_ = 1;
     } else {
         ctx->expected_result_size_ = 1;
     }
 
+    ctx->result_columns_ = inferResultColumns(optimized_tree.get(), *catalog_);
+    ctx->result_column_names_ = inferResultColumnNames(optimized_tree.get(), *catalog_);
+    ctx->resetResultShapeFlags();
+    ctx->result_is_dense_ = findProjectionNode(optimized_tree.get()) != nullptr;
+
+    preflightDeviceMemoryOrThrow(ctx, optimized_tree.get(), *catalog_);
+
     // Гарантируем достаточную ёмкость буфера и обнуляем его перед запуском ядра.
     // DynamicDeviceBuffer::ensureCapacity реаллоцирует только при нехватке места.
     ctx->result_buffer_->ensureCapacity(ctx->expected_result_size_);
-    ctx->result_buffer_->zero();            // ctx->result_buffer_ почему-то имеет capacity 31500 при expected_result_size_ = 21000
-
+    ctx->result_buffer_->zero();
+    ctx->ensureResultValidityCapacity(ctx->expected_result_size_);
 
     // ШАГ 5: Проверка кеша
-    std::string query_hash = "query_" + std::to_string(std::hash<std::string>{}(sql));
+    static constexpr const char* kJitAbiVersion = "v27_p1_case_alias_having";
+    std::string query_hash = std::string("query_") + kJitAbiVersion + "_" + std::to_string(std::hash<std::string>{}(sql));
     auto cached_lib = cache_->get(query_hash);
     if (cached_lib.has_value()) {
         // Cache HIT: размер уже рассчитан, буфер подготовлен — просто выполняем
         executor_->execute(cached_lib.value(), ctx);
+        if (ctx) ctx->timing_.engine_ms = elapsedMs(engine_start, Clock::now());
         return;
     }
 
     // ШАГ 6: Cache MISS — JIT генерация кода
+    const auto codegen_start = Clock::now();
     JITContext jit_ctx;
     JITOperatorVisitor visitor(jit_ctx, *catalog_);
     optimized_tree->accept(visitor);
     std::string source_code = visitor.generateCode();
+    const auto codegen_end = Clock::now();
+    if (ctx) ctx->timing_.codegen_ms += elapsedMs(codegen_start, codegen_end);
 
     // ШАГ 7: Компиляция → .so
+    const auto compile_start = Clock::now();
     std::string lib_path = compiler_->compile(source_code, query_hash);
+    const auto compile_end = Clock::now();
+    if (ctx) ctx->timing_.compile_ms += elapsedMs(compile_start, compile_end);
     cache_->put(query_hash, lib_path);
 
     // ШАГ 8: Выполнение
     executor_->execute(lib_path, ctx);
+    if (ctx) ctx->timing_.engine_ms = elapsedMs(engine_start, Clock::now());
 }
 
 } // namespace db
