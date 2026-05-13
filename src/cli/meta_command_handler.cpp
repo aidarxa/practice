@@ -90,6 +90,26 @@ bool MetaCommandHandler::handle(const std::string& command, SessionContext& ctx)
     }
 
 
+
+    // --- Extended timing output ---
+    if (cmd == "\\timing") {
+        std::string arg;
+        if (iss >> arg) {
+            if (arg == "on") {
+                ctx.extended_timing = true;
+                std::cout << "Extended timing: ON\n";
+            } else if (arg == "off") {
+                ctx.extended_timing = false;
+                std::cout << "Extended timing: OFF\n";
+            } else {
+                std::cerr << "Usage: \\timing on|off\n";
+            }
+        } else {
+            std::cout << "Extended timing: " << (ctx.extended_timing ? "ON" : "OFF") << "\n";
+        }
+        return false;
+    }
+
     // --- Result output row limit ---
     if (cmd == "\\limit") {
         std::string arg;

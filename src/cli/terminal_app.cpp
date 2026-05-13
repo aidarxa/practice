@@ -5,6 +5,8 @@
 
 #include <algorithm>
 #include <fstream>
+#include <chrono>
+#include <iomanip>
 #include <cstring>
 #include <iomanip>
 #include <iostream>
@@ -13,6 +15,17 @@
 #include <vector>
 
 namespace db::cli {
+
+namespace {
+using Clock = std::chrono::steady_clock;
+static double elapsedMs(const Clock::time_point& start, const Clock::time_point& end) {
+    return std::chrono::duration<double, std::milli>(end - start).count();
+}
+static void printTimingLine(const char* label, double ms) {
+    std::cout << label << ": " << std::fixed << std::setprecision(3) << ms << " ms\n";
+}
+}
+
 
 namespace {
 
@@ -70,10 +83,35 @@ std::string formatResultValue(unsigned long long raw,
     return std::to_string(raw);
 }
 
+
+std::string formatResultCell(const db::QueryResult& result, size_t row, size_t col) {
+    const bool valid = resultColumnCellIsValid(result, row, col);
+    if (!valid) return "NULL";
+    const auto type = (col < result.columns.size()) ? result.columns[col].type : db::LogicalType::UInt64;
+    std::ostringstream oss;
+    if (type == db::LogicalType::Float64) {
+        if (col < result.column_f64.size() && row < result.column_f64[col].size()) {
+            oss << std::setprecision(15) << result.column_f64[col][row];
+            return oss.str();
+        }
+    } else if (type == db::LogicalType::Int64) {
+        if (col < result.column_i64.size() && row < result.column_i64[col].size()) {
+            return std::to_string(result.column_i64[col][row]);
+        }
+    } else {
+        if (col < result.column_u64.size() && row < result.column_u64[col].size()) {
+            return std::to_string(result.column_u64[col][row]);
+        }
+    }
+    return formatResultValue(resultCellRaw(result, row, col), result.columns, col, valid);
+}
+
 } // anonymous namespace
 
 TerminalApp::TerminalApp(std::shared_ptr<db::DatabaseInstance> db)
-    : db_(std::move(db)) {}
+    : db_(std::move(db)) {
+    if (db_) ctx_.applyConfig(db_->config());
+}
 
 void TerminalApp::run() {
     // Настраиваем linenoise
@@ -138,6 +176,7 @@ void TerminalApp::run() {
 }
 
 void TerminalApp::executeQuery(const std::string& sql) {
+    const auto total_start = Clock::now();
     try {
         if (ctx_.dump_code) {
             std::string code = db_->generateQueryCode(sql);
@@ -200,23 +239,30 @@ void TerminalApp::executeQuery(const std::string& sql) {
                 for (size_t row : rows_to_print) {
                     const size_t base = row * tuple_size;
                     if (tuple_size <= 1) {
-                        std::cout << formatResultValue(resultCellRaw(query_result, row, 0), columns, 0, resultColumnCellIsValid(query_result, row, 0)) << "\n";
+                        std::cout << formatResultCell(query_result, row, 0) << "\n";
                         continue;
                     }
                     std::cout << "Row " << row << ": ";
                     for (size_t j = 0; j < tuple_size; ++j) {
-                        std::cout << formatResultValue(resultCellRaw(query_result, row, j), columns, j, resultColumnCellIsValid(query_result, row, j));
+                        std::cout << formatResultCell(query_result, row, j);
                         if (j < tuple_size - 1) std::cout << " | ";
                     }
                     std::cout << "\n";
                 }
             }
             std::cout << "Rows returned: " << query_result.row_count << "\n";
-            if (ctx_.output_row_limit_enabled && query_result.row_count > rows_to_print.size()) {
-                std::cout << "Rows shown: " << rows_to_print.size()
-                          << " (last rows; change with \\limit)\n";
-            } else {
+            if (ctx_.output_row_limit_enabled && query_result.row_count > ctx_.output_row_limit) {
                 std::cout << "Rows shown: " << rows_to_print.size() << "\n";
+            }
+            printTimingLine("GPU execution + host fetch time", query_result.timing.gpu_and_host_fetch_ms);
+            if (ctx_.extended_timing) {
+                printTimingLine("Code generation time", query_result.timing.codegen_ms);
+                printTimingLine("ACPP compilation time", query_result.timing.compile_ms);
+                printTimingLine("Library load + execution start time", query_result.timing.library_load_ms);
+                printTimingLine("Generated function execution time", query_result.timing.jit_execute_ms);
+                printTimingLine("Host result fetch time", query_result.timing.host_fetch_ms);
+                printTimingLine("Engine processing time", query_result.timing.total_engine_ms);
+                printTimingLine("Total query processing time", elapsedMs(total_start, Clock::now()));
             }
             std::cout << "--- End ---\n";
         }

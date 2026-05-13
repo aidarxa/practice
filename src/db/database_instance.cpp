@@ -4,20 +4,32 @@
 
 #include <iostream>
 #include <iomanip>
+#include <chrono>
+#include <cstring>
 
 namespace db {
 
+namespace {
+using Clock = std::chrono::steady_clock;
+static double elapsedMs(const Clock::time_point& start, const Clock::time_point& end) {
+    return std::chrono::duration<double, std::milli>(end - start).count();
+}
+}
+
+
 DatabaseInstance::DatabaseInstance()
-    : q_(sycl::gpu_selector_v,sycl::property::queue::in_order()) {
+    : config_(loadCrystalConfig()),
+      q_(sycl::gpu_selector_v,sycl::property::queue::in_order()) {
     ctx_ = std::make_unique<ExecutionContext>();
     ctx_->q_ = &q_;
+    ctx_->config_ = config_;
 
     initCatalog();
 
     engine_ = std::make_unique<QueryEngine>(
         catalog_,
         std::make_unique<FileBasedQueryCache>(),
-        std::make_unique<AdaptiveCppCompiler>(),
+        std::make_unique<AdaptiveCppCompiler>(config_.include_dir, config_.deps_include_dir),
         std::make_unique<DynamicLibraryExecutor>()
     );
 
@@ -165,6 +177,7 @@ QueryResult DatabaseInstance::executeQuery(const std::string& sql) {
     // на основе рассчитанного expected_result_size_.
     engine_->executeQuery(sql, ctx_.get());
 
+    const auto fetch_start = Clock::now();
     // Ждём завершения всех GPU операций перед копированием на хост.
     q_.wait();
 
@@ -178,17 +191,46 @@ QueryResult DatabaseInstance::executeQuery(const std::string& sql) {
         result.dense_result = true;
         result.has_columnar_result = true;
         result.column_data.resize(ctx_->result_column_count_);
+        result.column_i64.resize(ctx_->result_column_count_);
+        result.column_u64.resize(ctx_->result_column_count_);
+        result.column_f64.resize(ctx_->result_column_count_);
         result.column_validity_bitmap.resize(ctx_->result_column_count_);
         const size_t rows_to_copy = result.row_count;
         const size_t validity_words = (rows_to_copy + 63ULL) / 64ULL;
         for (size_t col = 0; col < ctx_->result_column_count_; ++col) {
-            if (col < ctx_->result_column_buffers_.size() && ctx_->result_column_buffers_[col]) {
-                ctx_->result_column_buffers_[col]->copyToHost(result.column_data[col], rows_to_copy);
-            }
-            if (col < ctx_->result_column_validity_buffers_.size() && ctx_->result_column_validity_buffers_[col]) {
-                ctx_->result_column_validity_buffers_[col]->copyToHost(result.column_validity_bitmap[col], validity_words);
+            const db::LogicalType type = (col < result.columns.size()) ? result.columns[col].type : db::LogicalType::UInt64;
+            if (col < ctx_->result_column_storage_.size()) {
+                const auto& storage = ctx_->result_column_storage_[col];
+                if (type == db::LogicalType::Float64 && storage.f64) {
+                    storage.f64->copyToHost(result.column_f64[col], rows_to_copy);
+                    result.column_data[col].resize(rows_to_copy);
+                    for (size_t r = 0; r < rows_to_copy; ++r) {
+                        unsigned long long bits = 0ULL;
+                        static_assert(sizeof(bits) == sizeof(double), "double/ULL size mismatch");
+                        std::memcpy(&bits, &result.column_f64[col][r], sizeof(double));
+                        result.column_data[col][r] = bits;
+                    }
+                } else if (type == db::LogicalType::Int64 && storage.i64) {
+                    storage.i64->copyToHost(result.column_i64[col], rows_to_copy);
+                    result.column_data[col].resize(rows_to_copy);
+                    for (size_t r = 0; r < rows_to_copy; ++r) {
+                        result.column_data[col][r] = static_cast<unsigned long long>(result.column_i64[col][r]);
+                    }
+                } else if (storage.u64) {
+                    storage.u64->copyToHost(result.column_u64[col], rows_to_copy);
+                    result.column_data[col].resize(rows_to_copy);
+                    for (size_t r = 0; r < rows_to_copy; ++r) {
+                        result.column_data[col][r] = static_cast<unsigned long long>(result.column_u64[col][r]);
+                    }
+                }
+                if (storage.validity) {
+                    storage.validity->copyToHost(result.column_validity_bitmap[col], validity_words);
+                }
             }
         }
+        result.timing = ctx_->timing_;
+        result.timing.host_fetch_ms = elapsedMs(fetch_start, Clock::now());
+        result.timing.gpu_and_host_fetch_ms = result.timing.jit_execute_ms + result.timing.host_fetch_ms;
         return result;
     }
 
@@ -220,6 +262,15 @@ QueryResult DatabaseInstance::executeQuery(const std::string& sql) {
         const size_t physical_rows = result.data.size() / result.tuple_size;
         if (physical_rows == 0) return;
         result.column_data.assign(result.tuple_size, std::vector<unsigned long long>(physical_rows, 0ULL));
+        result.column_i64.assign(result.tuple_size, std::vector<std::int64_t>());
+        result.column_u64.assign(result.tuple_size, std::vector<std::uint64_t>());
+        result.column_f64.assign(result.tuple_size, std::vector<double>());
+        for (size_t col = 0; col < result.tuple_size; ++col) {
+            const auto type = (col < result.columns.size()) ? result.columns[col].type : db::LogicalType::UInt64;
+            if (type == db::LogicalType::Float64) result.column_f64[col].assign(physical_rows, 0.0);
+            else if (type == db::LogicalType::Int64) result.column_i64[col].assign(physical_rows, 0);
+            else result.column_u64[col].assign(physical_rows, 0);
+        }
         const size_t words_per_col = (physical_rows + 63ULL) / 64ULL;
         result.column_validity_bitmap.assign(result.tuple_size, std::vector<uint64_t>(words_per_col, 0ULL));
         for (size_t row = 0; row < physical_rows; ++row) {
@@ -227,6 +278,17 @@ QueryResult DatabaseInstance::executeQuery(const std::string& sql) {
             for (size_t col = 0; col < result.tuple_size; ++col) {
                 const size_t src_idx = base + col;
                 result.column_data[col][row] = result.data[src_idx];
+                const auto type = (col < result.columns.size()) ? result.columns[col].type : db::LogicalType::UInt64;
+                if (type == db::LogicalType::Float64) {
+                    double value = 0.0;
+                    unsigned long long bits = result.data[src_idx];
+                    std::memcpy(&value, &bits, sizeof(double));
+                    result.column_f64[col][row] = value;
+                } else if (type == db::LogicalType::Int64) {
+                    result.column_i64[col][row] = static_cast<std::int64_t>(result.data[src_idx]);
+                } else {
+                    result.column_u64[col][row] = static_cast<std::uint64_t>(result.data[src_idx]);
+                }
                 if (row_valid_at(src_idx)) {
                     result.column_validity_bitmap[col][row >> 6U] |= (1ULL << (row & 63U));
                 }
@@ -267,6 +329,9 @@ QueryResult DatabaseInstance::executeQuery(const std::string& sql) {
         }
         result.row_count = non_empty_rows;
     }
+    result.timing = ctx_->timing_;
+    result.timing.host_fetch_ms = elapsedMs(fetch_start, Clock::now());
+    result.timing.gpu_and_host_fetch_ms = result.timing.jit_execute_ms + result.timing.host_fetch_ms;
     return result;
 }
 

@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <string>
+#include "core/config.h"
 
 namespace db::cli {
 
@@ -17,6 +18,15 @@ struct SessionContext {
     // separately.
     bool output_row_limit_enabled = true;
     std::size_t output_row_limit = 1000;
+
+    bool extended_timing = false;
+
+    void applyConfig(const db::CrystalConfig& cfg) {
+        dump_code = cfg.dump_generated_code;
+        output_row_limit_enabled = cfg.output_row_limit_enabled;
+        output_row_limit = cfg.output_row_limit == 0 ? 1000 : cfg.output_row_limit;
+        extended_timing = cfg.extended_timing;
+    }
 };
 
 } // namespace db::cli

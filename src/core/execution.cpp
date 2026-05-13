@@ -4,6 +4,7 @@
 #include "core/visitor.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdlib>
 #include <dlfcn.h>
 #include <filesystem>
@@ -19,6 +20,14 @@
 #include <vector>
 
 namespace db {
+
+namespace {
+using Clock = std::chrono::steady_clock;
+static double elapsedMs(const Clock::time_point& start, const Clock::time_point& end) {
+    return std::chrono::duration<double, std::milli>(end - start).count();
+}
+}
+
 
 static std::string tableNameFromColumn(const std::string& col) {
     if (col.rfind("lo_", 0) == 0) return "LINEORDER";
@@ -75,21 +84,16 @@ static std::string escapeShellArg(const std::string& value) {
 
 static std::string getRequiredPath(const char* env_name,
                                    const std::string& configured_value) {
+    const char* env_value = std::getenv(env_name);
+    if (env_value && *env_value) {
+        return std::string(env_value);
+    }
     if (!configured_value.empty()) {
         return configured_value;
     }
-    const char* env_value = std::getenv(env_name);
-    if (!env_value) {
-        throw std::runtime_error(
-            std::string("Missing required path. Set environment variable ") +
-            env_name + " or pass it into AdaptiveCppCompiler constructor.");
-    }
-    std::string path(env_value);
-    if (path.empty()) {
-        throw std::runtime_error(
-            std::string("Environment variable ") + env_name + " is empty.");
-    }
-    return path;
+    throw std::runtime_error(
+        std::string("Missing required path. Set ") + env_name +
+        " in environment, crystal.conf, or CMake defaults.");
 }
 
 static void validateExistingDir(const std::string& path, const std::string& name) {
@@ -147,6 +151,7 @@ std::string AdaptiveCppCompiler::compile(const std::string& source_code, const s
 // --- DynamicLibraryExecutor ---
 
 void DynamicLibraryExecutor::execute(const std::string& lib_path, ExecutionContext* ctx) {
+    const auto load_start = Clock::now();
     void* handle = dlopen(lib_path.c_str(), RTLD_NOW | RTLD_LOCAL);
     if (!handle) {
         throw std::runtime_error("dlopen failed: " + std::string(dlerror()));
@@ -167,9 +172,17 @@ void DynamicLibraryExecutor::execute(const std::string& lib_path, ExecutionConte
 
     typedef void (*JitFunc)(db::ExecutionContext*);
     JitFunc func = reinterpret_cast<JitFunc>(sym);
+    const auto load_end = Clock::now();
+    if (ctx) {
+        ctx->timing_.library_load_ms += elapsedMs(load_start, load_end);
+    }
 
-    // Execute the kernel
+    const auto exec_start = Clock::now();
     func(ctx);
+    const auto exec_end = Clock::now();
+    if (ctx) {
+        ctx->timing_.jit_execute_ms += elapsedMs(exec_start, exec_end);
+    }
 }
 
 // --- QueryEngine ---
@@ -332,7 +345,7 @@ static std::string formatBytes(size_t bytes) {
 static void preflightDeviceMemoryOrThrow(const ExecutionContext* ctx,
                                          const OperatorNode* root,
                                          const Catalog& catalog) {
-    if (!ctx || !ctx->q_) return;
+    if (!ctx || !ctx->q_ || !ctx->config_.memory_guard_enabled) return;
     const auto dev = ctx->q_->get_device();
     const size_t total = static_cast<size_t>(dev.get_info<sycl::info::device::global_mem_size>());
     if (total == 0) return;
@@ -366,7 +379,8 @@ static void preflightDeviceMemoryOrThrow(const ExecutionContext* ctx,
     // Keep a conservative reserve for runtime allocations, code objects, queues,
     // driver bookkeeping, and fragmentation.  A hard allocation failure in ROCm
     // may destabilize the graphics session, so reject before malloc_device.
-    const size_t reserve = std::max(total / 10, static_cast<size_t>(512ULL * 1024ULL * 1024ULL));
+    const size_t fraction_reserve = static_cast<size_t>(static_cast<double>(total) * ctx->config_.memory_guard_reserve_fraction);
+    const size_t reserve = std::max(fraction_reserve, ctx->config_.memory_guard_reserve_bytes);
     const size_t budget = total > reserve ? total - reserve : total / 2;
 
     if (required > budget) {
@@ -391,6 +405,28 @@ static void collectTableScansForResultLayout(const OperatorNode* node,
     }
     for (const auto& child : node->getChildren()) {
         collectTableScansForResultLayout(child.get(), out);
+    }
+}
+
+
+static LogicalType expressionResultType(const ExprNode* expr) {
+    if (!expr) return LogicalType::UInt64;
+    switch (expr->getType()) {
+        case ExprType::OP_EQ:
+        case ExprType::OP_NEQ:
+        case ExprType::OP_LT:
+        case ExprType::OP_LTE:
+        case ExprType::OP_GT:
+        case ExprType::OP_GTE:
+        case ExprType::OP_AND:
+        case ExprType::OP_OR:
+        case ExprType::OP_IS_NULL:
+        case ExprType::OP_IS_NOT_NULL:
+            return LogicalType::UInt64;
+        case ExprType::LITERAL_FLOAT:
+            return LogicalType::Float64;
+        default:
+            return LogicalType::Int64;
     }
 }
 
@@ -441,7 +477,7 @@ static std::vector<ResultColumnDesc> inferResultColumns(const OperatorNode* node
 
     if (const auto* agg = findAggregateNode(node)) {
         for (const auto& gexpr : agg->group_by_exprs) {
-            descs.push_back({LogicalType::Int64, 0, expressionMayBeNullable(gexpr.get(), catalog)});
+            descs.push_back({expressionResultType(gexpr.get()), 0, expressionMayBeNullable(gexpr.get(), catalog)});
         }
         for (const auto& agg_def : agg->aggregates) {
             if (agg_def.isAvg()) {
@@ -470,7 +506,7 @@ static std::vector<ResultColumnDesc> inferResultColumns(const OperatorNode* node
                     }
                 }
             } else {
-                descs.push_back({LogicalType::Int64, 0, expressionMayBeNullable(expr.get(), catalog)});
+                descs.push_back({expressionResultType(expr.get()), 0, expressionMayBeNullable(expr.get(), catalog)});
             }
         }
     }
@@ -517,8 +553,13 @@ std::string QueryEngine::generateQueryCode(const std::string& sql) {
 // executeQuery — новый конвейер
 // ============================================================================
 void QueryEngine::executeQuery(const std::string& sql, ExecutionContext* ctx) {
+    const auto engine_start = Clock::now();
     if (sql.empty()) {
         throw std::runtime_error("Empty query");
+    }
+
+    if (ctx) {
+        ctx->resetForQuery();
     }
 
     // ШАГ 1: Парсинг SQL
@@ -554,27 +595,35 @@ void QueryEngine::executeQuery(const std::string& sql, ExecutionContext* ctx) {
     ctx->ensureResultValidityCapacity(ctx->expected_result_size_);
 
     // ШАГ 5: Проверка кеша
-    static constexpr const char* kJitAbiVersion = "v18_columnar_projection";
+    static constexpr const char* kJitAbiVersion = "v20_typed_columnar_nullable_tests";
     std::string query_hash = std::string("query_") + kJitAbiVersion + "_" + std::to_string(std::hash<std::string>{}(sql));
     auto cached_lib = cache_->get(query_hash);
     if (cached_lib.has_value()) {
         // Cache HIT: размер уже рассчитан, буфер подготовлен — просто выполняем
         executor_->execute(cached_lib.value(), ctx);
+        if (ctx) ctx->timing_.total_engine_ms = elapsedMs(engine_start, Clock::now());
         return;
     }
 
     // ШАГ 6: Cache MISS — JIT генерация кода
+    const auto codegen_start = Clock::now();
     JITContext jit_ctx;
     JITOperatorVisitor visitor(jit_ctx, *catalog_);
     optimized_tree->accept(visitor);
     std::string source_code = visitor.generateCode();
+    const auto codegen_end = Clock::now();
+    if (ctx) ctx->timing_.codegen_ms += elapsedMs(codegen_start, codegen_end);
 
     // ШАГ 7: Компиляция → .so
+    const auto compile_start = Clock::now();
     std::string lib_path = compiler_->compile(source_code, query_hash);
+    const auto compile_end = Clock::now();
+    if (ctx) ctx->timing_.compile_ms += elapsedMs(compile_start, compile_end);
     cache_->put(query_hash, lib_path);
 
     // ШАГ 8: Выполнение
     executor_->execute(lib_path, ctx);
+    if (ctx) ctx->timing_.total_engine_ms = elapsedMs(engine_start, Clock::now());
 }
 
 } // namespace db

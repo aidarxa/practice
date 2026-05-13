@@ -70,6 +70,71 @@ static const char* exprTypeName(ExprType t) {
     }
 }
 
+
+static LogicalType resultLogicalTypeForExpr(const ExprNode* expr) {
+    if (!expr) return LogicalType::UInt64;
+    switch (expr->getType()) {
+        case ExprType::OP_EQ:
+        case ExprType::OP_NEQ:
+        case ExprType::OP_LT:
+        case ExprType::OP_LTE:
+        case ExprType::OP_GT:
+        case ExprType::OP_GTE:
+        case ExprType::OP_AND:
+        case ExprType::OP_OR:
+        case ExprType::OP_IS_NULL:
+        case ExprType::OP_IS_NOT_NULL:
+            return LogicalType::UInt64;
+        case ExprType::LITERAL_FLOAT:
+            return LogicalType::Float64;
+        default:
+            return LogicalType::Int64;
+    }
+}
+
+static LogicalType resultLogicalTypeForAggregateOutput(const AggregateNode* node, int visible_col) {
+    if (!node) return LogicalType::UInt64;
+    const int group_cols = static_cast<int>(node->group_by_exprs.size());
+    if (visible_col < group_cols) {
+        return resultLogicalTypeForExpr(node->group_by_exprs[static_cast<std::size_t>(visible_col)].get());
+    }
+    const int agg_idx = visible_col - group_cols;
+    if (agg_idx >= 0 && agg_idx < static_cast<int>(node->aggregates.size())) {
+        const auto& agg = node->aggregates[static_cast<std::size_t>(agg_idx)];
+        if (agg.isAvg()) return LogicalType::Float64;
+        if (agg.isCount()) return LogicalType::UInt64;
+        return LogicalType::UInt64;
+    }
+    return LogicalType::UInt64;
+}
+
+static std::string resultColumnPointerType(LogicalType type) {
+    switch (type) {
+        case LogicalType::Float64: return "double*";
+        case LogicalType::Int64:   return "std::int64_t*";
+        case LogicalType::UInt64:  return "std::uint64_t*";
+    }
+    return "std::uint64_t*";
+}
+
+static std::string resultColumnGetter(LogicalType type) {
+    switch (type) {
+        case LogicalType::Float64: return "getResultColumnFloat64Pointer";
+        case LogicalType::Int64:   return "getResultColumnInt64Pointer";
+        case LogicalType::UInt64:  return "getResultColumnUInt64Pointer";
+    }
+    return "getResultColumnUInt64Pointer";
+}
+
+static std::string castToResultColumnType(const std::string& value, LogicalType type) {
+    switch (type) {
+        case LogicalType::Float64: return "static_cast<double>(" + value + ")";
+        case LogicalType::Int64:   return "static_cast<std::int64_t>(" + value + ")";
+        case LogicalType::UInt64:  return "static_cast<std::uint64_t>(" + value + ")";
+    }
+    return "static_cast<std::uint64_t>(" + value + ")";
+}
+
 static bool isComparisonOp(ExprType t) {
     return t >= ExprType::OP_EQ && t <= ExprType::OP_GTE;
 }
@@ -1367,6 +1432,108 @@ static void emitAggregateFinalizationIfNeeded(const AggregateNode* node,
     out << "    ctx->expected_result_validity_words_ = " << (visible_words == 0 ? 1 : visible_words) << ";\n\n";
 }
 
+
+static void emitAggregateDenseColumnarMaterialization(const AggregateNode* node,
+                                                     JITContext& ctx,
+                                                     uint64_t group_count,
+                                                     int visible_ts) {
+    if (!node || visible_ts <= 0) return;
+    const std::string count_kernel = "AggregateDenseCount";
+    const std::string write_kernel = "AggregateDenseWrite";
+    const std::string marker = "aggregate_dense_columnar_materialization";
+    if (!ctx.emitted_auxiliary_kernels.insert(marker).second) return;
+    for (const auto& k : {count_kernel, write_kernel}) {
+        if (std::find(ctx.kernel_class_names.begin(), ctx.kernel_class_names.end(), k) == ctx.kernel_class_names.end()) {
+            ctx.kernel_class_names.push_back(k);
+        }
+    }
+
+    auto& out = ctx.post_execution_code;
+    out << "    {\n";
+    out << "        const unsigned long long aggregate_group_count = " << group_count << "ULL;\n";
+    out << "        const unsigned long long aggregate_tuple_size = " << visible_ts << "ULL;\n";
+    out << "        unsigned long long* d_aggregate_counts = sycl::malloc_device<unsigned long long>(aggregate_group_count == 0ULL ? 1ULL : aggregate_group_count, q);\n";
+    out << "        unsigned long long* d_aggregate_offsets = sycl::malloc_device<unsigned long long>(aggregate_group_count == 0ULL ? 1ULL : aggregate_group_count, q);\n";
+    out << "        q.memset(d_aggregate_counts, 0, (aggregate_group_count == 0ULL ? 1ULL : aggregate_group_count) * sizeof(unsigned long long));\n";
+    out << "        q.memset(d_aggregate_offsets, 0, (aggregate_group_count == 0ULL ? 1ULL : aggregate_group_count) * sizeof(unsigned long long));\n";
+    out << "        q.submit([&](sycl::handler& h) {\n";
+    out << "            h.parallel_for<class " << count_kernel << ">(sycl::range<1>(aggregate_group_count == 0ULL ? 1ULL : aggregate_group_count), [=](sycl::id<1> gid) {\n";
+    out << "                unsigned long long g = static_cast<unsigned long long>(gid[0]);\n";
+    out << "                if (g >= aggregate_group_count) return;\n";
+    if (node->group_by_exprs.empty()) {
+        out << "                d_aggregate_counts[g] = 1ULL;\n";
+    } else {
+        out << "                bool present = false;\n";
+        out << "                unsigned long long base = g * aggregate_tuple_size;\n";
+        out << "                for (unsigned long long c = 0; c < aggregate_tuple_size; ++c) {\n";
+        out << "                    if (db::bitmap_valid_at(d_result_validity, base + c) || d_result[base + c] != 0ULL) { present = true; break; }\n";
+        out << "                }\n";
+        out << "                d_aggregate_counts[g] = present ? 1ULL : 0ULL;\n";
+    }
+    out << "            });\n";
+    out << "        });\n";
+    out << "        std::vector<unsigned long long> h_aggregate_counts(static_cast<std::size_t>(aggregate_group_count == 0ULL ? 1ULL : aggregate_group_count), 0ULL);\n";
+    out << "        std::vector<unsigned long long> h_aggregate_offsets(static_cast<std::size_t>(aggregate_group_count == 0ULL ? 1ULL : aggregate_group_count), 0ULL);\n";
+    out << "        if (aggregate_group_count != 0ULL) {\n";
+    out << "            q.memcpy(h_aggregate_counts.data(), d_aggregate_counts, static_cast<std::size_t>(aggregate_group_count) * sizeof(unsigned long long)).wait();\n";
+    out << "        }\n";
+    out << "        unsigned long long aggregate_row_count = 0ULL;\n";
+    out << "        for (unsigned long long g = 0; g < aggregate_group_count; ++g) {\n";
+    out << "            h_aggregate_offsets[static_cast<std::size_t>(g)] = aggregate_row_count;\n";
+    out << "            aggregate_row_count += h_aggregate_counts[static_cast<std::size_t>(g)];\n";
+    out << "        }\n";
+    out << "        if (aggregate_group_count != 0ULL) {\n";
+    out << "            q.memcpy(d_aggregate_offsets, h_aggregate_offsets.data(), static_cast<std::size_t>(aggregate_group_count) * sizeof(unsigned long long)).wait();\n";
+    out << "        }\n";
+    out << "        if (aggregate_row_count != 0ULL && aggregate_row_count > static_cast<unsigned long long>(std::numeric_limits<std::size_t>::max() / aggregate_tuple_size)) {\n";
+    out << "            throw std::overflow_error(\"Aggregate dense result size overflow\");\n";
+    out << "        }\n";
+    out << "        const std::size_t aggregate_result_values = static_cast<std::size_t>(aggregate_row_count * aggregate_tuple_size);\n";
+    out << "        const std::size_t aggregate_result_bytes = aggregate_result_values * sizeof(unsigned long long);\n";
+    out << "        const std::size_t aggregate_validity_bytes = static_cast<std::size_t>(aggregate_tuple_size) * (((static_cast<std::size_t>(aggregate_row_count) + 63ULL) / 64ULL) == 0 ? 1ULL : ((static_cast<std::size_t>(aggregate_row_count) + 63ULL) / 64ULL)) * sizeof(uint64_t);\n";
+    out << "        const std::size_t aggregate_temp_bytes = static_cast<std::size_t>(aggregate_group_count == 0ULL ? 1ULL : aggregate_group_count) * 2ULL * sizeof(unsigned long long);\n";
+    out << "        const std::size_t aggregate_total_mem = static_cast<std::size_t>(q.get_device().get_info<sycl::info::device::global_mem_size>());\n";
+    out << "        const std::size_t aggregate_reserve_fraction = static_cast<std::size_t>(static_cast<double>(aggregate_total_mem) * ctx->config_.memory_guard_reserve_fraction);\n";
+    out << "        const std::size_t aggregate_reserve = aggregate_reserve_fraction > ctx->config_.memory_guard_reserve_bytes ? aggregate_reserve_fraction : ctx->config_.memory_guard_reserve_bytes;\n";
+    out << "        const std::size_t aggregate_budget = aggregate_total_mem > aggregate_reserve ? aggregate_total_mem - aggregate_reserve : aggregate_total_mem / 2ULL;\n";
+    out << "        const std::size_t aggregate_required = ctx->loaded_device_bytes_ + aggregate_temp_bytes + aggregate_result_bytes + aggregate_validity_bytes;\n";
+    out << "        if (ctx->config_.memory_guard_enabled && aggregate_required > aggregate_budget) {\n";
+    out << "            throw std::runtime_error(\"Insufficient GPU memory after aggregate count: exact dense aggregate result does not fit device memory\");\n";
+    out << "        }\n";
+    out << "        ctx->result_row_count_ = static_cast<std::size_t>(aggregate_row_count);\n";
+    out << "        ctx->result_is_dense_ = true;\n";
+    out << "        ctx->expected_result_size_ = aggregate_result_values == 0 ? aggregate_tuple_size : aggregate_result_values;\n";
+    out << "        ctx->ensureColumnarResultCapacity(static_cast<std::size_t>(aggregate_tuple_size), static_cast<std::size_t>(aggregate_row_count));\n";
+    for (int c = 0; c < visible_ts; ++c) {
+        const LogicalType type = resultLogicalTypeForAggregateOutput(node, c);
+        out << "        " << resultColumnPointerType(type) << " d_result_col_" << c << " = ctx->" << resultColumnGetter(type) << "(" << c << ");\n";
+        out << "        uint64_t* d_result_validity_col_" << c << " = ctx->getResultColumnValidityPointer(" << c << ");\n";
+    }
+    out << "        q.submit([&](sycl::handler& h) {\n";
+    out << "            h.parallel_for<class " << write_kernel << ">(sycl::range<1>(aggregate_group_count == 0ULL ? 1ULL : aggregate_group_count), [=](sycl::id<1> gid) {\n";
+    out << "                unsigned long long g = static_cast<unsigned long long>(gid[0]);\n";
+    out << "                if (g >= aggregate_group_count || d_aggregate_counts[g] == 0ULL) return;\n";
+    out << "                unsigned long long out_row = d_aggregate_offsets[g];\n";
+    out << "                unsigned long long src = g * aggregate_tuple_size;\n";
+    for (int c = 0; c < visible_ts; ++c) {
+        const LogicalType type = resultLogicalTypeForAggregateOutput(node, c);
+        std::string value_expr = "d_result[src + " + std::to_string(c) + "]";
+        if (type == LogicalType::Float64) {
+            value_expr = "db::bit_cast_ull_to_double(" + value_expr + ")";
+        } else {
+            value_expr = castToResultColumnType(value_expr, type);
+        }
+        out << "                d_result_col_" << c << "[out_row] = " << value_expr << ";\n";
+        out << "                if (db::bitmap_valid_at(d_result_validity, src + " << c << ")) db::atomic_set_valid_bit(d_result_validity_col_" << c << ", out_row);\n";
+    }
+    out << "            });\n";
+    out << "        });\n";
+    out << "        q.wait();\n";
+    out << "        sycl::free(d_aggregate_counts, q);\n";
+    out << "        sycl::free(d_aggregate_offsets, q);\n";
+    out << "    }\n\n";
+}
+
 static void emitAtomicAggregateUpdate(std::stringstream& code,
                                       const std::string& ref_expr,
                                       const AggregateDef& agg,
@@ -1485,6 +1652,7 @@ void JITOperatorVisitor::consumeAggregateVector(const AggregateNode* node, JITCo
             }
         }
         emitAggregateFinalizationIfNeeded(node, ctx, 1, visible_ts, storage_ts, hidden_count_slot);
+        emitAggregateDenseColumnarMaterialization(node, ctx, 1, visible_ts);
     } else {
         auto [hash_expr, total_size] = generatePerfectHash(node->group_by_exprs, catalog_, ctx);
         ctx.tuple_size = visible_ts;
@@ -1529,6 +1697,7 @@ void JITOperatorVisitor::consumeAggregateVector(const AggregateNode* node, JITCo
         code << "                }\n";
         code << "            }\n";
         emitAggregateFinalizationIfNeeded(node, ctx, total_size, visible_ts, storage_ts, hidden_count_slot);
+        emitAggregateDenseColumnarMaterialization(node, ctx, total_size, visible_ts);
     }
 }
 
@@ -1572,6 +1741,7 @@ void JITOperatorVisitor::consumeAggregateItem(const AggregateNode* node, JITCont
             code << "                        }\n";
         }
         emitAggregateFinalizationIfNeeded(node, ctx, 1, visible_ts, storage_ts, hidden_count_slot);
+        emitAggregateDenseColumnarMaterialization(node, ctx, 1, visible_ts);
     } else {
         std::set<std::string> required_cols;
         collectAggregateColumns(node, required_cols);
@@ -1619,6 +1789,7 @@ void JITOperatorVisitor::consumeAggregateItem(const AggregateNode* node, JITCont
             ++slot;
         }
         emitAggregateFinalizationIfNeeded(node, ctx, total_size, visible_ts, storage_ts, hidden_count_slot);
+        emitAggregateDenseColumnarMaterialization(node, ctx, total_size, visible_ts);
     }
 }
 
@@ -1644,7 +1815,8 @@ static bool projectionRequiresRowIdPayload(const HashJoinNode* join_node,
 
 static void ensureProjectionExactBuffers(JITContext& ctx,
                                          const std::string& row_count_expr,
-                                         int tuple_size) {
+                                         int tuple_size,
+                                         const std::vector<LogicalType>& result_types) {
     const std::string num_tiles_expr = "((" + row_count_expr + " + TILE_SIZE - 1) / TILE_SIZE)";
     auto has_buffer = [&](const std::string& name) {
         for (const auto& ht : ctx.hash_tables) {
@@ -1675,13 +1847,15 @@ static void ensureProjectionExactBuffers(JITContext& ctx,
 
 static void emitProjectionPrefixScanBeforeWrite(JITContext& ctx,
                                                 const std::string& row_count_expr,
-                                                int tuple_size) {
+                                                int tuple_size,
+                                                const std::vector<LogicalType>& result_types) {
     const std::string marker = "projection_exact_prefix_scan";
     if (!ctx.emitted_auxiliary_kernels.insert(marker).second) return;
 
     auto& out = ctx.current_pipeline->includes_and_globals;
     for (int col = 0; col < tuple_size; ++col) {
-        out << "    unsigned long long* d_result_col_" << col << " = nullptr;\n";
+        const LogicalType type = (col < static_cast<int>(result_types.size())) ? result_types[static_cast<std::size_t>(col)] : LogicalType::UInt64;
+        out << "    " << resultColumnPointerType(type) << " d_result_col_" << col << " = nullptr;\n";
         out << "    uint64_t* d_result_validity_col_" << col << " = nullptr;\n";
     }
     out << "    {\n";
@@ -1740,7 +1914,8 @@ static void emitProjectionPrefixScanBeforeWrite(JITContext& ctx,
     out << "        ctx->ensureColumnarResultCapacity(" << tuple_size << ", static_cast<size_t>(projection_running));\n";
     out << "        q.memset(d_projection_write_counts, 0, projection_num_tiles * sizeof(unsigned long long));\n";
     for (int col = 0; col < tuple_size; ++col) {
-        out << "        d_result_col_" << col << " = ctx->getResultColumnPointer(" << col << ");\n";
+        const LogicalType type = (col < static_cast<int>(result_types.size())) ? result_types[static_cast<std::size_t>(col)] : LogicalType::UInt64;
+        out << "        d_result_col_" << col << " = ctx->" << resultColumnGetter(type) << "(" << col << ");\n";
         out << "        d_result_validity_col_" << col << " = ctx->getResultColumnValidityPointer(" << col << ");\n";
     }
     out << "    }\n\n";
@@ -1813,9 +1988,12 @@ void JITOperatorVisitor::consumeProjectionVector(const ProjectionNode* node, JIT
 
     const int tuple_size = (int)expanded.size();
     ctx.tuple_size = tuple_size > 0 ? tuple_size : 1;
+    std::vector<LogicalType> projection_types;
+    projection_types.reserve(expanded.size());
+    for (const auto* expr : expanded) projection_types.push_back(resultLogicalTypeForExpr(expr));
     std::string row_count = "LO_LEN";
     if (scans.size() == 1) row_count = sizeMacroFor(scans[0]->table_name);
-    ensureProjectionExactBuffers(ctx, row_count, ctx.tuple_size);
+    ensureProjectionExactBuffers(ctx, row_count, ctx.tuple_size, projection_types);
 
     if (projection_pass_ == ProjectionPass::Count) {
         code << "            unsigned long long projection_local_count = 0ULL;\n";
@@ -1832,7 +2010,7 @@ void JITOperatorVisitor::consumeProjectionVector(const ProjectionNode* node, JIT
     }
 
     if (projection_pass_ == ProjectionPass::Write) {
-        emitProjectionPrefixScanBeforeWrite(ctx, row_count, ctx.tuple_size);
+        emitProjectionPrefixScanBeforeWrite(ctx, row_count, ctx.tuple_size, projection_types);
     }
 
     std::vector<std::string> cols;
@@ -1854,7 +2032,8 @@ void JITOperatorVisitor::consumeProjectionVector(const ProjectionNode* node, JIT
     for (int slot = 0; slot < (int)expanded.size(); ++slot) {
         std::string val = expr_vis.translateInlineExpr(expanded[slot], true);
         std::string valid = expressionValidExpr(expanded[slot], ctx);
-        code << "                    d_result_col_" << slot << "[out_row] = (unsigned long long)(" << val << ");\n";
+        const LogicalType out_type = (slot < static_cast<int>(projection_types.size())) ? projection_types[static_cast<std::size_t>(slot)] : LogicalType::UInt64;
+        code << "                    d_result_col_" << slot << "[out_row] = " << castToResultColumnType(val, out_type) << ";\n";
         if (valid == "1" || valid == "true" || valid == "(1)" || valid == "(true)") {
             code << "                    db::atomic_set_valid_bit(d_result_validity_col_" << slot << ", out_row);\n";
         } else if (!(valid == "0" || valid == "false" || valid == "(0)" || valid == "(false)")) {
@@ -2716,6 +2895,8 @@ std::string JITOperatorVisitor::generateCode() const {
     code << "#include <sycl/sycl.hpp>\n";
     code << "#include <limits>\n";
     code << "#include <stdexcept>\n";
+    code << "#include <vector>\n";
+    code << "#include <cstddef>\n";
     code << "#include \"crystal/load.h\"\n";
     code << "#include \"crystal/pred.h\"\n";
     code << "#include \"crystal/join.h\"\n";

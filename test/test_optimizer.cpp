@@ -15,6 +15,7 @@
 #include <cassert>
 #include <iostream>
 #include <string>
+#include <vector>
 
 using namespace db;
 
@@ -534,6 +535,65 @@ static void test_catalog_nullable_metadata() {
     std::cout << "PASSED\n";
 }
 
+
+
+// ============================================================================
+// Test 11: nullable expression codegen and typed columnar result ABI
+// ============================================================================
+static void test_nullable_expression_codegen_and_typed_result_abi() {
+    std::cout << "Test 11: nullable expression codegen + typed columnar ABI... ";
+
+    auto catalog = buildTestCatalog();
+    // Mark fact aggregate/projection inputs nullable. This synthetic catalog is
+    // enough to validate generated NULL semantics without modifying SSB data.
+    TableMetadata lo = catalog->getTableMetadata("LINEORDER");
+    lo.setColumnNullable("lo_revenue", true);
+    auto nullable_catalog = std::make_shared<Catalog>();
+    nullable_catalog->pushTableMetadata(lo);
+    for (const auto& table : catalog->getTablesMetadata()) {
+        if (table.getName() != "LINEORDER") nullable_catalog->pushTableMetadata(table);
+    }
+
+    auto generate = [&](const std::string& sql) {
+        hsql::SQLParserResult result;
+        auto* ast = parseSQL(sql, result);
+        assert(ast != nullptr);
+        db::QueryTranslator translator;
+        auto tree = translator.translate(ast);
+        db::Optimizer opt;
+        tree = opt.optimize(std::move(tree));
+        db::JITContext jit_ctx;
+        db::JITOperatorVisitor visitor(jit_ctx, *nullable_catalog);
+        tree->accept(visitor);
+        return visitor.generateCode();
+    };
+
+    const std::string agg_code = generate(
+        "SELECT COUNT(*), COUNT(lo_revenue), SUM(lo_revenue), AVG(lo_revenue) "
+        "FROM lineorder");
+    assert(agg_code.find("BlockLoadValidity") != std::string::npos);
+    assert(agg_code.find("items_valid") != std::string::npos);
+    assert(agg_code.find("getResultColumnUInt64Pointer(0)") != std::string::npos);
+    assert(agg_code.find("getResultColumnUInt64Pointer(1)") != std::string::npos);
+    assert(agg_code.find("getResultColumnUInt64Pointer(2)") != std::string::npos);
+    assert(agg_code.find("getResultColumnFloat64Pointer(3)") != std::string::npos);
+
+    const std::string is_null_projection = generate(
+        "SELECT lo_revenue IS NULL FROM lineorder");
+    assert(is_null_projection.find("getResultColumnUInt64Pointer(0)") != std::string::npos);
+    assert(is_null_projection.find("(!(items_valid[i]))") != std::string::npos ||
+           is_null_projection.find("!((items_valid[i]))") != std::string::npos);
+    assert(is_null_projection.find("d_result[out_row") == std::string::npos);
+
+    const std::string where_is_null = generate(
+        "SELECT COUNT(*) FROM lineorder WHERE lo_revenue IS NULL");
+    assert(where_is_null.find("flags[i] = flags[i] && 0") == std::string::npos);
+    assert(where_is_null.find("!(lo_revenue_valid[i])") != std::string::npos ||
+           where_is_null.find("!(items_valid[i])") != std::string::npos);
+
+    std::cout << "PASSED\n";
+}
+
 // ============================================================================
 int main() {
     std::cout << "=== test_optimizer (new pipeline) ===\n\n";
@@ -548,6 +608,7 @@ int main() {
     test_jit_visitor_unsupported_predicate_throws();
     test_catalog_uniqueness_metadata();
     test_catalog_nullable_metadata();
+    test_nullable_expression_codegen_and_typed_result_abi();
 
     std::cout << "\nAll tests passed!\n";
     return 0;

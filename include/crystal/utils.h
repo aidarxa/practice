@@ -110,6 +110,35 @@ inline void maskUnusedValidityBits(std::vector<uint64_t>& bitmap, std::size_t nu
   }
 }
 
+
+inline std::vector<uint64_t> decodeValidityWordBitmap(std::vector<uint64_t> words,
+                                                      std::size_t num_entries,
+                                                      bool input_bits_are_valid) {
+  const std::size_t word_count = nullBitmapWordCount(num_entries);
+  words.resize(word_count, 0ULL);
+  if (!input_bits_are_valid) {
+    for (auto& word : words) word = ~word;
+  }
+  maskUnusedValidityBits(words, num_entries);
+  return words;
+}
+
+inline std::vector<uint64_t> decodeValidityByteBitmap(const std::vector<unsigned char>& bytes,
+                                                      std::size_t num_entries,
+                                                      bool input_bytes_are_valid) {
+  if (bytes.size() != num_entries) {
+    throw std::runtime_error("decodeValidityByteBitmap: byte count does not match row count");
+  }
+  std::vector<uint64_t> validity(nullBitmapWordCount(num_entries), 0ULL);
+  for (std::size_t row = 0; row < num_entries; ++row) {
+    const bool bit = bytes[row] != 0;
+    const bool valid = input_bytes_are_valid ? bit : !bit;
+    if (valid) validity[row >> 6U] |= (1ULL << (row & 63U));
+  }
+  maskUnusedValidityBits(validity, num_entries);
+  return validity;
+}
+
 enum class NullBitmapFileKind {
   ValidBits64,
   NullBits64,
@@ -186,11 +215,7 @@ inline std::vector<uint64_t> loadValidityBitmapIfExists(const std::string& col_n
       if (!in) {
         throw std::runtime_error("Failed to read null bitmap file: " + path);
       }
-      if (kind == NullBitmapFileKind::NullBits64) {
-        for (auto& word : validity) word = ~word;
-      }
-      maskUnusedValidityBits(validity, num_entries);
-      return validity;
+      return decodeValidityWordBitmap(std::move(validity), num_entries, kind == NullBitmapFileKind::ValidBits64);
     }
 
     if (kind == NullBitmapFileKind::ValidBytes ||
@@ -206,15 +231,7 @@ inline std::vector<uint64_t> loadValidityBitmapIfExists(const std::string& col_n
       if (!in) {
         throw std::runtime_error("Failed to read null bitmap file: " + path);
       }
-      for (std::size_t row = 0; row < num_entries; ++row) {
-        const bool bit = bytes[row] != 0;
-        const bool valid = (kind == NullBitmapFileKind::ValidBytes) ? bit : !bit;
-        if (valid) {
-          validity[row >> 6U] |= (1ULL << (row & 63U));
-        }
-      }
-      maskUnusedValidityBits(validity, num_entries);
-      return validity;
+      return decodeValidityByteBitmap(bytes, num_entries, kind == NullBitmapFileKind::ValidBytes);
     }
   }
 

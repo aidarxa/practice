@@ -6,6 +6,12 @@
 #include <utility>
 #include <vector>
 
+enum class LogicalType : uint8_t {
+    Int64,
+    UInt64,
+    Float64,
+};
+
 struct ColumnStatistics {
   int64_t min_value_ = 0;    // e.g. 19920101 for d_datekey
   int64_t max_value_ = 0;    // e.g. 19981230 for d_datekey

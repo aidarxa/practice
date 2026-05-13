@@ -6,6 +6,7 @@
 #include <sycl/sycl.hpp>
 
 #include "core/execution.h"
+#include "core/config.h"
 #include "core/memory.h"
 
 namespace db {
@@ -24,9 +25,12 @@ public:
     /// Возвращает сгенерированный JIT-код без его компиляции
     std::string generateQueryCode(const std::string& sql);
 
+    const CrystalConfig& config() const { return config_; }
+
 private:
     void initCatalog();
 
+    CrystalConfig config_;
     sycl::queue q_;
     std::shared_ptr<Catalog> catalog_;
     std::unique_ptr<ExecutionContext> ctx_;
