@@ -105,6 +105,7 @@ private:
 
     void free() {
         if (d_data_) {
+            q_.wait();
             sycl::free(d_data_, q_);
             d_data_ = nullptr;
             capacity_ = 0;

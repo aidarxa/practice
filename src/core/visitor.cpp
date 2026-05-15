@@ -300,6 +300,7 @@ static void registerSortLimitKernelClasses(JITContext& ctx, int tuple_size) {
     };
     add("SortLimitInitIndices");
     add("SortLimitBitonicSort");
+    add("SortLimitTopKLocalSelect");
     for (int col = 0; col < tuple_size; ++col) add("SortLimitReorderCol" + std::to_string(col));
 }
 
@@ -358,6 +359,168 @@ static void emitRightBeforeLeftComparison(std::stringstream& out,
     out << indent << "}\n";
 }
 
+static void emitSortLimitReorderAndFinalize(std::stringstream& out,
+                                            int tuple_size,
+                                            const std::vector<LogicalType>& result_types,
+                                            const std::vector<bool>& nullable,
+                                            const std::string& indices_expr,
+                                            const std::string& after_reorder_free_code) {
+    out << "            const std::size_t sort_validity_words = (sort_output_rows + 63ULL) / 64ULL;\n";
+    out << "            if (sort_output_rows != 0 && sort_output_rows > std::numeric_limits<std::size_t>::max() / static_cast<std::size_t>(" << tuple_size << ")) {\n";
+    out << "                throw std::overflow_error(\"ORDER BY/LIMIT result size overflow\");\n";
+    out << "            }\n";
+    for (int col = 0; col < tuple_size; ++col) {
+        const LogicalType type = result_types[static_cast<std::size_t>(col)];
+        const std::string type_name = resultColumnPointerType(type).substr(0, resultColumnPointerType(type).size() - 1);
+        out << "            " << type_name << "* d_sort_tmp_col_" << col << " = sycl::malloc_device<" << type_name << ">(sort_output_rows == 0 ? 1 : sort_output_rows, q);\n";
+        out << "            std::uint64_t* d_sort_tmp_validity_col_" << col << " = sycl::malloc_device<std::uint64_t>(sort_validity_words == 0 ? 1 : sort_validity_words, q);\n";
+        out << "            q.memset(d_sort_tmp_validity_col_" << col << ", 0, (sort_validity_words == 0 ? 1 : sort_validity_words) * sizeof(std::uint64_t));\n";
+        out << "            q.submit([&](sycl::handler& h) {\n";
+        out << "                h.parallel_for<class SortLimitReorderCol" << col << ">(sycl::range<1>(sort_output_rows), [=](sycl::id<1> gid) {\n";
+        out << "                    const std::uint64_t out_row = static_cast<std::uint64_t>(gid[0]);\n";
+        out << "                    const std::uint64_t src_row = " << indices_expr << "[out_row];\n";
+        out << "                    if (src_row == sort_invalid_idx || src_row >= static_cast<std::uint64_t>(sort_input_rows)) return;\n";
+        out << "                    d_sort_tmp_col_" << col << "[out_row] = d_result_col_" << col << "[src_row];\n";
+        if (nullable[static_cast<std::size_t>(col)]) {
+            out << "                    if (db::bitmap_valid_at(d_result_validity_col_" << col << ", src_row)) db::atomic_set_valid_bit(d_sort_tmp_validity_col_" << col << ", out_row);\n";
+        } else {
+            out << "                    db::atomic_set_valid_bit(d_sort_tmp_validity_col_" << col << ", out_row);\n";
+        }
+        out << "                });\n";
+        out << "            });\n";
+        out << "            if (sort_output_rows != 0) q.memcpy(d_result_col_" << col << ", d_sort_tmp_col_" << col << ", sort_output_rows * " << resultColumnValueByteSizeExpr(type) << ");\n";
+        out << "            q.memcpy(d_result_validity_col_" << col << ", d_sort_tmp_validity_col_" << col << ", (sort_validity_words == 0 ? 1 : sort_validity_words) * sizeof(std::uint64_t));\n";
+        out << "            q.wait();\n";
+        out << "            sycl::free(d_sort_tmp_col_" << col << ", q);\n";
+        out << "            sycl::free(d_sort_tmp_validity_col_" << col << ", q);\n";
+    }
+    out << after_reorder_free_code;
+}
+
+static void emitSortLimitFullBitonicPostExecution(std::stringstream& out,
+                                                  const SortLimitNode* node,
+                                                  int tuple_size,
+                                                  const std::vector<LogicalType>& result_types,
+                                                  const std::vector<bool>& nullable) {
+    out << "            std::uint64_t sort_padded_rows = 1ULL;\n";
+    out << "            while (sort_padded_rows < static_cast<std::uint64_t>(sort_input_rows)) {\n";
+    out << "                if (sort_padded_rows > (std::numeric_limits<std::uint64_t>::max() >> 1)) throw std::overflow_error(\"ORDER BY padded row count overflow\");\n";
+    out << "                sort_padded_rows <<= 1ULL;\n";
+    out << "            }\n";
+    out << "            std::uint64_t* d_sort_indices = sycl::malloc_device<std::uint64_t>(static_cast<std::size_t>(sort_padded_rows), q);\n";
+    out << "            q.submit([&](sycl::handler& h) {\n";
+    out << "                h.parallel_for<class SortLimitInitIndices>(sycl::range<1>(static_cast<std::size_t>(sort_padded_rows)), [=](sycl::id<1> gid) {\n";
+    out << "                    const std::uint64_t i = static_cast<std::uint64_t>(gid[0]);\n";
+    out << "                    d_sort_indices[i] = (i < static_cast<std::uint64_t>(sort_input_rows)) ? i : sort_invalid_idx;\n";
+    out << "                });\n";
+    out << "            });\n";
+    out << "            for (std::uint64_t sort_k = 2ULL; sort_k <= sort_padded_rows; sort_k <<= 1ULL) {\n";
+    out << "                for (std::uint64_t sort_j = sort_k >> 1ULL; sort_j > 0ULL; sort_j >>= 1ULL) {\n";
+    out << "                    q.submit([&](sycl::handler& h) {\n";
+    out << "                        h.parallel_for<class SortLimitBitonicSort>(sycl::range<1>(static_cast<std::size_t>(sort_padded_rows)), [=](sycl::id<1> gid) {\n";
+    out << "                            const std::uint64_t sort_i = static_cast<std::uint64_t>(gid[0]);\n";
+    out << "                            const std::uint64_t sort_ixj = sort_i ^ sort_j;\n";
+    out << "                            if (sort_ixj > sort_i) {\n";
+    out << "                                const std::uint64_t sort_left_idx = d_sort_indices[sort_i];\n";
+    out << "                                const std::uint64_t sort_right_idx = d_sort_indices[sort_ixj];\n";
+    out << "                                bool sort_right_before_left = false;\n";
+    emitRightBeforeLeftComparison(out, result_types, nullable, node->sort_keys,
+                                  "sort_left_idx", "sort_right_idx", "sort_right_before_left", "                                ");
+    out << "                                const bool sort_left_before_right = (sort_left_idx != sort_right_idx) && !sort_right_before_left;\n";
+    out << "                                const bool sort_ascending_stage = ((sort_i & sort_k) == 0ULL);\n";
+    out << "                                const bool sort_swap = sort_ascending_stage ? sort_right_before_left : sort_left_before_right;\n";
+    out << "                                if (sort_swap) {\n";
+    out << "                                    d_sort_indices[sort_i] = sort_right_idx;\n";
+    out << "                                    d_sort_indices[sort_ixj] = sort_left_idx;\n";
+    out << "                                }\n";
+    out << "                            }\n";
+    out << "                        });\n";
+    out << "                    });\n";
+    out << "                }\n";
+    out << "            }\n";
+    emitSortLimitReorderAndFinalize(out, tuple_size, result_types, nullable, "d_sort_indices", "            sycl::free(d_sort_indices, q);\n");
+}
+
+static void emitSortLimitTopKPostExecution(std::stringstream& out,
+                                           const SortLimitNode* node,
+                                           int tuple_size,
+                                           const std::vector<LogicalType>& result_types,
+                                           const std::vector<bool>& nullable) {
+    const std::uint64_t topk_chunk_rows = 4096ULL;
+    const std::uint64_t topk_threads = 256ULL;
+    out << "            constexpr std::uint64_t sort_topk_chunk_rows = " << topk_chunk_rows << "ULL;\n";
+    out << "            constexpr std::uint64_t sort_topk_threads = " << topk_threads << "ULL;\n";
+    out << "            const std::uint64_t sort_topk_limit = static_cast<std::uint64_t>(sort_output_rows);\n";
+    out << "            std::uint64_t sort_topk_current_count = static_cast<std::uint64_t>(sort_input_rows);\n";
+    out << "            std::uint64_t sort_topk_initial_groups = (sort_topk_current_count + sort_topk_chunk_rows - 1ULL) / sort_topk_chunk_rows;\n";
+    out << "            if (sort_topk_initial_groups > std::numeric_limits<std::uint64_t>::max() / sort_topk_limit) throw std::overflow_error(\"ORDER BY/LIMIT Top-K candidate size overflow\");\n";
+    out << "            const std::uint64_t sort_topk_capacity = sort_topk_initial_groups * sort_topk_limit;\n";
+    out << "            std::uint64_t* d_sort_topk_a = sycl::malloc_device<std::uint64_t>(static_cast<std::size_t>(sort_topk_capacity == 0ULL ? 1ULL : sort_topk_capacity), q);\n";
+    out << "            std::uint64_t* d_sort_topk_b = sycl::malloc_device<std::uint64_t>(static_cast<std::size_t>(sort_topk_capacity == 0ULL ? 1ULL : sort_topk_capacity), q);\n";
+    out << "            std::uint64_t* d_sort_topk_in = nullptr;\n";
+    out << "            std::uint64_t* d_sort_topk_out = d_sort_topk_a;\n";
+    out << "            std::uint64_t* d_sort_indices = d_sort_topk_a;\n";
+    out << "            bool sort_topk_identity_input = true;\n";
+    out << "            while (true) {\n";
+    out << "                const std::uint64_t sort_topk_groups = (sort_topk_current_count + sort_topk_chunk_rows - 1ULL) / sort_topk_chunk_rows;\n";
+    out << "                if (sort_topk_groups > std::numeric_limits<std::uint64_t>::max() / sort_topk_limit) throw std::overflow_error(\"ORDER BY/LIMIT Top-K pass size overflow\");\n";
+    out << "                const std::uint64_t sort_topk_next_count = sort_topk_groups * sort_topk_limit;\n";
+    out << "                const bool sort_topk_this_pass_identity = sort_topk_identity_input;\n";
+    out << "                std::uint64_t* d_sort_topk_this_in = d_sort_topk_in;\n";
+    out << "                std::uint64_t* d_sort_topk_this_out = d_sort_topk_out;\n";
+    out << "                q.submit([&](sycl::handler& h) {\n";
+    out << "                    sycl::local_accessor<std::uint64_t, 1> sort_local_idx(sycl::range<1>(static_cast<std::size_t>(sort_topk_chunk_rows)), h);\n";
+    out << "                    h.parallel_for<class SortLimitTopKLocalSelect>(sycl::nd_range<1>(sycl::range<1>(static_cast<std::size_t>(sort_topk_groups * sort_topk_threads)), sycl::range<1>(static_cast<std::size_t>(sort_topk_threads))), [=](sycl::nd_item<1> it) {\n";
+    out << "                        const std::uint64_t sort_lid = static_cast<std::uint64_t>(it.get_local_linear_id());\n";
+    out << "                        const std::uint64_t sort_group = static_cast<std::uint64_t>(it.get_group_linear_id());\n";
+    out << "                        const std::uint64_t sort_base = sort_group * sort_topk_chunk_rows;\n";
+    out << "                        for (std::uint64_t sort_pos = sort_lid; sort_pos < sort_topk_chunk_rows; sort_pos += sort_topk_threads) {\n";
+    out << "                            const std::uint64_t sort_global_pos = sort_base + sort_pos;\n";
+    out << "                            std::uint64_t sort_idx = sort_invalid_idx;\n";
+    out << "                            if (sort_global_pos < sort_topk_current_count) {\n";
+    out << "                                sort_idx = sort_topk_this_pass_identity ? sort_global_pos : d_sort_topk_this_in[sort_global_pos];\n";
+    out << "                                if (sort_idx >= static_cast<std::uint64_t>(sort_input_rows)) sort_idx = sort_invalid_idx;\n";
+    out << "                            }\n";
+    out << "                            sort_local_idx[sort_pos] = sort_idx;\n";
+    out << "                        }\n";
+    out << "                        it.barrier(sycl::access::fence_space::local_space);\n";
+    out << "                        for (std::uint64_t sort_k = 2ULL; sort_k <= sort_topk_chunk_rows; sort_k <<= 1ULL) {\n";
+    out << "                            for (std::uint64_t sort_j = sort_k >> 1ULL; sort_j > 0ULL; sort_j >>= 1ULL) {\n";
+    out << "                                for (std::uint64_t sort_pos = sort_lid; sort_pos < sort_topk_chunk_rows; sort_pos += sort_topk_threads) {\n";
+    out << "                                    const std::uint64_t sort_ixj = sort_pos ^ sort_j;\n";
+    out << "                                    if (sort_ixj > sort_pos) {\n";
+    out << "                                        const std::uint64_t sort_left_idx = sort_local_idx[sort_pos];\n";
+    out << "                                        const std::uint64_t sort_right_idx = sort_local_idx[sort_ixj];\n";
+    out << "                                        bool sort_right_before_left = false;\n";
+    emitRightBeforeLeftComparison(out, result_types, nullable, node->sort_keys,
+                                  "sort_left_idx", "sort_right_idx", "sort_right_before_left", "                                        ");
+    out << "                                        const bool sort_left_before_right = (sort_left_idx != sort_right_idx) && !sort_right_before_left;\n";
+    out << "                                        const bool sort_ascending_stage = ((sort_pos & sort_k) == 0ULL);\n";
+    out << "                                        const bool sort_swap = sort_ascending_stage ? sort_right_before_left : sort_left_before_right;\n";
+    out << "                                        if (sort_swap) {\n";
+    out << "                                            sort_local_idx[sort_pos] = sort_right_idx;\n";
+    out << "                                            sort_local_idx[sort_ixj] = sort_left_idx;\n";
+    out << "                                        }\n";
+    out << "                                    }\n";
+    out << "                                }\n";
+    out << "                                it.barrier(sycl::access::fence_space::local_space);\n";
+    out << "                            }\n";
+    out << "                        }\n";
+    out << "                        for (std::uint64_t sort_pos = sort_lid; sort_pos < sort_topk_limit; sort_pos += sort_topk_threads) {\n";
+    out << "                            d_sort_topk_this_out[sort_group * sort_topk_limit + sort_pos] = sort_local_idx[sort_pos];\n";
+    out << "                        }\n";
+    out << "                    });\n";
+    out << "                });\n";
+    out << "                d_sort_indices = d_sort_topk_out;\n";
+    out << "                sort_topk_current_count = sort_topk_next_count;\n";
+    out << "                if (sort_topk_current_count <= sort_topk_limit) break;\n";
+    out << "                sort_topk_identity_input = false;\n";
+    out << "                d_sort_topk_in = d_sort_topk_out;\n";
+    out << "                d_sort_topk_out = (d_sort_topk_out == d_sort_topk_a) ? d_sort_topk_b : d_sort_topk_a;\n";
+    out << "            }\n";
+    emitSortLimitReorderAndFinalize(out, tuple_size, result_types, nullable, "d_sort_indices", "            sycl::free(d_sort_topk_a, q);\n            sycl::free(d_sort_topk_b, q);\n");
+}
+
 static void emitSortLimitPostExecution(const SortLimitNode* node,
                                        JITContext& ctx,
                                        const Catalog& catalog) {
@@ -397,79 +560,19 @@ static void emitSortLimitPostExecution(const SortLimitNode* node,
     }
 
     registerSortLimitKernelClasses(ctx, tuple_size);
-    out << "        if (sort_input_rows > 1) {\n";
-    out << "            std::uint64_t sort_padded_rows = 1ULL;\n";
-    out << "            while (sort_padded_rows < static_cast<std::uint64_t>(sort_input_rows)) {\n";
-    out << "                if (sort_padded_rows > (std::numeric_limits<std::uint64_t>::max() >> 1)) throw std::overflow_error(\"ORDER BY padded row count overflow\");\n";
-    out << "                sort_padded_rows <<= 1ULL;\n";
-    out << "            }\n";
-    out << "            const std::uint64_t sort_invalid_idx = std::numeric_limits<std::uint64_t>::max();\n";
-    out << "            std::uint64_t* d_sort_indices = sycl::malloc_device<std::uint64_t>(static_cast<std::size_t>(sort_padded_rows), q);\n";
     for (int col = 0; col < tuple_size; ++col) {
         const LogicalType type = result_types[static_cast<std::size_t>(col)];
-        out << "            " << resultColumnPointerType(type) << " d_result_col_" << col << " = ctx->" << resultColumnGetter(type) << "(" << col << ");\n";
-        out << "            std::uint64_t* d_result_validity_col_" << col << " = ctx->getResultColumnValidityPointer(" << col << ");\n";
+        out << "        " << resultColumnPointerType(type) << " d_result_col_" << col << " = ctx->" << resultColumnGetter(type) << "(" << col << ");\n";
+        out << "        std::uint64_t* d_result_validity_col_" << col << " = ctx->getResultColumnValidityPointer(" << col << ");\n";
     }
-    out << "            q.submit([&](sycl::handler& h) {\n";
-    out << "                h.parallel_for<class SortLimitInitIndices>(sycl::range<1>(static_cast<std::size_t>(sort_padded_rows)), [=](sycl::id<1> gid) {\n";
-    out << "                    const std::uint64_t i = static_cast<std::uint64_t>(gid[0]);\n";
-    out << "                    d_sort_indices[i] = (i < static_cast<std::uint64_t>(sort_input_rows)) ? i : sort_invalid_idx;\n";
-    out << "                });\n";
-    out << "            });\n";
-    out << "            for (std::uint64_t sort_k = 2ULL; sort_k <= sort_padded_rows; sort_k <<= 1ULL) {\n";
-    out << "                for (std::uint64_t sort_j = sort_k >> 1ULL; sort_j > 0ULL; sort_j >>= 1ULL) {\n";
-    out << "                    q.submit([&](sycl::handler& h) {\n";
-    out << "                        h.parallel_for<class SortLimitBitonicSort>(sycl::range<1>(static_cast<std::size_t>(sort_padded_rows)), [=](sycl::id<1> gid) {\n";
-    out << "                            const std::uint64_t sort_i = static_cast<std::uint64_t>(gid[0]);\n";
-    out << "                            const std::uint64_t sort_ixj = sort_i ^ sort_j;\n";
-    out << "                            if (sort_ixj > sort_i) {\n";
-    out << "                                const std::uint64_t sort_left_idx = d_sort_indices[sort_i];\n";
-    out << "                                const std::uint64_t sort_right_idx = d_sort_indices[sort_ixj];\n";
-    out << "                                bool sort_right_before_left = false;\n";
-    emitRightBeforeLeftComparison(out, result_types, nullable, node->sort_keys,
-                                  "sort_left_idx", "sort_right_idx", "sort_right_before_left", "                                ");
-    out << "                                const bool sort_left_before_right = (sort_left_idx != sort_right_idx) && !sort_right_before_left;\n";
-    out << "                                const bool sort_ascending_stage = ((sort_i & sort_k) == 0ULL);\n";
-    out << "                                const bool sort_swap = sort_ascending_stage ? sort_right_before_left : sort_left_before_right;\n";
-    out << "                                if (sort_swap) {\n";
-    out << "                                    d_sort_indices[sort_i] = sort_right_idx;\n";
-    out << "                                    d_sort_indices[sort_ixj] = sort_left_idx;\n";
-    out << "                                }\n";
-    out << "                            }\n";
-    out << "                        });\n";
-    out << "                    });\n";
-    out << "                }\n";
-    out << "            }\n";
-    out << "            const std::size_t sort_validity_words = (sort_output_rows + 63ULL) / 64ULL;\n";
-    out << "            if (sort_output_rows != 0 && sort_output_rows > std::numeric_limits<std::size_t>::max() / static_cast<std::size_t>(" << tuple_size << ")) {\n";
-    out << "                throw std::overflow_error(\"ORDER BY/LIMIT result size overflow\");\n";
-    out << "            }\n";
-    for (int col = 0; col < tuple_size; ++col) {
-        const LogicalType type = result_types[static_cast<std::size_t>(col)];
-        const std::string type_name = resultColumnPointerType(type).substr(0, resultColumnPointerType(type).size() - 1);
-        out << "            " << type_name << "* d_sort_tmp_col_" << col << " = sycl::malloc_device<" << type_name << ">(sort_output_rows == 0 ? 1 : sort_output_rows, q);\n";
-        out << "            std::uint64_t* d_sort_tmp_validity_col_" << col << " = sycl::malloc_device<std::uint64_t>(sort_validity_words == 0 ? 1 : sort_validity_words, q);\n";
-        out << "            q.memset(d_sort_tmp_validity_col_" << col << ", 0, (sort_validity_words == 0 ? 1 : sort_validity_words) * sizeof(std::uint64_t));\n";
-        out << "            q.submit([&](sycl::handler& h) {\n";
-        out << "                h.parallel_for<class SortLimitReorderCol" << col << ">(sycl::range<1>(sort_output_rows), [=](sycl::id<1> gid) {\n";
-        out << "                    const std::uint64_t out_row = static_cast<std::uint64_t>(gid[0]);\n";
-        out << "                    const std::uint64_t src_row = d_sort_indices[out_row];\n";
-        out << "                    if (src_row == sort_invalid_idx) return;\n";
-        out << "                    d_sort_tmp_col_" << col << "[out_row] = d_result_col_" << col << "[src_row];\n";
-        if (nullable[static_cast<std::size_t>(col)]) {
-            out << "                    if (db::bitmap_valid_at(d_result_validity_col_" << col << ", src_row)) db::atomic_set_valid_bit(d_sort_tmp_validity_col_" << col << ", out_row);\n";
-        } else {
-            out << "                    db::atomic_set_valid_bit(d_sort_tmp_validity_col_" << col << ", out_row);\n";
-        }
-        out << "                });\n";
-        out << "            });\n";
-        out << "            if (sort_output_rows != 0) q.memcpy(d_result_col_" << col << ", d_sort_tmp_col_" << col << ", sort_output_rows * " << resultColumnValueByteSizeExpr(type) << ");\n";
-        out << "            q.memcpy(d_result_validity_col_" << col << ", d_sort_tmp_validity_col_" << col << ", (sort_validity_words == 0 ? 1 : sort_validity_words) * sizeof(std::uint64_t));\n";
-        out << "            q.wait();\n";
-        out << "            sycl::free(d_sort_tmp_col_" << col << ", q);\n";
-        out << "            sycl::free(d_sort_tmp_validity_col_" << col << ", q);\n";
+    out << "        const std::uint64_t sort_invalid_idx = std::numeric_limits<std::uint64_t>::max();\n";
+    out << "        if (sort_input_rows > 1 && sort_output_rows > 0) {\n";
+    constexpr std::size_t topk_limit_threshold = 4096;
+    if (node->has_limit && node->limit > 0 && node->limit <= topk_limit_threshold) {
+        emitSortLimitTopKPostExecution(out, node, tuple_size, result_types, nullable);
+    } else {
+        emitSortLimitFullBitonicPostExecution(out, node, tuple_size, result_types, nullable);
     }
-    out << "            sycl::free(d_sort_indices, q);\n";
     out << "        }\n";
     out << "        ctx->result_row_count_ = sort_output_rows;\n";
     out << "        ctx->result_is_dense_ = true;\n";
@@ -1836,7 +1939,9 @@ void JITOperatorVisitor::produceSortLimit(const SortLimitNode* node, JITContext&
     if (node && !node->getChildren().empty()) {
         produce(node->getChildren()[0].get(), ctx);
     }
-    emitSortLimitPostExecution(node, ctx, catalog_);
+    if (!ctx.sort_limit_post_execution_fused) {
+        emitSortLimitPostExecution(node, ctx, catalog_);
+    }
 }
 
 static std::string translateMathExprPush(
@@ -2591,6 +2696,194 @@ static void emitAggregateDenseColumnarMaterialization(const AggregateNode* node,
     out << "    }\n\n";
 }
 
+
+static const SortLimitNode* parentSortLimitNode(const AggregateNode* node) {
+    if (!node || !node->parent_) return nullptr;
+    if (node->parent_->getType() != OperatorType::SORT_LIMIT) return nullptr;
+    return static_cast<const SortLimitNode*>(node->parent_);
+}
+
+static bool aggregateSmallFusedMaterializationEligible(const AggregateNode* node,
+                                                       uint64_t group_count,
+                                                       const SortLimitNode* sort_node) {
+    if (!node) return false;
+    if (group_count > 256ULL) return false;
+    return sort_node != nullptr;
+}
+
+static std::string aggregateSparseSlotValueExpr(int col,
+                                                const std::string& base_expr,
+                                                LogicalType type) {
+    std::string raw = "d_result[" + base_expr + " + " + std::to_string(col) + "]";
+    if (type == LogicalType::Float64) return "db::bit_cast_ull_to_double(" + raw + ")";
+    if (type == LogicalType::Int64) return "static_cast<std::int64_t>(" + raw + ")";
+    return "static_cast<std::uint64_t>(" + raw + ")";
+}
+
+static void emitAggregateSparseRightBeforeLeftComparison(std::stringstream& out,
+                                                         const AggregateNode* node,
+                                                         const Catalog& catalog,
+                                                         const std::vector<SortKeyDef>& sort_keys,
+                                                         const std::string& left_base,
+                                                         const std::string& right_base,
+                                                         const std::string& left_group_idx,
+                                                         const std::string& right_group_idx,
+                                                         const std::string& output_var,
+                                                         const std::string& indent) {
+    out << indent << output_var << " = false;\n";
+    out << indent << "if (" << right_group_idx << " != " << left_group_idx << ") {\n";
+    out << indent << "    bool sort_decided = false;\n";
+    for (std::size_t k = 0; k < sort_keys.size(); ++k) {
+        const auto& key = sort_keys[k];
+        const int col = static_cast<int>(key.column_index);
+        const LogicalType type = resultLogicalTypeForAggregateOutput(node, col);
+        const bool is_nullable = resultColumnNullableForAggregateOutput(node, col, catalog);
+        if (is_nullable) {
+            out << indent << "    if (!sort_decided) {\n";
+            out << indent << "        const bool sort_left_valid_" << k << " = db::bitmap_valid_at(d_result_validity, " << left_base << " + " << col << ");\n";
+            out << indent << "        const bool sort_right_valid_" << k << " = db::bitmap_valid_at(d_result_validity, " << right_base << " + " << col << ");\n";
+            out << indent << "        if (sort_left_valid_" << k << " != sort_right_valid_" << k << ") {\n";
+            out << indent << "            " << output_var << " = sort_right_valid_" << k << ";\n";
+            out << indent << "            sort_decided = true;\n";
+            out << indent << "        } else if (sort_left_valid_" << k << ") {\n";
+        } else {
+            out << indent << "    if (!sort_decided) {\n";
+            out << indent << "        {\n";
+        }
+        out << indent << "            auto sort_left_value_" << k << " = " << aggregateSparseSlotValueExpr(col, left_base, type) << ";\n";
+        out << indent << "            auto sort_right_value_" << k << " = " << aggregateSparseSlotValueExpr(col, right_base, type) << ";\n";
+        out << indent << "            if (sort_right_value_" << k << " < sort_left_value_" << k << ") {\n";
+        out << indent << "                " << output_var << " = " << (key.descending ? "false" : "true") << ";\n";
+        out << indent << "                sort_decided = true;\n";
+        out << indent << "            } else if (sort_left_value_" << k << " < sort_right_value_" << k << ") {\n";
+        out << indent << "                " << output_var << " = " << (key.descending ? "true" : "false") << ";\n";
+        out << indent << "                sort_decided = true;\n";
+        out << indent << "            }\n";
+        if (is_nullable) {
+            out << indent << "        }\n";
+            out << indent << "    }\n";
+        } else {
+            out << indent << "        }\n";
+            out << indent << "    }\n";
+        }
+    }
+    out << indent << "    if (!sort_decided) " << output_var << " = (" << right_group_idx << " < " << left_group_idx << ");\n";
+    out << indent << "}\n";
+}
+
+static void emitAggregateSmallFusedColumnarMaterialization(const AggregateNode* node,
+                                                           const SortLimitNode* sort_node,
+                                                           JITContext& ctx,
+                                                           const Catalog& catalog,
+                                                           uint64_t group_count,
+                                                           int visible_ts,
+                                                           int storage_ts) {
+    if (!node || visible_ts <= 0) return;
+    const std::string kernel = "AggregateSmallFusedMaterialize";
+    const std::string marker = "aggregate_small_fused_columnar_materialization";
+    if (!ctx.emitted_auxiliary_kernels.insert(marker).second) return;
+    if (std::find(ctx.kernel_class_names.begin(), ctx.kernel_class_names.end(), kernel) == ctx.kernel_class_names.end()) {
+        ctx.kernel_class_names.push_back(kernel);
+    }
+    if (sort_node) ctx.sort_limit_post_execution_fused = true;
+
+    const uint64_t max_rows_no_limit = group_count;
+    uint64_t max_output_rows = max_rows_no_limit;
+    if (sort_node && sort_node->has_limit && sort_node->limit < max_output_rows) {
+        max_output_rows = sort_node->limit;
+    }
+    const uint64_t index_array_size = group_count == 0ULL ? 1ULL : group_count;
+    const bool has_sort = sort_node && !sort_node->sort_keys.empty();
+    const bool has_limit = sort_node && sort_node->has_limit;
+    const uint64_t limit_value = has_limit ? sort_node->limit : max_output_rows;
+
+    auto& out = ctx.post_execution_code;
+    out << "    {\n";
+    out << "        const unsigned long long aggregate_group_count = " << group_count << "ULL;\n";
+    out << "        const unsigned long long aggregate_visible_tuple_size = " << visible_ts << "ULL;\n";
+    out << "        const unsigned long long aggregate_storage_tuple_size = " << storage_ts << "ULL;\n";
+    out << "        const std::size_t aggregate_max_output_rows = static_cast<std::size_t>(" << max_output_rows << "ULL);\n";
+    out << "        q.wait(); // ensure sparse aggregate writes into d_result/d_result_validity are complete before host-side USM allocation/zeroing\n";
+    out << "        ctx->ensureColumnarResultCapacity(static_cast<std::size_t>(aggregate_visible_tuple_size), aggregate_max_output_rows);\n";
+    out << "        unsigned long long* d_aggregate_output_count = ctx->config_.reuse_scratch_buffers ? ctx->getScratchUInt64Buffer(\"d_aggregate_small_output_count\", static_cast<std::size_t>(1)) : sycl::malloc_device<unsigned long long>(1, q);\n";
+    out << "        q.memset(d_aggregate_output_count, 0, sizeof(unsigned long long));\n";
+    for (int c = 0; c < visible_ts; ++c) {
+        const LogicalType type = resultLogicalTypeForAggregateOutput(node, c);
+        out << "        " << resultColumnPointerType(type) << " d_result_col_" << c << " = ctx->" << resultColumnGetter(type) << "(" << c << ");\n";
+        out << "        uint64_t* d_result_validity_col_" << c << " = ctx->getResultColumnValidityPointer(" << c << ");\n";
+    }
+    out << "        q.submit([&](sycl::handler& h) {\n";
+    out << "            h.parallel_for<class " << kernel << ">(sycl::range<1>(1), [=](sycl::id<1>) {\n";
+    out << "                std::uint64_t aggregate_indices[" << index_array_size << "];\n";
+    out << "                std::uint64_t aggregate_count = 0ULL;\n";
+    out << "                for (std::uint64_t g = 0ULL; g < aggregate_group_count; ++g) {\n";
+    out << "                    const std::uint64_t base = g * aggregate_storage_tuple_size;\n";
+    if (node->group_by_exprs.empty()) {
+        out << "                    bool present = true;\n";
+    } else {
+        out << "                    bool present = false;\n";
+        out << "                    for (std::uint64_t c = 0ULL; c < aggregate_visible_tuple_size; ++c) {\n";
+        out << "                        if (db::bitmap_valid_at(d_result_validity, base + c) || d_result[base + c] != 0ULL) { present = true; break; }\n";
+        out << "                    }\n";
+    }
+    const std::string having_pass = aggregateHavingPassExpr(node, catalog, "base");
+    if (having_pass == "true" || having_pass == "(true)" || having_pass == "1" || having_pass == "(1)") {
+        out << "                    bool having_pass = true;\n";
+    } else {
+        out << "                    bool having_pass = " << having_pass << ";\n";
+    }
+    out << "                    if (present && having_pass) aggregate_indices[aggregate_count++] = g;\n";
+    out << "                }\n";
+    if (has_sort) {
+        out << "                for (std::uint64_t i = 0ULL; i < aggregate_count; ++i) {\n";
+        out << "                    for (std::uint64_t j = i + 1ULL; j < aggregate_count; ++j) {\n";
+        out << "                        const std::uint64_t left_group = aggregate_indices[i];\n";
+        out << "                        const std::uint64_t right_group = aggregate_indices[j];\n";
+        out << "                        const std::uint64_t left_base = left_group * aggregate_storage_tuple_size;\n";
+        out << "                        const std::uint64_t right_base = right_group * aggregate_storage_tuple_size;\n";
+        out << "                        bool sort_right_before_left = false;\n";
+        emitAggregateSparseRightBeforeLeftComparison(out, node, catalog, sort_node->sort_keys,
+                                                     "left_base", "right_base", "left_group", "right_group",
+                                                     "sort_right_before_left", "                        ");
+        out << "                        if (sort_right_before_left) {\n";
+        out << "                            aggregate_indices[i] = right_group;\n";
+        out << "                            aggregate_indices[j] = left_group;\n";
+        out << "                        }\n";
+        out << "                    }\n";
+        out << "                }\n";
+    }
+    out << "                std::uint64_t aggregate_output_count = aggregate_count;\n";
+    if (has_limit) {
+        out << "                if (aggregate_output_count > " << limit_value << "ULL) aggregate_output_count = " << limit_value << "ULL;\n";
+    }
+    out << "                for (std::uint64_t out_row = 0ULL; out_row < aggregate_output_count; ++out_row) {\n";
+    out << "                    const std::uint64_t src = aggregate_indices[out_row] * aggregate_storage_tuple_size;\n";
+    for (int c = 0; c < visible_ts; ++c) {
+        const LogicalType type = resultLogicalTypeForAggregateOutput(node, c);
+        std::string value_expr = "d_result[src + " + std::to_string(c) + "]";
+        if (type == LogicalType::Float64) value_expr = "db::bit_cast_ull_to_double(" + value_expr + ")";
+        else value_expr = castToResultColumnType(value_expr, type);
+        out << "                    d_result_col_" << c << "[out_row] = " << value_expr << ";\n";
+        if (resultColumnNullableForAggregateOutput(node, c, catalog)) {
+            out << "                    if (db::bitmap_valid_at(d_result_validity, src + " << c << ")) db::atomic_set_valid_bit(d_result_validity_col_" << c << ", out_row);\n";
+        } else {
+            out << "                    db::atomic_set_valid_bit(d_result_validity_col_" << c << ", out_row);\n";
+        }
+    }
+    out << "                }\n";
+    out << "                d_aggregate_output_count[0] = static_cast<unsigned long long>(aggregate_output_count);\n";
+    out << "            });\n";
+    out << "        });\n";
+    out << "        unsigned long long aggregate_row_count = 0ULL;\n";
+    out << "        q.memcpy(&aggregate_row_count, d_aggregate_output_count, sizeof(unsigned long long)).wait();\n";
+    out << "        if (!ctx->config_.reuse_scratch_buffers) sycl::free(d_aggregate_output_count, q);\n";
+    out << "        if (aggregate_row_count > " << max_output_rows << "ULL) throw std::runtime_error(\"Aggregate fused materialization row count overflow\");\n";
+    out << "        ctx->result_row_count_ = static_cast<std::size_t>(aggregate_row_count);\n";
+    out << "        ctx->result_is_dense_ = true;\n";
+    out << "        ctx->expected_result_size_ = aggregate_row_count == 0ULL ? static_cast<std::size_t>(aggregate_visible_tuple_size) : static_cast<std::size_t>(aggregate_row_count * aggregate_visible_tuple_size);\n";
+    out << "    }\n\n";
+}
+
 static void emitAtomicAggregateUpdate(std::stringstream& code,
                                       const std::string& ref_expr,
                                       const AggregateDef& agg,
@@ -2602,6 +2895,90 @@ static void emitAtomicAggregateUpdate(std::stringstream& code,
     } else {
         code << "                    db::atomic_add_ull(" << ref_expr << ", " << value_expr << ");\n";
     }
+}
+
+
+static bool aggregateLocalGroupReduceEligible(const AggregateNode* node, uint64_t group_count) {
+    if (!node) return false;
+    if (node->group_by_exprs.empty()) return false;
+    if (group_count == 0ULL || group_count > 64ULL) return false;
+    if (node->needsHiddenCountSlot()) return false;
+    for (const auto& agg : node->aggregates) {
+        if (!(agg.isCount() || agg.isSum())) return false;
+    }
+    return true;
+}
+
+static void emitAggregateGroupedLocalReduceVector(const AggregateNode* node,
+                                                  JITContext& ctx,
+                                                  const Catalog& catalog,
+                                                  const std::string& hash_expr,
+                                                  uint64_t total_size,
+                                                  int visible_ts,
+                                                  int storage_ts,
+                                                  bool fast_sparse_output) {
+    auto& code = ctx.current_pipeline->kernel_body;
+    code << "            for (int aggregate_group = 0; aggregate_group < " << total_size << "; ++aggregate_group) {\n";
+    for (std::size_t a = 0; a < node->aggregates.size(); ++a) {
+        code << "                unsigned long long local_agg_" << a << " = 0ULL;\n";
+        code << "                unsigned long long local_seen_" << a << " = 0ULL;\n";
+    }
+    code << "                #pragma unroll\n";
+    code << "                for (int i = 0; i < ITEMS_PER_THREAD; ++i) {\n";
+    code << "                    if (flags[i] && (tid + BLOCK_THREADS * i < num_tile_items)) {\n";
+    code << "                        int hash = " << hash_expr << ";\n";
+    code << "                        if (hash == aggregate_group) {\n";
+    code << "                            int out = hash * " << storage_ts << ";\n";
+
+    int slot = 0;
+    JITExprVisitor group_expr_vis(ctx, code, "flags");
+    for (const auto& g : node->group_by_exprs) {
+        const std::string group_value = group_expr_vis.translateInlineExpr(g.get(), true);
+        std::string valid = expressionValidExpr(g.get(), ctx);
+        code << "                            d_result[out + " << slot << "] = static_cast<unsigned long long>(" << group_value << ");\n";
+        if (!fast_sparse_output) {
+            if (isTriviallyTrueExpr(valid)) {
+                code << "                            db::atomic_set_valid_bit(d_result_validity, out + " << slot << ");\n";
+            } else if (!isTriviallyFalseExpr(valid)) {
+                code << "                            if (" << valid << ") db::atomic_set_valid_bit(d_result_validity, out + " << slot << ");\n";
+            }
+        }
+        ++slot;
+    }
+
+    for (std::size_t a = 0; a < node->aggregates.size(); ++a) {
+        const auto& agg = node->aggregates[a];
+        std::string val = aggregateInputExpr(agg, ctx, true);
+        std::string valid = agg.hasStarArgument() ? "1" : expressionValidExpr(agg.agg_expr.get(), ctx);
+        if (isTriviallyTrueExpr(valid)) {
+            code << "                            local_agg_" << a << " += " << val << ";\n";
+            code << "                            local_seen_" << a << " += 1ULL;\n";
+        } else if (!isTriviallyFalseExpr(valid)) {
+            code << "                            if (" << valid << ") {\n";
+            code << "                                local_agg_" << a << " += " << val << ";\n";
+            code << "                                local_seen_" << a << " += 1ULL;\n";
+            code << "                            }\n";
+        }
+    }
+    code << "                        }\n";
+    code << "                    }\n";
+    code << "                }\n";
+
+    const int agg_base_slot = static_cast<int>(node->group_by_exprs.size());
+    for (std::size_t a = 0; a < node->aggregates.size(); ++a) {
+        const int out_slot = agg_base_slot + static_cast<int>(a);
+        code << "                unsigned long long agg_val_" << a << " = sycl::reduce_over_group(it.get_group(), local_agg_" << a << ", sycl::plus<unsigned long long>{});\n";
+        code << "                unsigned long long agg_seen_" << a << " = sycl::reduce_over_group(it.get_group(), local_seen_" << a << ", sycl::plus<unsigned long long>{});\n";
+        code << "                if (tid == 0 && agg_seen_" << a << " != 0ULL) {\n";
+        code << "                    db::atomic_add_ull(d_result[(unsigned long long)aggregate_group * " << storage_ts << " + " << out_slot << "], agg_val_" << a << ");\n";
+        if (!fast_sparse_output) {
+            code << "                    db::atomic_set_valid_bit(d_result_validity, (unsigned long long)aggregate_group * " << storage_ts << " + " << out_slot << ");\n";
+        }
+        code << "                }\n";
+    }
+    (void)catalog;
+    (void)visible_ts;
+    code << "            }\n";
 }
 
 // ============================================================================
@@ -2734,7 +3111,12 @@ void JITOperatorVisitor::consumeAggregateVector(const AggregateNode* node, JITCo
         }
         emitAggregateFinalizationIfNeeded(node, ctx, 1, visible_ts, storage_ts, hidden_count_slot);
         if (!fast_sparse_output) {
-            emitAggregateDenseColumnarMaterialization(node, ctx, catalog_, 1, visible_ts);
+            const SortLimitNode* sort_node = parentSortLimitNode(node);
+            if (aggregateSmallFusedMaterializationEligible(node, 1, sort_node)) {
+                emitAggregateSmallFusedColumnarMaterialization(node, sort_node, ctx, catalog_, 1, visible_ts, storage_ts);
+            } else {
+                emitAggregateDenseColumnarMaterialization(node, ctx, catalog_, 1, visible_ts);
+            }
         } else {
             ctx.post_execution_code << "    ctx->result_is_dense_ = false;\n";
             ctx.post_execution_code << "    ctx->result_row_count_ = 0;\n";
@@ -2747,6 +3129,9 @@ void JITOperatorVisitor::consumeAggregateVector(const AggregateNode* node, JITCo
         ctx.visible_result_size_expr = std::to_string((uint64_t)total_size * (uint64_t)visible_ts);
         emitAggregateInitializationIfNeeded(node, ctx, total_size, visible_ts, storage_ts);
 
+        if (aggregateLocalGroupReduceEligible(node, total_size)) {
+            emitAggregateGroupedLocalReduceVector(node, ctx, catalog_, hash_expr, total_size, visible_ts, storage_ts, fast_sparse_output);
+        } else {
         code << "            #pragma unroll\n";
         code << "            for (int i = 0; i < ITEMS_PER_THREAD; ++i) {\n";
         code << "                if (flags[i] && (tid + BLOCK_THREADS * i < num_tile_items)) {\n";
@@ -2793,9 +3178,15 @@ void JITOperatorVisitor::consumeAggregateVector(const AggregateNode* node, JITCo
         }
         code << "                }\n";
         code << "            }\n";
+        }
         emitAggregateFinalizationIfNeeded(node, ctx, total_size, visible_ts, storage_ts, hidden_count_slot);
         if (!fast_sparse_output) {
-            emitAggregateDenseColumnarMaterialization(node, ctx, catalog_, total_size, visible_ts);
+            const SortLimitNode* sort_node = parentSortLimitNode(node);
+            if (aggregateSmallFusedMaterializationEligible(node, total_size, sort_node)) {
+                emitAggregateSmallFusedColumnarMaterialization(node, sort_node, ctx, catalog_, total_size, visible_ts, storage_ts);
+            } else {
+                emitAggregateDenseColumnarMaterialization(node, ctx, catalog_, total_size, visible_ts);
+            }
         } else {
             ctx.post_execution_code << "    ctx->result_is_dense_ = false;\n";
             ctx.post_execution_code << "    ctx->result_row_count_ = 0;\n";
@@ -2844,7 +3235,14 @@ void JITOperatorVisitor::consumeAggregateItem(const AggregateNode* node, JITCont
             code << "                        }\n";
         }
         emitAggregateFinalizationIfNeeded(node, ctx, 1, visible_ts, storage_ts, hidden_count_slot);
-        emitAggregateDenseColumnarMaterialization(node, ctx, catalog_, 1, visible_ts);
+        {
+            const SortLimitNode* sort_node = parentSortLimitNode(node);
+            if (aggregateSmallFusedMaterializationEligible(node, 1, sort_node)) {
+                emitAggregateSmallFusedColumnarMaterialization(node, sort_node, ctx, catalog_, 1, visible_ts, storage_ts);
+            } else {
+                emitAggregateDenseColumnarMaterialization(node, ctx, catalog_, 1, visible_ts);
+            }
+        }
     } else {
         auto [hash_expr, total_size] = generatePerfectHashItem(node->group_by_exprs, catalog_, ctx);
         ctx.tuple_size = visible_ts;
@@ -2887,7 +3285,14 @@ void JITOperatorVisitor::consumeAggregateItem(const AggregateNode* node, JITCont
             ++slot;
         }
         emitAggregateFinalizationIfNeeded(node, ctx, total_size, visible_ts, storage_ts, hidden_count_slot);
-        emitAggregateDenseColumnarMaterialization(node, ctx, catalog_, total_size, visible_ts);
+        {
+            const SortLimitNode* sort_node = parentSortLimitNode(node);
+            if (aggregateSmallFusedMaterializationEligible(node, total_size, sort_node)) {
+                emitAggregateSmallFusedColumnarMaterialization(node, sort_node, ctx, catalog_, total_size, visible_ts, storage_ts);
+            } else {
+                emitAggregateDenseColumnarMaterialization(node, ctx, catalog_, total_size, visible_ts);
+            }
+        }
     }
 }
 

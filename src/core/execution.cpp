@@ -152,6 +152,12 @@ std::string AdaptiveCppCompiler::compile(const std::string& source_code, const s
 
 // --- DynamicLibraryExecutor ---
 
+DynamicLibraryExecutor::~DynamicLibraryExecutor() {
+    for (void* handle : handles_) {
+        if (handle) dlclose(handle);
+    }
+}
+
 void DynamicLibraryExecutor::execute(const std::string& lib_path, ExecutionContext* ctx) {
     const auto load_start = Clock::now();
     void* handle = dlopen(lib_path.c_str(), RTLD_NOW | RTLD_LOCAL);
@@ -159,18 +165,14 @@ void DynamicLibraryExecutor::execute(const std::string& lib_path, ExecutionConte
         throw std::runtime_error("dlopen failed: " + std::string(dlerror()));
     }
 
-    // RAII for dlclose
-    struct DlCloser {
-        void* h;
-        ~DlCloser() { if (h) dlclose(h); }
-    } closer{handle};
-
     dlerror(); // Clear any existing errors
     void* sym = dlsym(handle, "execute_query");
     const char* dlsym_error = dlerror();
     if (dlsym_error) {
+        dlclose(handle);
         throw std::runtime_error("dlsym failed: " + std::string(dlsym_error));
     }
+    handles_.push_back(handle);
 
     typedef void (*JitFunc)(db::ExecutionContext*);
     JitFunc func = reinterpret_cast<JitFunc>(sym);
@@ -691,7 +693,7 @@ void QueryEngine::executeQuery(const std::string& sql, ExecutionContext* ctx) {
     ctx->ensureResultValidityCapacity(ctx->expected_result_size_);
 
     // ШАГ 5: Проверка кеша
-    static constexpr const char* kJitAbiVersion = "v27_p1_case_alias_having";
+    static constexpr const char* kJitAbiVersion = "v33_having_dense_topk4096";
     std::string query_hash = std::string("query_") + kJitAbiVersion + "_" + std::to_string(std::hash<std::string>{}(sql));
     auto cached_lib = cache_->get(query_hash);
     if (cached_lib.has_value()) {

@@ -105,6 +105,11 @@ struct JITContext {
     // aggregate child and disables sparse aggregate output.
     bool requires_dense_result = false;
 
+    // Set when AggregateNode emits a fused small-result materialization that
+    // already applies HAVING and/or ORDER BY/LIMIT. SortLimitNode must not
+    // append its generic post-sort path in that case.
+    bool sort_limit_post_execution_fused = false;
+
     // ---------- helpers ----------
     std::string getNewMask() {
         return "mask_" + std::to_string(++mask_counter);

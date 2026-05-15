@@ -223,7 +223,9 @@ struct ExecutionContext {
         result_is_columnar_ = true;
         result_column_count_ = column_count;
         result_column_row_capacity_ = row_count;
-        result_column_storage_.resize(column_count);
+        if (result_column_storage_.size() < column_count) {
+            result_column_storage_.resize(column_count);
+        }
         for (size_t col = 0; col < column_count; ++col) {
             LogicalType type = LogicalType::UInt64;
             if (col < result_columns_.size()) type = result_columns_[col].type;
@@ -276,7 +278,6 @@ struct ExecutionContext {
         result_is_columnar_ = false;
         result_column_count_ = 0;
         result_column_row_capacity_ = 0;
-        result_column_storage_.clear();
     }
 };
 
@@ -319,7 +320,10 @@ private:
 
 class DynamicLibraryExecutor : public IExecutor {
 public:
+    ~DynamicLibraryExecutor() override;
     void execute(const std::string& lib_path, ExecutionContext* ctx) override;
+private:
+    std::vector<void*> handles_;
 };
 
 class QueryEngine {
