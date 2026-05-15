@@ -41,6 +41,21 @@ def parse_metrics(text: str) -> dict:
     return out
 
 
+def has_sql_error(text: str) -> bool:
+    return '[ERROR]' in text or 'Fatal error:' in text
+
+
+def has_process_crash_marker(text: str) -> bool:
+    crash_markers = (
+        'HSA_STATUS',
+        'aborting with error',
+        'AdaptiveCpp error report',
+        'hipMalloc() failed',
+        'terminate called',
+    )
+    return any(marker in text for marker in crash_markers)
+
+
 def iter_queries(manifest: dict, include_future: bool, include_heavy: bool, classes: Optional[set]):
     allowed = {'current'}
     if include_heavy:
@@ -62,12 +77,16 @@ def sql_command(sql_text: str) -> str:
     return sql
 
 
-def run_one(db_cli: str, sql_text: str, limit: str, timing: bool, timeout: int) -> subprocess.CompletedProcess:
+def run_one(db_cli: str, sql_text: str, limit: str, timing: bool, timeout: int, is_dump: bool = False) -> subprocess.CompletedProcess:
     commands = []
     commands.append('\\timing on' if timing else '\\timing off')
     if limit:
         commands.append(f'\\limit {limit}')
+    if is_dump:
+        commands.append('\\dump on')
     commands.append(sql_command(sql_text))
+    if is_dump:
+        commands.append('\\dump off')
     commands.append('\\q')
     stdin = '\n'.join(commands) + '\n'
     return subprocess.run(
@@ -80,11 +99,25 @@ def run_one(db_cli: str, sql_text: str, limit: str, timing: bool, timeout: int) 
     )
 
 
-def build_run_items(selected, root: pathlib.Path, warmups: int, runs: int):
+def build_run_items(selected, root: pathlib.Path, warmups: int, runs: int, dump_code: bool):
     items = []
     for cls, q in selected:
         sql_path = root / q['path']
         sql_text = sql_path.read_text()
+        
+        if dump_code:
+            items.append({
+                'class_id': cls['id'],
+                'query_id': q['id'],
+                'path': q['path'],
+                'status': q['status'],
+                'phase': 'dump',
+                'run_index': 0,
+                'measured': False,
+                'timeout': int(q.get('timeout_sec', 120)),
+                'sql': sql_text,
+            })
+
         total_runs = warmups + runs
         for run_idx in range(total_runs):
             measured = run_idx >= warmups
@@ -119,7 +152,12 @@ def run_single_session(db_cli: str, run_items: list, limit: str, timing: bool, t
         commands.append(f'\\limit {limit}')
     for idx, item in enumerate(run_items):
         commands.append(f"\\echo {MARKER_PREFIX}|{idx}|{item['query_id']}|{item['phase']}|{item['run_index']}")
-        commands.append(sql_command(item['sql']))
+        if item['phase'] == 'dump':
+            commands.append('\\dump on')
+            commands.append(sql_command(item['sql']))
+            commands.append('\\dump off')
+        else:
+            commands.append(sql_command(item['sql']))
     commands.append('\\q')
     stdin = '\n'.join(commands) + '\n'
     timeout = sum(item['timeout'] for item in run_items) + timeout_pad
@@ -144,17 +182,19 @@ def run_single_session(db_cli: str, run_items: list, limit: str, timing: bool, t
 
     segments = split_session_output(combined)
     records = []
+    last_segment_index = max(segments.keys(), default=-1)
     for idx, item in enumerate(run_items):
         segment = segments.get(idx, '')
         metrics = parse_metrics(segment)
-        segment_error = '[ERROR]' in segment or 'Fatal error:' in segment
+        segment_error = has_sql_error(segment)
+        segment_crash = has_process_crash_marker(segment)
         segment_missing = idx not in segments
         item_returncode = 0
         item_timed_out = False
-        if timed_out and (segment_missing or idx == max(segments.keys(), default=-1)):
+        if timed_out and (segment_missing or idx == last_segment_index):
             item_returncode = 124
             item_timed_out = True
-        elif returncode != 0 and (segment_error or segment_missing):
+        elif returncode != 0 and (segment_crash or segment_missing or idx == last_segment_index):
             item_returncode = returncode
         elif segment_error:
             item_returncode = 1
@@ -164,6 +204,7 @@ def run_single_session(db_cli: str, run_items: list, limit: str, timing: bool, t
             '_session_index': idx,
             'returncode': item_returncode,
             'timed_out': item_timed_out,
+            '_raw_output': segment,
             **metrics,
         })
         records.append(record)
@@ -171,12 +212,12 @@ def run_single_session(db_cli: str, run_items: list, limit: str, timing: bool, t
 
 
 def run_isolated(db_cli: str, run_items: list, limit: str, timing: bool, logs_dir: pathlib.Path,
-                 fail_on_error: bool) -> tuple[list, int]:
+                 fail_on_error: bool, codes_dir: Optional[pathlib.Path] = None) -> tuple[list, int]:
     records = []
     failures = 0
     for item in run_items:
         try:
-            proc = run_one(db_cli, item['sql'], limit, timing, item['timeout'])
+            proc = run_one(db_cli, item['sql'], limit, timing, item['timeout'], is_dump=item['phase'] == 'dump')
             timed_out = False
             stdout = proc.stdout or ''
             stderr = proc.stderr or ''
@@ -193,19 +234,30 @@ def run_isolated(db_cli: str, run_items: list, limit: str, timing: bool, logs_di
         log_base = f"{item['query_id']}__{item['phase']}_{item['run_index']}"
         (logs_dir / f'{log_base}.out').write_text(stdout)
         (logs_dir / f'{log_base}.err').write_text(stderr)
-        metrics = parse_metrics(stdout + '\n' + stderr)
-        if returncode != 0 or timed_out or '[ERROR]' in stdout or '[ERROR]' in stderr:
+        
+        if item['phase'] == 'dump' and codes_dir:
+            code_match = re.search(r'---\s*Generated Code\s*---\n(.*?)---\s*End\s*---', stdout, re.DOTALL)
+            if code_match:
+                (codes_dir / f"{item['query_id']}.cpp").write_text(code_match.group(1).strip() + '\n')
+                
+        combined_output = stdout + '\n' + stderr
+        metrics = parse_metrics(combined_output)
+        record_returncode = returncode
+        if record_returncode == 0 and has_sql_error(combined_output):
+            record_returncode = 1
+        if record_returncode != 0 or timed_out or has_sql_error(combined_output):
             failures += 1
         record = dict(item)
         del record['sql']
         record.update({
-            'returncode': returncode,
+            'returncode': record_returncode,
             'timed_out': timed_out,
+            '_raw_output': stdout,
             **metrics,
         })
         records.append(record)
-        print(f"[{item['phase']}] {item['query_id']}: rc={returncode} timeout={timed_out} rows={metrics.get('rows_returned')} gpu_ms={metrics.get('gpu_execution_ms')}")
-        if fail_on_error and (returncode != 0 or timed_out):
+        print(f"[{item['phase']}] {item['query_id']}: rc={record_returncode} timeout={timed_out} rows={metrics.get('rows_returned')} gpu_ms={metrics.get('gpu_execution_ms')}")
+        if fail_on_error and (record_returncode != 0 or timed_out):
             break
     return records, failures
 
@@ -235,6 +287,8 @@ def main() -> int:
     ap.add_argument('--fail-on-error', action='store_true')
     ap.add_argument('--mode', choices=['single-session', 'isolated'], default='single-session')
     ap.add_argument('--session-timeout-pad', type=int, default=300)
+    ap.add_argument('--dump-code', action='store_true', default=True, help='Save generated code for each query (default: True)')
+    ap.add_argument('--no-dump-code', dest='dump_code', action='store_false', help='Do not save generated code')
     args = ap.parse_args()
 
     manifest_path = resolve_manifest_path(args.manifest)
@@ -243,10 +297,13 @@ def main() -> int:
     out_dir = pathlib.Path(args.out) if args.out else root / 'results' / dt.datetime.now().strftime('%Y%m%d_%H%M%S')
     logs_dir = out_dir / 'logs'
     logs_dir.mkdir(parents=True, exist_ok=True)
+    codes_dir = out_dir / 'codes'
+    if args.dump_code:
+        codes_dir.mkdir(parents=True, exist_ok=True)
     class_filter = set(args.classes) if args.classes else None
 
     selected = list(iter_queries(manifest, args.include_future, args.include_heavy, class_filter))
-    run_items = build_run_items(selected, root, args.warmups, args.runs)
+    run_items = build_run_items(selected, root, args.warmups, args.runs, args.dump_code)
 
     if args.mode == 'single-session':
         all_records, proc_rc, timed_out, combined = run_single_session(
@@ -260,6 +317,12 @@ def main() -> int:
             log_base = f"{record['query_id']}__{record['phase']}_{record['run_index']}"
             (logs_dir / f'{log_base}.out').write_text(segment)
             (logs_dir / f'{log_base}.err').write_text('')
+            
+            if record['phase'] == 'dump' and args.dump_code:
+                code_match = re.search(r'---\s*Generated Code\s*---\n(.*?)---\s*End\s*---', segment, re.DOTALL)
+                if code_match:
+                    (codes_dir / f"{record['query_id']}.cpp").write_text(code_match.group(1).strip() + '\n')
+
             if record['returncode'] != 0 or record['timed_out']:
                 failures += 1
             print(f"[{record['phase']}] {record['query_id']}: rc={record['returncode']} timeout={record['timed_out']} rows={record.get('rows_returned')} gpu_ms={record.get('gpu_execution_ms')}")
@@ -268,9 +331,62 @@ def main() -> int:
         if timed_out and failures == 0:
             failures = 1
     else:
-        all_records, failures = run_isolated(args.db_cli, run_items, args.limit, args.timing, logs_dir, args.fail_on_error)
+        all_records, failures = run_isolated(args.db_cli, run_items, args.limit, args.timing, logs_dir, args.fail_on_error, codes_dir if args.dump_code else None)
 
-    rows = [r for r in all_records if r.get('measured')]
+    warmup_metrics = {}
+    for r in all_records:
+        if r.get('phase') == 'warmup':
+            key = r['query_id']
+            if key not in warmup_metrics:
+                warmup_metrics[key] = {
+                    'code_generation_ms': r.get('code_generation_ms', 0),
+                    'acpp_compilation_ms': r.get('acpp_compilation_ms', 0)
+                }
+
+    rows = []
+    for r in all_records:
+        if r.get('measured'):
+            key = r['query_id']
+            if key in warmup_metrics:
+                if not r.get('code_generation_ms'):
+                    r['code_generation_ms'] = warmup_metrics[key].get('code_generation_ms', 0)
+                if not r.get('acpp_compilation_ms'):
+                    r['acpp_compilation_ms'] = warmup_metrics[key].get('acpp_compilation_ms', 0)
+            rows.append(r)
+
+    aggregates = {}
+    for r in rows:
+        key = r['query_id']
+        aggregates.setdefault(key, []).append(r)
+
+    outputs_dir = out_dir / 'outputs'
+    outputs_dir.mkdir(parents=True, exist_ok=True)
+
+    summary = []
+    for key, vals in sorted(aggregates.items()):
+        last_run = vals[-1]
+        if '_raw_output' in last_run:
+            (outputs_dir / f"{key}.out").write_text(last_run['_raw_output'])
+
+        successful_vals = [v for v in vals if v.get('returncode') == 0 and not v.get('timed_out')]
+        last_success = successful_vals[-1] if successful_vals else None
+        gpu_vals = [v['gpu_execution_ms'] for v in successful_vals if isinstance(v.get('gpu_execution_ms'), (int, float))]
+        fetch_vals = [v['result_materialization_fetch_ms'] for v in successful_vals if isinstance(v.get('result_materialization_fetch_ms'), (int, float))]
+        summary.append({
+            'query_id': key,
+            'runs': len(vals),
+            'successful_runs': len(successful_vals),
+            'failed_runs': len(vals) - len(successful_vals),
+            'last_returncode': last_run.get('returncode'),
+            'last_timed_out': last_run.get('timed_out'),
+            'gpu_execution_ms_mean': mean(gpu_vals) if gpu_vals else None,
+            'result_materialization_fetch_ms_mean': mean(fetch_vals) if fetch_vals else None,
+            'rows_returned_last': last_success.get('rows_returned') if last_success else None,
+        })
+
+    for r in rows:
+        r.pop('_raw_output', None)
+
     fields = [
         'class_id','query_id','path','status','phase','run_index','measured','returncode','timed_out',
         'rows_returned','rows_shown','gpu_execution_ms','result_materialization_fetch_ms',
@@ -283,21 +399,7 @@ def main() -> int:
             w.writerow(r)
     (out_dir / 'summary.json').write_text(json.dumps({'mode': args.mode, 'rows': rows}, indent=2))
 
-    aggregates = {}
-    for r in rows:
-        key = r['query_id']
-        aggregates.setdefault(key, []).append(r)
-    summary = []
-    for key, vals in sorted(aggregates.items()):
-        gpu_vals = [v['gpu_execution_ms'] for v in vals if isinstance(v.get('gpu_execution_ms'), (int, float))]
-        fetch_vals = [v['result_materialization_fetch_ms'] for v in vals if isinstance(v.get('result_materialization_fetch_ms'), (int, float))]
-        summary.append({
-            'query_id': key,
-            'runs': len(vals),
-            'gpu_execution_ms_mean': mean(gpu_vals) if gpu_vals else None,
-            'result_materialization_fetch_ms_mean': mean(fetch_vals) if fetch_vals else None,
-            'rows_returned_last': vals[-1].get('rows_returned'),
-        })
+
     (out_dir / 'aggregate_summary.json').write_text(json.dumps(summary, indent=2))
     print(f'Wrote results to {out_dir}')
     return 1 if failures and args.fail_on_error else 0

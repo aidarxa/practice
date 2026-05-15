@@ -178,7 +178,7 @@ void TerminalApp::run() {
             linenoiseFree(raw);
 
             if (!continuation.empty()) {
-                buffer += " " + continuation;
+                buffer += "\n" + continuation;
             }
         }
 

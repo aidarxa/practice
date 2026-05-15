@@ -16,7 +16,7 @@ This file separates the benchmark feature surface into current functionality and
 - Typed columnar result fetch for projection and dense result paths.
 - Sparse fast path for SSB-style grouped aggregates when no post-aggregate filter/order requires dense output.
 - Runtime memory guard and dynamic materialization for projection.
-- SQL-level `ORDER BY` and `LIMIT` on final GPU materialized results using device-side Bitonic Sort for ordering.
+- SQL-level `ORDER BY` and `LIMIT` on final GPU materialized results. Bounded `LIMIT K` with `K <= 4096` uses an exact iterative GPU Top-K selection path; unbounded ordering and large limits fall back to device-side Bitonic Sort.
 - `HAVING` after grouped aggregation when referenced aggregate expressions are present in the SELECT output.
 - Table aliases for ordinary non-self-join queries.
 - Column aliases in SELECT output and references from `ORDER BY` / `HAVING`.
@@ -27,7 +27,7 @@ This file separates the benchmark feature surface into current functionality and
 
 These are required for a general-purpose OLAP SQL engine, even if not required by current SSB smoke tests.
 
-1. Top-N optimization beyond full Bitonic Sort. `ORDER BY`/`LIMIT` semantics are supported; a heap/selection Top-N kernel is still future work.
+1. Projection-level Top-K pushdown before full dense materialization for simple scan/projection queries. The current Top-K optimization runs after dense materialization.
 2. Hidden aggregate slots for `HAVING` expressions not projected by SELECT.
 3. `DISTINCT` and `COUNT(DISTINCT ...)`.
 4. Self-join aliases. Ordinary table aliases are supported; two independent logical aliases over the same physical table are still unsupported.

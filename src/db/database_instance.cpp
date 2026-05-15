@@ -439,6 +439,8 @@ QueryResult DatabaseInstance::executeQuery(const std::string& sql, const QueryFe
 }
 
 std::string DatabaseInstance::generateQueryCode(const std::string& sql) {
+    q_.wait();
+    ctx_->resetForQuery();
     return engine_->generateQueryCode(sql);
 }
 
