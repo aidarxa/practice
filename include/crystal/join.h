@@ -119,6 +119,54 @@ inline void BlockProbeAndPHT_2(int tid, K (&items)[ITEMS_PER_THREAD],
       tid, items, res, flags, ht, ht_len, 0, num_items);
 }
 
+template <typename K, int BLOCK_THREADS, int ITEMS_PER_THREAD>
+inline void BlockProbeDirectAndPHT_2KeyOnly(int tid, K (&items)[ITEMS_PER_THREAD],
+                                            int (&flags)[ITEMS_PER_THREAD],
+                                            K* ht, int ht_len, K key_mins) {
+#pragma unroll
+  for (int i = 0; i < ITEMS_PER_THREAD; ++i) {
+    if (flags[i]) {
+      int hash = HASH(items[i], ht_len, key_mins);
+      K slot_key = ht[hash << 1];
+      flags[i] = (slot_key == items[i]) ? 1 : 0;
+    }
+  }
+}
+template <typename K, int BLOCK_THREADS, int ITEMS_PER_THREAD>
+inline void BlockProbeDirectAndPHT_2KeyOnly(int tid, K (&items)[ITEMS_PER_THREAD],
+                                            int (&flags)[ITEMS_PER_THREAD],
+                                            K* ht, int ht_len, K key_mins,
+                                            int num_items) {
+#pragma unroll
+  for (int i = 0; i < ITEMS_PER_THREAD; ++i) {
+    if (flags[i] && (i * BLOCK_THREADS + tid < num_items)) {
+      int hash = HASH(items[i], ht_len, key_mins);
+      K slot_key = ht[hash << 1];
+      flags[i] = (slot_key == items[i]) ? 1 : 0;
+    }
+  }
+}
+template <typename K, int BLOCK_THREADS, int ITEMS_PER_THREAD>
+inline void BlockProbeAndPHT_2KeyOnly(int tid, K (&items)[ITEMS_PER_THREAD],
+                                      int (&flags)[ITEMS_PER_THREAD],
+                                      K* ht, int ht_len, K key_mins,
+                                      int num_items) {
+  if (BLOCK_THREADS * ITEMS_PER_THREAD == num_items) {
+    BlockProbeDirectAndPHT_2KeyOnly<K, BLOCK_THREADS, ITEMS_PER_THREAD>(
+        tid, items, flags, ht, ht_len, key_mins);
+  } else {
+    BlockProbeDirectAndPHT_2KeyOnly<K, BLOCK_THREADS, ITEMS_PER_THREAD>(
+        tid, items, flags, ht, ht_len, key_mins, num_items);
+  }
+}
+template <typename K, int BLOCK_THREADS, int ITEMS_PER_THREAD>
+inline void BlockProbeAndPHT_2KeyOnly(int tid, K (&items)[ITEMS_PER_THREAD],
+                                      int (&flags)[ITEMS_PER_THREAD],
+                                      K* ht, int ht_len, int num_items) {
+  BlockProbeAndPHT_2KeyOnly<K, BLOCK_THREADS, ITEMS_PER_THREAD>(
+      tid, items, flags, ht, ht_len, 0, num_items);
+}
+
 // Construct hash table on device
 
 template<typename K, int BLOCK_THREADS, int ITEMS_PER_THREAD>

@@ -693,7 +693,7 @@ void QueryEngine::executeQuery(const std::string& sql, ExecutionContext* ctx) {
     ctx->ensureResultValidityCapacity(ctx->expected_result_size_);
 
     // ШАГ 5: Проверка кеша
-    static constexpr const char* kJitAbiVersion = "v33_having_dense_topk4096";
+    static constexpr const char* kJitAbiVersion = "v39_radix_projection_topk";
     std::string query_hash = std::string("query_") + kJitAbiVersion + "_" + std::to_string(std::hash<std::string>{}(sql));
     auto cached_lib = cache_->get(query_hash);
     if (cached_lib.has_value()) {
