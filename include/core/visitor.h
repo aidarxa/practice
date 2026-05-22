@@ -322,7 +322,8 @@ private:
     enum class ProjectionPass : uint8_t {
         None = 0,
         Count,
-        Write
+        Write,
+        DirectDense
     };
     ProjectionPass projection_pass_ = ProjectionPass::None;
 

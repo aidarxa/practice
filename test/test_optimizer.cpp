@@ -97,6 +97,23 @@ static hsql::SelectStatement* parseSQL(const std::string& sql,
         static_cast<const hsql::SelectStatement*>(result.getStatement(0)));
 }
 
+static std::string generateJitCodeForSql(const std::string& sql,
+                                         const std::shared_ptr<Catalog>& catalog) {
+    hsql::SQLParserResult result;
+    auto* ast = parseSQL(sql, result);
+    assert(ast != nullptr);
+
+    db::QueryTranslator translator;
+    auto tree = translator.translate(ast);
+    db::Optimizer opt;
+    tree = opt.optimize(std::move(tree));
+
+    db::JITContext jit_ctx;
+    db::JITOperatorVisitor visitor(jit_ctx, *catalog);
+    tree->accept(visitor);
+    return visitor.generateCode();
+}
+
 // ============================================================================
 // Test 1: PredicatePushdownRule — ручное построение дерева
 // ============================================================================
@@ -595,6 +612,105 @@ static void test_nullable_expression_codegen_and_typed_result_abi() {
 }
 
 // ============================================================================
+// Test 12: ORDER BY/LIMIT projection uses direct radix Top-K codegen
+// ============================================================================
+static void test_topn_projection_direct_radix_codegen() {
+    std::cout << "Test 12: projection ORDER BY/LIMIT direct radix Top-K codegen... ";
+
+    const std::string code = generateJitCodeForSql(
+        "SELECT lo_orderkey, lo_revenue "
+        "FROM lineorder "
+        "ORDER BY lo_revenue DESC "
+        "LIMIT 100",
+        buildTestCatalog());
+
+    assert(code.find("ProjectionDirectTopKRadixHistogram") != std::string::npos);
+    assert(code.find("ProjectionDirectTopKRadixReduce") != std::string::npos);
+    assert(code.find("ProjectionDirectTopKCollect") != std::string::npos);
+    assert(code.find("ProjectionDirectTopKLocalSelect") == std::string::npos);
+    assert(code.find("projection_topk_threshold_key") != std::string::npos);
+    assert(code.find("ProjectionDirectTopKCountGE") == std::string::npos);
+    assert(code.find("ProjectionDirectTopKMinMax") == std::string::npos);
+
+    std::cout << "PASSED\n";
+}
+
+// ============================================================================
+// Test 13: SELECT * after PK/FK join avoids wide unconditional projection loads
+// ============================================================================
+static void test_projection_join_star_selective_direct_load_codegen() {
+    std::cout << "Test 13: join SELECT * selective projection codegen... ";
+
+    const std::string code = generateJitCodeForSql(
+        "SELECT * "
+        "FROM lineorder, customer "
+        "WHERE lo_custkey = c_custkey "
+        "AND c_region = 1",
+        buildTestCatalog());
+
+    assert(code.find("d_lo_orderkey[tile_offset + tid + BLOCK_THREADS * i]") != std::string::npos);
+    assert(code.find("d_c_name[c_row_id[i]]") != std::string::npos);
+    assert(code.find("BlockProbeAndPHT_2KeyOnly") != std::string::npos);
+    assert(code.find("d_projection_write_counts") == std::string::npos);
+    assert(code.find("BlockLoad<int, BLOCK_THREADS, ITEMS_PER_THREAD>(d_lo_orderkey + tile_offset") == std::string::npos);
+
+    std::cout << "PASSED\n";
+}
+
+// ============================================================================
+// Test 14: grouped aggregate local-reduce cost model keeps wide domains atomic
+// ============================================================================
+static void test_grouped_aggregate_local_reduce_cost_model_codegen() {
+    std::cout << "Test 14: grouped aggregate local-reduce cost model codegen... ";
+
+    const auto catalog = buildTestCatalog();
+    const std::string wide_group_code = generateJitCodeForSql(
+        "SELECT c_nation, sum(lo_revenue) "
+        "FROM lineorder, customer, supplier "
+        "WHERE lo_custkey = c_custkey "
+        "AND lo_suppkey = s_suppkey "
+        "AND c_nation = s_nation "
+        "AND c_region = 1 "
+        "GROUP BY c_nation",
+        catalog);
+    assert(wide_group_code.find("local_agg_0[25]") == std::string::npos);
+    assert(wide_group_code.find("db::atomic_add_ull(d_result[out + 1]") != std::string::npos);
+
+    const std::string small_group_code = generateJitCodeForSql(
+        "SELECT c_region, sum(lo_extendedprice * lo_discount) "
+        "FROM lineorder, customer "
+        "WHERE lo_custkey = c_custkey "
+        "GROUP BY c_region",
+        catalog);
+    assert(small_group_code.find("local_agg_0[5]") != std::string::npos);
+
+    std::cout << "PASSED\n";
+}
+
+// ============================================================================
+// Test 15: OR-expanded grouped aggregates scope local-reduce temporaries
+// ============================================================================
+static void test_or_join_grouped_aggregate_local_reduce_scopes_codegen() {
+    std::cout << "Test 15: OR join grouped aggregate local-reduce scopes codegen... ";
+
+    const std::string code = generateJitCodeForSql(
+        "SELECT d_year, sum(lo_revenue) "
+        "FROM lineorder, ddate "
+        "WHERE (lo_orderdate = d_datekey OR lo_commitdate = d_datekey) "
+        "AND d_year >= 1992 AND d_year <= 1997 "
+        "GROUP BY d_year",
+        buildTestCatalog());
+
+    const std::string scoped_decl = "            {\n                unsigned long long local_agg_0[7];";
+    const std::size_t first = code.find(scoped_decl);
+    assert(first != std::string::npos);
+    const std::size_t second = code.find(scoped_decl, first + scoped_decl.size());
+    assert(second != std::string::npos);
+
+    std::cout << "PASSED\n";
+}
+
+// ============================================================================
 int main() {
     std::cout << "=== test_optimizer (new pipeline) ===\n\n";
 
@@ -609,6 +725,10 @@ int main() {
     test_catalog_uniqueness_metadata();
     test_catalog_nullable_metadata();
     test_nullable_expression_codegen_and_typed_result_abi();
+    test_topn_projection_direct_radix_codegen();
+    test_projection_join_star_selective_direct_load_codegen();
+    test_grouped_aggregate_local_reduce_cost_model_codegen();
+    test_or_join_grouped_aggregate_local_reduce_scopes_codegen();
 
     std::cout << "\nAll tests passed!\n";
     return 0;
