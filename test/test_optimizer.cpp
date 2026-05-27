@@ -711,6 +711,24 @@ static void test_or_join_grouped_aggregate_local_reduce_scopes_codegen() {
 }
 
 // ============================================================================
+// Test 16: generated query records whole generated execute interval
+// ============================================================================
+static void test_generated_execute_timing_codegen() {
+    std::cout << "Test 16: generated execute timing codegen... ";
+
+    const std::string code = generateJitCodeForSql(
+        "SELECT SUM(lo_revenue) "
+        "FROM lineorder",
+        buildTestCatalog());
+
+    assert(code.find("ctx->timing_.generated_execute_ms") != std::string::npos);
+    assert(code.find("ctx->timing_.gpu_execute_ms = ctx->timing_.generated_execute_ms") != std::string::npos);
+    assert(code.find("ctx->timing_.jit_execute_ms = ctx->timing_.generated_execute_ms") != std::string::npos);
+
+    std::cout << "PASSED\n";
+}
+
+// ============================================================================
 int main() {
     std::cout << "=== test_optimizer (new pipeline) ===\n\n";
 
@@ -729,6 +747,7 @@ int main() {
     test_projection_join_star_selective_direct_load_codegen();
     test_grouped_aggregate_local_reduce_cost_model_codegen();
     test_or_join_grouped_aggregate_local_reduce_scopes_codegen();
+    test_generated_execute_timing_codegen();
 
     std::cout << "\nAll tests passed!\n";
     return 0;

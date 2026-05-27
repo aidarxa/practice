@@ -94,10 +94,11 @@ The runner extracts these metrics when present:
 
 - `Rows returned`
 - `Rows shown`
-- `GPU execution time`
+- `Prepare time`
+- `Generated execute time`
 - `Result materialization/fetch time`
 - `Code generation time`
 - `ACPP compilation time`
 - `Library load time`
 - `Engine processing time`
-
+- `Total query time`

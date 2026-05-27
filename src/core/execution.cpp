@@ -181,14 +181,25 @@ void DynamicLibraryExecutor::execute(const std::string& lib_path, ExecutionConte
         ctx->timing_.library_load_ms += elapsedMs(load_start, load_end);
     }
 
-    const double generated_reported_before = ctx ? ctx->timing_.gpu_execute_ms : 0.0;
+    const double generated_reported_before = ctx ? ctx->timing_.generated_execute_ms : 0.0;
     const auto exec_start = Clock::now();
     func(ctx);
-    const auto exec_end = Clock::now();
-    if (ctx && ctx->timing_.gpu_execute_ms <= generated_reported_before) {
-        ctx->timing_.gpu_execute_ms += elapsedMs(exec_start, exec_end);
+    double final_barrier_ms = 0.0;
+    if (ctx && ctx->q_) {
+        const auto barrier_start = Clock::now();
+        ctx->q_->wait();
+        final_barrier_ms = elapsedMs(barrier_start, Clock::now());
     }
-    if (ctx) ctx->timing_.jit_execute_ms = ctx->timing_.gpu_execute_ms;
+    const auto exec_end = Clock::now();
+    if (ctx) {
+        if (ctx->timing_.generated_execute_ms <= generated_reported_before) {
+            ctx->timing_.generated_execute_ms += elapsedMs(exec_start, exec_end);
+        } else {
+            ctx->timing_.generated_execute_ms += final_barrier_ms;
+        }
+        ctx->timing_.gpu_execute_ms = ctx->timing_.generated_execute_ms;
+        ctx->timing_.jit_execute_ms = ctx->timing_.generated_execute_ms;
+    }
 }
 
 // --- QueryEngine ---
@@ -693,18 +704,25 @@ void QueryEngine::executeQuery(const std::string& sql, ExecutionContext* ctx) {
     ctx->ensureResultValidityCapacity(ctx->expected_result_size_);
 
     // ШАГ 5: Проверка кеша
-    static constexpr const char* kJitAbiVersion = "v39_radix_projection_topk";
+    static constexpr const char* kJitAbiVersion = "v40_query_timing";
     std::string query_hash = std::string("query_") + kJitAbiVersion + "_" + std::to_string(std::hash<std::string>{}(sql));
     auto cached_lib = cache_->get(query_hash);
+    const auto prepare_end = Clock::now();
+    if (ctx) {
+        ctx->timing_.prepare_ms += elapsedMs(engine_start, prepare_end);
+    }
     if (cached_lib.has_value()) {
         // Cache HIT: размер уже рассчитан, буфер подготовлен — просто выполняем
         executor_->execute(cached_lib.value(), ctx);
-        if (ctx) ctx->timing_.engine_ms = elapsedMs(engine_start, Clock::now());
+        if (ctx) {
+            ctx->timing_.engine_ms = elapsedMs(engine_start, Clock::now());
+            ctx->timing_.total_engine_ms = ctx->timing_.engine_ms;
+        }
         return;
     }
 
     // ШАГ 6: Cache MISS — JIT генерация кода
-    const auto codegen_start = Clock::now();
+    const auto codegen_start = prepare_end;
     JITContext jit_ctx;
     JITOperatorVisitor visitor(jit_ctx, *catalog_);
     optimized_tree->accept(visitor);
@@ -713,15 +731,18 @@ void QueryEngine::executeQuery(const std::string& sql, ExecutionContext* ctx) {
     if (ctx) ctx->timing_.codegen_ms += elapsedMs(codegen_start, codegen_end);
 
     // ШАГ 7: Компиляция → .so
-    const auto compile_start = Clock::now();
+    const auto compile_start = codegen_end;
     std::string lib_path = compiler_->compile(source_code, query_hash);
+    cache_->put(query_hash, lib_path);
     const auto compile_end = Clock::now();
     if (ctx) ctx->timing_.compile_ms += elapsedMs(compile_start, compile_end);
-    cache_->put(query_hash, lib_path);
 
     // ШАГ 8: Выполнение
     executor_->execute(lib_path, ctx);
-    if (ctx) ctx->timing_.engine_ms = elapsedMs(engine_start, Clock::now());
+    if (ctx) {
+        ctx->timing_.engine_ms = elapsedMs(engine_start, Clock::now());
+        ctx->timing_.total_engine_ms = ctx->timing_.engine_ms;
+    }
 }
 
 } // namespace db

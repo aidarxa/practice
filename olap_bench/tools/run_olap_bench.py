@@ -12,7 +12,9 @@ from typing import Optional
 METRIC_PATTERNS = {
     'rows_returned': re.compile(r'Rows returned:\s*(\d+)'),
     'rows_shown': re.compile(r'Rows shown:\s*(\d+)'),
-    'gpu_execution_ms': re.compile(r'GPU execution time:\s*([0-9.]+)\s*ms'),
+    'generated_execute_ms': re.compile(r'Generated execute time:\s*([0-9.]+)\s*ms'),
+    'gpu_execution_ms_legacy': re.compile(r'GPU execution time:\s*([0-9.]+)\s*ms'),
+    'prepare_ms': re.compile(r'Prepare time:\s*([0-9.]+)\s*ms'),
     'result_materialization_fetch_ms': re.compile(r'Result materialization/fetch time:\s*([0-9.]+)\s*ms'),
     'host_result_fetch_ms_legacy': re.compile(r'Host result fetch time:\s*([0-9.]+)\s*ms'),
     'code_generation_ms': re.compile(r'Code generation time:\s*([0-9.]+)\s*ms'),
@@ -20,10 +22,97 @@ METRIC_PATTERNS = {
     'library_load_ms': re.compile(r'Library load time:\s*([0-9.]+)\s*ms'),
     'library_load_old_ms': re.compile(r'Library load \+ execution start time:\s*([0-9.]+)\s*ms'),
     'engine_processing_ms': re.compile(r'Engine processing time:\s*([0-9.]+)\s*ms'),
+    'total_query_ms': re.compile(r'Total query time:\s*([0-9.]+)\s*ms'),
 }
 
 MARKER_PREFIX = '__CRYSTAL_BENCH_BEGIN__'
 MARKER_RE = re.compile(rf'{re.escape(MARKER_PREFIX)}\|(\d+)\|([^|]+)\|([^|]+)\|(\d+)')
+
+ENGINE_COMPONENT_FIELDS = [
+    'prepare_ms',
+    'codegen_ms',
+    'compile_ms',
+    'library_load_ms',
+    'generated_execute_ms',
+]
+
+TIMING_COMPONENT_FIELDS = ENGINE_COMPONENT_FIELDS + [
+    'host_fetch_ms',
+]
+
+CANONICAL_TIMING_FIELDS = TIMING_COMPONENT_FIELDS + [
+    'engine_ms',
+    'total_query_ms',
+]
+
+COMPATIBILITY_TIMING_FIELDS = [
+    'code_generation_ms',
+    'acpp_compilation_ms',
+    'result_materialization_fetch_ms',
+    'engine_processing_ms',
+    'gpu_execution_ms',
+]
+
+DERIVED_TIMING_FIELDS = [
+    'engine_component_sum_ms',
+    'engine_minus_components_ms',
+    'timing_component_sum_ms',
+    'timing_total_minus_components_ms',
+]
+
+TIMING_ALIASES = [
+    ('codegen_ms', 'code_generation_ms'),
+    ('compile_ms', 'acpp_compilation_ms'),
+    ('host_fetch_ms', 'result_materialization_fetch_ms'),
+    ('engine_ms', 'engine_processing_ms'),
+    ('generated_execute_ms', 'gpu_execution_ms'),
+]
+
+
+def is_number(value) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
+def sync_timing_aliases(record: dict) -> None:
+    for canonical, compatible in TIMING_ALIASES:
+        if canonical not in record and compatible in record:
+            record[canonical] = record[compatible]
+        if compatible not in record and canonical in record:
+            record[compatible] = record[canonical]
+
+
+def sum_numeric_fields(record: dict, fields) -> Optional[float]:
+    values = [record.get(field) for field in fields]
+    if not all(is_number(value) for value in values):
+        return None
+    return sum(values)
+
+
+def normalize_timing_record(record: dict) -> dict:
+    sync_timing_aliases(record)
+
+    engine_sum = sum_numeric_fields(record, ENGINE_COMPONENT_FIELDS)
+    record['engine_component_sum_ms'] = engine_sum
+    if engine_sum is not None and is_number(record.get('engine_ms')):
+        record['engine_minus_components_ms'] = record['engine_ms'] - engine_sum
+    else:
+        record['engine_minus_components_ms'] = None
+
+    total_sum = sum_numeric_fields(record, TIMING_COMPONENT_FIELDS)
+    record['timing_component_sum_ms'] = total_sum
+    if total_sum is not None and is_number(record.get('total_query_ms')):
+        record['timing_total_minus_components_ms'] = record['total_query_ms'] - total_sum
+    else:
+        record['timing_total_minus_components_ms'] = None
+
+    for field in CANONICAL_TIMING_FIELDS + COMPATIBILITY_TIMING_FIELDS + DERIVED_TIMING_FIELDS:
+        record.setdefault(field, None)
+    return record
+
+
+def mean_field(records, field: str) -> Optional[float]:
+    values = [record[field] for record in records if is_number(record.get(field))]
+    return mean(values) if values else None
 
 
 def parse_metrics(text: str) -> dict:
@@ -38,6 +127,9 @@ def parse_metrics(text: str) -> dict:
         out['result_materialization_fetch_ms'] = out['host_result_fetch_ms_legacy']
     if 'library_load_ms' not in out and 'library_load_old_ms' in out:
         out['library_load_ms'] = out['library_load_old_ms']
+    if 'generated_execute_ms' not in out and 'gpu_execution_ms_legacy' in out:
+        out['generated_execute_ms'] = out['gpu_execution_ms_legacy']
+    sync_timing_aliases(out)
     return out
 
 
@@ -256,7 +348,7 @@ def run_isolated(db_cli: str, run_items: list, limit: str, timing: bool, logs_di
             **metrics,
         })
         records.append(record)
-        print(f"[{item['phase']}] {item['query_id']}: rc={record_returncode} timeout={timed_out} rows={metrics.get('rows_returned')} gpu_ms={metrics.get('gpu_execution_ms')}")
+        print(f"[{item['phase']}] {item['query_id']}: rc={record_returncode} timeout={timed_out} rows={metrics.get('rows_returned')} generated_ms={metrics.get('generated_execute_ms')}")
         if fail_on_error and (record_returncode != 0 or timed_out):
             break
     return records, failures
@@ -325,7 +417,7 @@ def main() -> int:
 
             if record['returncode'] != 0 or record['timed_out']:
                 failures += 1
-            print(f"[{record['phase']}] {record['query_id']}: rc={record['returncode']} timeout={record['timed_out']} rows={record.get('rows_returned')} gpu_ms={record.get('gpu_execution_ms')}")
+            print(f"[{record['phase']}] {record['query_id']}: rc={record['returncode']} timeout={record['timed_out']} rows={record.get('rows_returned')} generated_ms={record.get('generated_execute_ms')}")
         if proc_rc != 0 and failures == 0:
             failures = 1
         if timed_out and failures == 0:
@@ -333,25 +425,10 @@ def main() -> int:
     else:
         all_records, failures = run_isolated(args.db_cli, run_items, args.limit, args.timing, logs_dir, args.fail_on_error, codes_dir if args.dump_code else None)
 
-    warmup_metrics = {}
-    for r in all_records:
-        if r.get('phase') == 'warmup':
-            key = r['query_id']
-            if key not in warmup_metrics:
-                warmup_metrics[key] = {
-                    'code_generation_ms': r.get('code_generation_ms', 0),
-                    'acpp_compilation_ms': r.get('acpp_compilation_ms', 0)
-                }
-
     rows = []
     for r in all_records:
         if r.get('measured'):
-            key = r['query_id']
-            if key in warmup_metrics:
-                if not r.get('code_generation_ms'):
-                    r['code_generation_ms'] = warmup_metrics[key].get('code_generation_ms', 0)
-                if not r.get('acpp_compilation_ms'):
-                    r['acpp_compilation_ms'] = warmup_metrics[key].get('acpp_compilation_ms', 0)
+            normalize_timing_record(r)
             rows.append(r)
 
     aggregates = {}
@@ -370,34 +447,42 @@ def main() -> int:
 
         successful_vals = [v for v in vals if v.get('returncode') == 0 and not v.get('timed_out')]
         last_success = successful_vals[-1] if successful_vals else None
-        gpu_vals = [v['gpu_execution_ms'] for v in successful_vals if isinstance(v.get('gpu_execution_ms'), (int, float))]
-        fetch_vals = [v['result_materialization_fetch_ms'] for v in successful_vals if isinstance(v.get('result_materialization_fetch_ms'), (int, float))]
-        summary.append({
+        aggregate_record = {
             'query_id': key,
             'runs': len(vals),
             'successful_runs': len(successful_vals),
             'failed_runs': len(vals) - len(successful_vals),
             'last_returncode': last_run.get('returncode'),
             'last_timed_out': last_run.get('timed_out'),
-            'gpu_execution_ms_mean': mean(gpu_vals) if gpu_vals else None,
-            'result_materialization_fetch_ms_mean': mean(fetch_vals) if fetch_vals else None,
             'rows_returned_last': last_success.get('rows_returned') if last_success else None,
-        })
+        }
+        for field in CANONICAL_TIMING_FIELDS + COMPATIBILITY_TIMING_FIELDS + DERIVED_TIMING_FIELDS:
+            aggregate_record[f'{field}_mean'] = mean_field(successful_vals, field)
+        summary.append(aggregate_record)
 
     for r in rows:
         r.pop('_raw_output', None)
 
     fields = [
         'class_id','query_id','path','status','phase','run_index','measured','returncode','timed_out',
-        'rows_returned','rows_shown','gpu_execution_ms','result_materialization_fetch_ms',
-        'code_generation_ms','acpp_compilation_ms','library_load_ms','engine_processing_ms'
+        'rows_returned','rows_shown',
+        'prepare_ms','codegen_ms','code_generation_ms','compile_ms','acpp_compilation_ms',
+        'library_load_ms','generated_execute_ms','gpu_execution_ms','host_fetch_ms',
+        'result_materialization_fetch_ms','engine_ms','engine_processing_ms','total_query_ms',
+        'engine_component_sum_ms','engine_minus_components_ms',
+        'timing_component_sum_ms','timing_total_minus_components_ms'
     ]
     with (out_dir / 'summary.csv').open('w', newline='') as f:
         w = csv.DictWriter(f, fieldnames=fields, extrasaction='ignore')
         w.writeheader()
         for r in rows:
             w.writerow(r)
-    (out_dir / 'summary.json').write_text(json.dumps({'mode': args.mode, 'rows': rows}, indent=2))
+    (out_dir / 'summary.json').write_text(json.dumps({
+        'mode': args.mode,
+        'timing_fields_ms': CANONICAL_TIMING_FIELDS,
+        'derived_timing_fields_ms': DERIVED_TIMING_FIELDS,
+        'rows': rows,
+    }, indent=2))
 
 
     (out_dir / 'aggregate_summary.json').write_text(json.dumps(summary, indent=2))
