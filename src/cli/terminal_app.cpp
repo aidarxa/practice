@@ -291,13 +291,15 @@ void TerminalApp::executeQuery(const std::string& sql) {
             if (ctx_.output_row_limit_enabled && query_result.row_count > ctx_.output_row_limit) {
                 std::cout << "Rows shown: " << rows_to_print.size() << "\n";
             }
-            printTimingLine("GPU execution time", query_result.timing.gpu_execute_ms);
+            printTimingLine("Generated execute time", query_result.timing.generated_execute_ms);
             if (ctx_.extended_timing) {
+                printTimingLine("Prepare time", query_result.timing.prepare_ms);
                 printTimingLine("Code generation time", query_result.timing.codegen_ms);
                 printTimingLine("ACPP compilation time", query_result.timing.compile_ms);
                 printTimingLine("Library load time", query_result.timing.library_load_ms);
                 printTimingLine("Result materialization/fetch time", query_result.timing.host_fetch_ms);
                 printTimingLine("Engine processing time", query_result.timing.engine_ms);
+                printTimingLine("Total query time", query_result.timing.total_query_ms);
             }
             std::cout << "--- End ---\n";
         }

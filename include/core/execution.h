@@ -26,17 +26,32 @@ struct ResultColumnDesc {
 
 
 struct QueryTimingStats {
+    // Query preparation before code generation or cached-library execution:
+    // SQL parsing, logical/physical preparation, result-shape inference,
+    // memory preflight, result-buffer preparation, cache-key build and lookup.
+    double prepare_ms = 0.0;
     double codegen_ms = 0.0;
     double compile_ms = 0.0;
     double library_load_ms = 0.0;
-    // Time measured inside generated execute_query(): queue submissions,
-    // required q.wait(), and generated-kernel temporary cleanup.
+    // Time measured for generated execute_query() as a whole: host-side queue
+    // submissions, temporary allocation/init, generated kernels, required
+    // q.wait(), service copies, and generated-kernel temporary cleanup.
+    double generated_execute_ms = 0.0;
+    // Backward-compatible alias for old reports. This is not pure GPU-kernel
+    // time; reporting keeps it equal to generated_execute_ms.
     double gpu_execute_ms = 0.0;
     // Backward-compatible alias for old code paths; kept in sync with
-    // gpu_execute_ms at reporting boundaries.
+    // generated_execute_ms at reporting boundaries.
     double jit_execute_ms = 0.0;
     double host_fetch_ms = 0.0;
+    // Full engine time before host result fetch:
+    // prepare + codegen + compile + library_load + generated_execute.
     double engine_ms = 0.0;
+    // Full SQL query path through the prototype, from DatabaseInstance entry
+    // to a fully populated CPU QueryResult.
+    double total_query_ms = 0.0;
+    // Legacy aggregate field. QueryResult finalization populates it with
+    // total_query_ms so old consumers get the complete query time.
     double total_engine_ms = 0.0;
 };
 

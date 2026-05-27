@@ -178,14 +178,15 @@ QueryResult DatabaseInstance::executeQuery(const std::string& sql) {
 }
 
 QueryResult DatabaseInstance::executeQuery(const std::string& sql, const QueryFetchOptions& fetch_options) {
+    const auto total_query_start = Clock::now();
+
     // QueryEngine::executeQuery самостоятельно вызовет ensureCapacity и zero
     // на основе рассчитанного expected_result_size_.
     engine_->executeQuery(sql, ctx_.get());
 
-    // Ждём завершения всех GPU операций перед копированием на хост. Обычно generated
-    // function уже сделал q.wait(); если нет, ожидание относится к GPU execution,
-    // а не к объёму результата. Host fetch timing начинается после этого барьера.
-    q_.wait();
+    // DynamicLibraryExecutor ставит финальный барьер и относит его к
+    // generated_execute_ms. Поэтому host_fetch_ms начинается уже после того,
+    // как результат готов к копированию на CPU.
     const auto fetch_start = Clock::now();
 
     QueryResult result;
@@ -193,6 +194,21 @@ QueryResult DatabaseInstance::executeQuery(const std::string& sql, const QueryFe
     result.columns = ctx_->result_columns_;
     result.column_names = ctx_->result_column_names_;
     result.dense_result = ctx_->result_is_dense_;
+
+    auto finalize_timing = [&](QueryResult& out) {
+        const auto total_query_end = Clock::now();
+        out.timing = ctx_->timing_;
+        if (out.timing.generated_execute_ms == 0.0) {
+            out.timing.generated_execute_ms = out.timing.gpu_execute_ms != 0.0
+                ? out.timing.gpu_execute_ms
+                : out.timing.jit_execute_ms;
+        }
+        out.timing.gpu_execute_ms = out.timing.generated_execute_ms;
+        out.timing.jit_execute_ms = out.timing.generated_execute_ms;
+        out.timing.host_fetch_ms = elapsedMs(fetch_start, total_query_end);
+        out.timing.total_query_ms = elapsedMs(total_query_start, total_query_end);
+        out.timing.total_engine_ms = out.timing.total_query_ms;
+    };
 
     if (ctx_->result_is_columnar_) {
         result.row_count = ctx_->result_row_count_;
@@ -260,10 +276,7 @@ QueryResult DatabaseInstance::executeQuery(const std::string& sql, const QueryFe
                 }
             }
         }
-        result.timing = ctx_->timing_;
-        result.timing.host_fetch_ms = elapsedMs(fetch_start, Clock::now());
-        result.timing.gpu_execute_ms = result.timing.gpu_execute_ms == 0.0 ? result.timing.jit_execute_ms : result.timing.gpu_execute_ms;
-        result.timing.jit_execute_ms = result.timing.gpu_execute_ms;
+        finalize_timing(result);
         return result;
     }
 
@@ -329,10 +342,7 @@ QueryResult DatabaseInstance::executeQuery(const std::string& sql, const QueryFe
         // Validity for fast sparse SSB aggregates is absent by design: all copied
         // cells are non-null. Nullable sparse paths use dense/columnar finalization.
         result.has_cell_validity = false;
-        result.timing = ctx_->timing_;
-        result.timing.host_fetch_ms = elapsedMs(fetch_start, Clock::now());
-        result.timing.gpu_execute_ms = result.timing.gpu_execute_ms == 0.0 ? result.timing.jit_execute_ms : result.timing.gpu_execute_ms;
-        result.timing.jit_execute_ms = result.timing.gpu_execute_ms;
+        finalize_timing(result);
         return result;
     }
 
@@ -431,10 +441,7 @@ QueryResult DatabaseInstance::executeQuery(const std::string& sql, const QueryFe
     }
     result.materialized_row_offset = 0;
     result.materialized_row_count = result.row_count;
-    result.timing = ctx_->timing_;
-    result.timing.host_fetch_ms = elapsedMs(fetch_start, Clock::now());
-    result.timing.gpu_execute_ms = result.timing.gpu_execute_ms == 0.0 ? result.timing.jit_execute_ms : result.timing.gpu_execute_ms;
-    result.timing.jit_execute_ms = result.timing.gpu_execute_ms;
+    finalize_timing(result);
     return result;
 }
 

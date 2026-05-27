@@ -5848,8 +5848,9 @@ std::string JITOperatorVisitor::generateCode() const {
     }
 
     code << "    auto __crystal_generated_end = std::chrono::high_resolution_clock::now();\n";
-    code << "    ctx->timing_.gpu_execute_ms = std::chrono::duration<double, std::milli>(__crystal_generated_end - __crystal_generated_start).count();\n";
-    code << "    ctx->timing_.jit_execute_ms = ctx->timing_.gpu_execute_ms;\n";
+    code << "    ctx->timing_.generated_execute_ms = std::chrono::duration<double, std::milli>(__crystal_generated_end - __crystal_generated_start).count();\n";
+    code << "    ctx->timing_.gpu_execute_ms = ctx->timing_.generated_execute_ms;\n";
+    code << "    ctx->timing_.jit_execute_ms = ctx->timing_.generated_execute_ms;\n";
     code << "    ctx->tuple_size_ = " << ctx_.tuple_size << ";\n";
     code << "}\n";
 
