@@ -40,6 +40,16 @@ static std::string sizeMacroFor(const std::string& table_name) {
     return "0";
 }
 
+static constexpr std::uint64_t kSortLimitSmallTopKRows = 4096ULL;
+static constexpr std::uint64_t kSortLimitAdaptiveRatioDivisor = 4ULL;
+
+static bool adaptiveTopKLimitWorthwhile(std::uint64_t limit, std::uint64_t input_rows) {
+    if (limit == 0ULL || input_rows <= 1ULL) return false;
+    if (limit <= kSortLimitSmallTopKRows) return true;
+    if (limit >= input_rows) return false;
+    return limit <= (input_rows / kSortLimitAdaptiveRatioDivisor);
+}
+
 enum class FilterPredicateSupport {
     FastPathSupported,
     NeedsUniversalPath,
@@ -466,7 +476,7 @@ static void emitSortLimitFullBitonicPostExecution(std::stringstream& out,
 static bool sortLimitThresholdTopKEligible(const SortLimitNode* node,
                                            const std::vector<LogicalType>& result_types,
                                            const std::vector<bool>& nullable) {
-    if (!node || !node->has_limit || node->limit == 0 || node->limit > 4096) return false;
+    if (!node || !node->has_limit || node->limit == 0) return false;
     if (node->sort_keys.size() != 1) return false;
     const SortKeyDef& key = node->sort_keys.front();
     if (!key.descending) return false;
@@ -735,10 +745,15 @@ static void emitSortLimitPostExecution(const SortLimitNode* node,
     }
     out << "        const std::uint64_t sort_invalid_idx = std::numeric_limits<std::uint64_t>::max();\n";
     out << "        if (sort_input_rows > 1 && sort_output_rows > 0) {\n";
-    constexpr std::size_t topk_limit_threshold = 4096;
     if (sortLimitThresholdTopKEligible(node, result_types, nullable)) {
+        out << "            const bool sort_use_threshold_topk = sort_output_rows <= static_cast<std::size_t>(" << kSortLimitSmallTopKRows << "ULL) ||\n";
+        out << "                (sort_output_rows < sort_input_rows && sort_output_rows <= (sort_input_rows / static_cast<std::size_t>(" << kSortLimitAdaptiveRatioDivisor << "ULL)));\n";
+        out << "            if (sort_use_threshold_topk) {\n";
         emitSortLimitThresholdTopKPostExecution(out, node, tuple_size, result_types, nullable);
-    } else if (node->has_limit && node->limit > 0 && node->limit <= topk_limit_threshold) {
+        out << "            } else {\n";
+        emitSortLimitFullBitonicPostExecution(out, node, tuple_size, result_types, nullable);
+        out << "            }\n";
+    } else if (node->has_limit && node->limit > 0 && node->limit <= kSortLimitSmallTopKRows) {
         emitSortLimitTopKPostExecution(out, node, tuple_size, result_types, nullable);
     } else {
         emitSortLimitFullBitonicPostExecution(out, node, tuple_size, result_types, nullable);
@@ -4118,8 +4133,7 @@ static bool emitProjectionSortLimitDirectTopKIfEligible(const SortLimitNode* nod
                                                         JITContext& ctx,
                                                         const Catalog& catalog) {
     constexpr unsigned long long kProjectionDirectTopKChunkRows = 4096ULL;
-    constexpr unsigned long long kProjectionDirectTopKMaxOutputRows = 4096ULL;
-    if (!node || !node->has_limit || node->limit == 0 || node->limit > kProjectionDirectTopKMaxOutputRows) return false;
+    if (!node || !node->has_limit || node->limit == 0) return false;
     if (node->sort_keys.size() != 1 || !node->sort_keys.front().descending) return false;
     if (node->getChildren().empty()) return false;
 
@@ -4130,14 +4144,15 @@ static bool emitProjectionSortLimitDirectTopKIfEligible(const SortLimitNode* nod
     const OperatorNode* scan_child = proj->getChildren()[0].get();
     if (!scan_child || scan_child->getType() != OperatorType::TABLE_SCAN) return false;
     const auto* scan = static_cast<const TableScanNode*>(scan_child);
+    const auto& scan_meta = catalog.getTableMetadata(scan->table_name);
+    if (!adaptiveTopKLimitWorthwhile(static_cast<std::uint64_t>(node->limit), scan_meta.getSize())) return false;
 
     std::vector<const ExprNode*> expanded;
     std::vector<std::unique_ptr<ExprNode>> owned_expanded;
     for (const auto& expr : proj->select_exprs) {
         if (!expr) continue;
         if (expr->getType() == ExprType::STAR) {
-            const auto& meta = catalog.getTableMetadata(scan->table_name);
-            for (const auto& col_name : meta.getColumnNames()) {
+            for (const auto& col_name : scan_meta.getColumnNames()) {
                 owned_expanded.push_back(std::make_unique<ColumnRefExpr>(col_name));
                 expanded.push_back(owned_expanded.back().get());
             }
