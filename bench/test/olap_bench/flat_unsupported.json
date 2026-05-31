@@ -1,0 +1,38 @@
+[
+  {
+    "id": "health_02_count_customer",
+    "path": "00_health/health_02_count_customer.sql",
+    "status": "current",
+    "reason": "flat table is fact-rooted; query does not reference lineorder"
+  },
+  {
+    "id": "health_03_count_part",
+    "path": "00_health/health_03_count_part.sql",
+    "status": "current",
+    "reason": "flat table is fact-rooted; query does not reference lineorder"
+  },
+  {
+    "id": "health_04_count_supplier",
+    "path": "00_health/health_04_count_supplier.sql",
+    "status": "current",
+    "reason": "flat table is fact-rooted; query does not reference lineorder"
+  },
+  {
+    "id": "health_05_count_ddate",
+    "path": "00_health/health_05_count_ddate.sql",
+    "status": "current",
+    "reason": "flat table is fact-rooted; query does not reference lineorder"
+  },
+  {
+    "id": "proj_05_select_star_small_dimension",
+    "path": "02_projection/proj_05_select_star_small_dimension.sql",
+    "status": "current",
+    "reason": "flat table is fact-rooted; query does not reference lineorder"
+  },
+  {
+    "id": "custom1",
+    "path": "08_custom/custom1.sql",
+    "status": "current",
+    "reason": "flat table stores ddate attributes for lo_orderdate only, not for lo_commitdate"
+  }
+]

@@ -7,4 +7,3 @@ and c_region = 2
 and s_region = 2
 and d_year >= 1992 and d_year <= 1997
 group by c_nation,s_nation,d_year;
-

@@ -8,3 +8,5 @@ test/queries/result/
 todo.md
 olap_bench/bench/*
 olap_bench/meta/*
+bench/test/__pycache__
+bench/test/results

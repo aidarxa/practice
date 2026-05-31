@@ -1,0 +1,390 @@
+{
+  "suite": "olap_bench_flat",
+  "description": "Flat-table variant of current/current_heavy OLAP benchmark queries for lineorder_flat. Future and unsupported dimension-only queries are omitted.",
+  "default_run_statuses": [
+    "current",
+    "current_heavy"
+  ],
+  "classes": [
+    {
+      "id": "00_health",
+      "name": "00_health",
+      "queries": [
+        {
+          "id": "health_01_count_lineorder",
+          "path": "sql_flat/00_health/health_01_count_lineorder.sql",
+          "status": "current"
+        }
+      ]
+    },
+    {
+      "id": "01_scan_filter",
+      "name": "01_scan_filter",
+      "queries": [
+        {
+          "id": "filter_01_eq",
+          "path": "sql_flat/01_scan_filter/filter_01_eq.sql",
+          "status": "current"
+        },
+        {
+          "id": "filter_02_range",
+          "path": "sql_flat/01_scan_filter/filter_02_range.sql",
+          "status": "current"
+        },
+        {
+          "id": "filter_03_or",
+          "path": "sql_flat/01_scan_filter/filter_03_or.sql",
+          "status": "current"
+        },
+        {
+          "id": "filter_04_arithmetic",
+          "path": "sql_flat/01_scan_filter/filter_04_arithmetic.sql",
+          "status": "current"
+        },
+        {
+          "id": "filter_05_not_is_null",
+          "path": "sql_flat/01_scan_filter/filter_05_not_is_null.sql",
+          "status": "current"
+        },
+        {
+          "id": "filter_06_complex_boolean",
+          "path": "sql_flat/01_scan_filter/filter_06_complex_boolean.sql",
+          "status": "current"
+        }
+      ]
+    },
+    {
+      "id": "02_projection",
+      "name": "02_projection",
+      "queries": [
+        {
+          "id": "proj_01_single_column",
+          "path": "sql_flat/02_projection/proj_01_single_column.sql",
+          "status": "current"
+        },
+        {
+          "id": "proj_02_two_columns",
+          "path": "sql_flat/02_projection/proj_02_two_columns.sql",
+          "status": "current"
+        },
+        {
+          "id": "proj_03_arithmetic_expr",
+          "path": "sql_flat/02_projection/proj_03_arithmetic_expr.sql",
+          "status": "current"
+        },
+        {
+          "id": "proj_04_boolean_expr",
+          "path": "sql_flat/02_projection/proj_04_boolean_expr.sql",
+          "status": "current"
+        }
+      ]
+    },
+    {
+      "id": "03_aggregate_scalar",
+      "name": "03_aggregate_scalar",
+      "queries": [
+        {
+          "id": "agg_01_count_star",
+          "path": "sql_flat/03_aggregate_scalar/agg_01_count_star.sql",
+          "status": "current"
+        },
+        {
+          "id": "agg_02_count_expr",
+          "path": "sql_flat/03_aggregate_scalar/agg_02_count_expr.sql",
+          "status": "current"
+        },
+        {
+          "id": "agg_03_sum_min_max",
+          "path": "sql_flat/03_aggregate_scalar/agg_03_sum_min_max.sql",
+          "status": "current"
+        },
+        {
+          "id": "agg_04_avg",
+          "path": "sql_flat/03_aggregate_scalar/agg_04_avg.sql",
+          "status": "current"
+        },
+        {
+          "id": "agg_05_all_basic_aggs",
+          "path": "sql_flat/03_aggregate_scalar/agg_05_all_basic_aggs.sql",
+          "status": "current"
+        },
+        {
+          "id": "agg_06_aggregate_expression",
+          "path": "sql_flat/03_aggregate_scalar/agg_06_aggregate_expression.sql",
+          "status": "current"
+        }
+      ]
+    },
+    {
+      "id": "04_group_by",
+      "name": "04_group_by",
+      "queries": [
+        {
+          "id": "group_01_year_sum",
+          "path": "sql_flat/04_group_by/group_01_year_sum.sql",
+          "status": "current"
+        },
+        {
+          "id": "group_02_year_brand_sum_q21_shape",
+          "path": "sql_flat/04_group_by/group_02_year_brand_sum_q21_shape.sql",
+          "status": "current"
+        },
+        {
+          "id": "group_03_customer_nation_supplier_nation",
+          "path": "sql_flat/04_group_by/group_03_customer_nation_supplier_nation.sql",
+          "status": "current"
+        }
+      ]
+    },
+    {
+      "id": "05_join_pk_fk",
+      "name": "05_join_pk_fk",
+      "queries": [
+        {
+          "id": "join_01_customer_filter",
+          "path": "sql_flat/05_join_pk_fk/join_01_customer_filter.sql",
+          "status": "current"
+        },
+        {
+          "id": "join_02_supplier_filter",
+          "path": "sql_flat/05_join_pk_fk/join_02_supplier_filter.sql",
+          "status": "current"
+        },
+        {
+          "id": "join_03_part_filter",
+          "path": "sql_flat/05_join_pk_fk/join_03_part_filter.sql",
+          "status": "current"
+        },
+        {
+          "id": "join_04_date_filter",
+          "path": "sql_flat/05_join_pk_fk/join_04_date_filter.sql",
+          "status": "current"
+        },
+        {
+          "id": "join_05_four_table_count",
+          "path": "sql_flat/05_join_pk_fk/join_05_four_table_count.sql",
+          "status": "current"
+        }
+      ]
+    },
+    {
+      "id": "06_projection_join",
+      "name": "06_projection_join",
+      "queries": [
+        {
+          "id": "proj_join_01_selected_columns",
+          "path": "sql_flat/06_projection_join/proj_join_01_selected_columns.sql",
+          "status": "current"
+        },
+        {
+          "id": "proj_join_02_star_customer",
+          "path": "sql_flat/06_projection_join/proj_join_02_star_customer.sql",
+          "status": "current"
+        },
+        {
+          "id": "proj_join_03_three_table_selected",
+          "path": "sql_flat/06_projection_join/proj_join_03_three_table_selected.sql",
+          "status": "current"
+        },
+        {
+          "id": "proj_join_04_expression_after_join",
+          "path": "sql_flat/06_projection_join/proj_join_04_expression_after_join.sql",
+          "status": "current"
+        }
+      ]
+    },
+    {
+      "id": "07_ssb_standard",
+      "name": "07_ssb_standard",
+      "queries": [
+        {
+          "id": "q11",
+          "path": "sql_flat/07_ssb_standard/q11.sql",
+          "status": "current"
+        },
+        {
+          "id": "q12",
+          "path": "sql_flat/07_ssb_standard/q12.sql",
+          "status": "current"
+        },
+        {
+          "id": "q13",
+          "path": "sql_flat/07_ssb_standard/q13.sql",
+          "status": "current"
+        },
+        {
+          "id": "q21",
+          "path": "sql_flat/07_ssb_standard/q21.sql",
+          "status": "current"
+        },
+        {
+          "id": "q22",
+          "path": "sql_flat/07_ssb_standard/q22.sql",
+          "status": "current"
+        },
+        {
+          "id": "q23",
+          "path": "sql_flat/07_ssb_standard/q23.sql",
+          "status": "current"
+        },
+        {
+          "id": "q31",
+          "path": "sql_flat/07_ssb_standard/q31.sql",
+          "status": "current"
+        },
+        {
+          "id": "q32",
+          "path": "sql_flat/07_ssb_standard/q32.sql",
+          "status": "current"
+        },
+        {
+          "id": "q33",
+          "path": "sql_flat/07_ssb_standard/q33.sql",
+          "status": "current"
+        },
+        {
+          "id": "q34",
+          "path": "sql_flat/07_ssb_standard/q34.sql",
+          "status": "current"
+        },
+        {
+          "id": "q41",
+          "path": "sql_flat/07_ssb_standard/q41.sql",
+          "status": "current"
+        },
+        {
+          "id": "q42",
+          "path": "sql_flat/07_ssb_standard/q42.sql",
+          "status": "current"
+        },
+        {
+          "id": "q43",
+          "path": "sql_flat/07_ssb_standard/q43.sql",
+          "status": "current"
+        }
+      ]
+    },
+    {
+      "id": "08_custom",
+      "name": "08_custom",
+      "queries": [
+        {
+          "id": "custom2",
+          "path": "sql_flat/08_custom/custom2.sql",
+          "status": "current"
+        },
+        {
+          "id": "custom3",
+          "path": "sql_flat/08_custom/custom3.sql",
+          "status": "current"
+        },
+        {
+          "id": "custom4",
+          "path": "sql_flat/08_custom/custom4.sql",
+          "status": "current"
+        },
+        {
+          "id": "custom5",
+          "path": "sql_flat/08_custom/custom5.sql",
+          "status": "current"
+        }
+      ]
+    },
+    {
+      "id": "09_nullable",
+      "name": "09_nullable",
+      "queries": [
+        {
+          "id": "nullable_agg",
+          "path": "sql_flat/09_nullable/nullable_agg.sql",
+          "status": "current"
+        },
+        {
+          "id": "nullable_is_null",
+          "path": "sql_flat/09_nullable/nullable_is_null.sql",
+          "status": "current"
+        },
+        {
+          "id": "nullable_where",
+          "path": "sql_flat/09_nullable/nullable_where.sql",
+          "status": "current"
+        },
+        {
+          "id": "three_valued_logic",
+          "path": "sql_flat/09_nullable/three_valued_logic.sql",
+          "status": "current"
+        }
+      ]
+    },
+    {
+      "id": "10_order_limit_topn_future",
+      "name": "10_order_limit_topn_future",
+      "queries": [
+        {
+          "id": "topn_01_order_by_sum_desc_limit",
+          "path": "sql_flat/10_order_limit_topn_future/topn_01_order_by_sum_desc_limit.sql",
+          "status": "current"
+        },
+        {
+          "id": "topn_02_order_by_projection",
+          "path": "sql_flat/10_order_limit_topn_future/topn_02_order_by_projection.sql",
+          "status": "current"
+        }
+      ]
+    },
+    {
+      "id": "11_having_future",
+      "name": "11_having_future",
+      "queries": [
+        {
+          "id": "having_01_sum_threshold",
+          "path": "sql_flat/11_having_future/having_01_sum_threshold.sql",
+          "status": "current"
+        }
+      ]
+    },
+    {
+      "id": "16_case_future",
+      "name": "16_case_future",
+      "queries": [
+        {
+          "id": "case_01_bucketed_sum",
+          "path": "sql_flat/16_case_future/case_01_bucketed_sum.sql",
+          "status": "current"
+        },
+        {
+          "id": "case_02_conditional_sum",
+          "path": "sql_flat/16_case_future/case_02_conditional_sum.sql",
+          "status": "current"
+        }
+      ]
+    },
+    {
+      "id": "17_alias_selfjoin_future",
+      "name": "17_alias_selfjoin_future",
+      "queries": [
+        {
+          "id": "alias_02_table_column_aliases",
+          "path": "sql_flat/17_alias_selfjoin_future/alias_02_table_column_aliases.sql",
+          "status": "current"
+        }
+      ]
+    },
+    {
+      "id": "20_memory_stress",
+      "name": "20_memory_stress",
+      "queries": [
+        {
+          "id": "stress_01_wide_star_customer",
+          "path": "sql_flat/20_memory_stress/stress_01_wide_star_customer.sql",
+          "status": "current_heavy"
+        },
+        {
+          "id": "stress_02_wide_star_customer_supplier",
+          "path": "sql_flat/20_memory_stress/stress_02_wide_star_customer_supplier.sql",
+          "status": "current_heavy"
+        }
+      ]
+    }
+  ]
+}
