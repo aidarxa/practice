@@ -632,6 +632,30 @@ static void test_topn_projection_direct_radix_codegen() {
     assert(code.find("ProjectionDirectTopKCountGE") == std::string::npos);
     assert(code.find("ProjectionDirectTopKMinMax") == std::string::npos);
 
+    const std::string large_limit_code = generateJitCodeForSql(
+        "SELECT lo_orderkey, lo_revenue "
+        "FROM lineorder "
+        "ORDER BY lo_revenue DESC "
+        "LIMIT 4100",
+        buildTestCatalog());
+
+    assert(large_limit_code.find("ProjectionDirectTopKRadixHistogram") != std::string::npos);
+    assert(large_limit_code.find("ProjectionDirectTopKCollect") != std::string::npos);
+    assert(large_limit_code.find("ProjectionDirectTopKSort") != std::string::npos);
+    assert(large_limit_code.find("SortLimitBitonicSort") == std::string::npos);
+
+    const std::string filtered_large_limit_code = generateJitCodeForSql(
+        "SELECT lo_orderkey, lo_revenue "
+        "FROM lineorder "
+        "WHERE lo_revenue > 0 "
+        "ORDER BY lo_revenue DESC "
+        "LIMIT 4100",
+        buildTestCatalog());
+
+    assert(filtered_large_limit_code.find("sort_use_threshold_topk") != std::string::npos);
+    assert(filtered_large_limit_code.find("SortLimitTopKThresholdCollect") != std::string::npos);
+    assert(filtered_large_limit_code.find("sort_input_rows / static_cast<std::size_t>(4ULL)") != std::string::npos);
+
     std::cout << "PASSED\n";
 }
 

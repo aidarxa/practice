@@ -39,7 +39,7 @@ The suite is intended for correctness regression, generated-code inspection, and
 
 The P1 feature set is implemented with explicit scope limits:
 
-- `ORDER BY` / `LIMIT`: current. Bounded `LIMIT K` with `K <= 4096` uses an exact iterative GPU Top-K selection path over the dense final result; unbounded ordering and larger limits fall back to GPU full Bitonic Sort. Projection-level Top-K pushdown before dense materialization remains future work.
+- `ORDER BY` / `LIMIT`: current. Bounded small limits use an exact GPU Top-K selection path over the dense final result. Single-key numeric `ORDER BY ... DESC LIMIT K` also uses an adaptive threshold Top-K path for larger `K` when `K` is still substantially smaller than the input; otherwise unbounded ordering and very large limits fall back to GPU full Bitonic Sort. Simple scan/projection queries can use direct radix Top-N before full dense materialization.
 - `HAVING`: current for aggregate/group expressions present in SELECT output. Hidden aggregate slots remain future work.
 - Table aliases: current for non-self-join queries. Self-join aliases remain future work.
 - Column aliases: current for output metadata and for `ORDER BY` / `HAVING` references.

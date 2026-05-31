@@ -214,7 +214,7 @@ void customer (FILE *fp, char *outName){
   /*fwrite(&header, sizeof(struct columnHeader), 1, out[5]);*/
   /*header.blockSize = header.tupleNum * 15;*/
   /*fwrite(&header, sizeof(struct columnHeader), 1, out[6]);*/
-  /*header.blockSize = header.tupleNum * 10;*/
+  /*header.blockSize = header.tupleNum * sizeof(int);*/
   /*fwrite(&header, sizeof(struct columnHeader), 1, out[7]);*/
   while(fgets(buf,sizeof(buf),fp)!= NULL){
     int writeHeader = 0;
@@ -297,11 +297,11 @@ void customer (FILE *fp, char *outName){
             break;
            case 7:
             if(writeHeader == 1){
-              header.blockSize = header.tupleNum * 10;
+              header.blockSize = header.tupleNum * sizeof(int);
               fwrite(&header,sizeof(struct columnHeader),1,out[7]);
             }
-            strcpy(tmp.c_mktsegment,data);
-            fwrite(&(tmp.c_mktsegment),sizeof(tmp.c_mktsegment), 1, out[7]);
+            int c_mktsegment = strtol(data, NULL, 10);
+            fwrite(&(c_mktsegment), sizeof(int), 1, out[7]);
             break;
         }
         count++;
@@ -309,11 +309,13 @@ void customer (FILE *fp, char *outName){
     }
     if(count == 7){
       if(writeHeader == 1){
-        header.blockSize = header.tupleNum * 10;
+        header.blockSize = header.tupleNum * sizeof(int);
         fwrite(&header,sizeof(struct columnHeader),1,out[7]);
       }
-      strncpy(tmp.c_mktsegment,buf+prev,i-prev);
-      fwrite(&(tmp.c_mktsegment),sizeof(tmp.c_mktsegment), 1, out[7]);
+      memset(data, 0, sizeof(data));
+      strncpy(data, buf + prev, i - prev);
+      int c_mktsegment = strtol(data, NULL, 10);
+      fwrite(&(c_mktsegment), sizeof(int), 1, out[7]);
     }
   }
 

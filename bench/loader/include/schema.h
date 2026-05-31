@@ -19,7 +19,7 @@
 		char c_nation[15];
 		char c_region[12];
 		char c_phone[15];
-		char c_mktsegment[10];
+		int c_mktsegment[10];
 	};
 
 	struct part {

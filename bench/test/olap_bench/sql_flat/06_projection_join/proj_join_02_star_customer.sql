@@ -1,0 +1,28 @@
+select
+  lo_orderkey,
+  lo_linenumber,
+  lo_custkey,
+  lo_partkey,
+  lo_suppkey,
+  lo_orderdate,
+  lo_orderpriority,
+  lo_shippriority,
+  lo_quantity,
+  lo_extendedprice,
+  lo_ordtotalprice,
+  lo_discount,
+  lo_revenue,
+  lo_supplycost,
+  lo_tax,
+  lo_commitdate,
+  lo_shipmode,
+  lo_custkey as c_custkey,
+  c_name,
+  c_address,
+  c_city,
+  c_nation,
+  c_region,
+  c_phone,
+  c_mktsegment
+from lineorder_flat
+where c_region = 1;
