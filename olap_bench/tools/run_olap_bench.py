@@ -210,15 +210,23 @@ def build_run_items(selected, root: pathlib.Path, warmups: int, runs: int, dump_
                 'sql': sql_text,
             })
 
-        total_runs = warmups + runs
+        total_runs = max(1, warmups + runs) if runs > 0 or warmups > 0 else 0
         for run_idx in range(total_runs):
-            measured = run_idx >= warmups
+            if run_idx == 0:
+                phase = 'cold'
+                measured = True
+            elif run_idx < warmups:
+                phase = 'warmup'
+                measured = False
+            else:
+                phase = 'run'
+                measured = True
             items.append({
                 'class_id': cls['id'],
                 'query_id': q['id'],
                 'path': q['path'],
                 'status': q['status'],
-                'phase': 'run' if measured else 'warmup',
+                'phase': phase,
                 'run_index': run_idx,
                 'measured': measured,
                 'timeout': int(q.get('timeout_sec', 120)),
@@ -348,7 +356,7 @@ def run_isolated(db_cli: str, run_items: list, limit: str, timing: bool, logs_di
             **metrics,
         })
         records.append(record)
-        print(f"[{item['phase']}] {item['query_id']}: rc={record_returncode} timeout={timed_out} rows={metrics.get('rows_returned')} generated_ms={metrics.get('generated_execute_ms')}")
+        print(f"[{item['phase']}] {item['query_id']}: rc={record_returncode} timeout={timed_out} rows={metrics.get('rows_returned')} execute_ms={metrics.get('generated_execute_ms')}")
         if fail_on_error and (record_returncode != 0 or timed_out):
             break
     return records, failures
@@ -374,7 +382,7 @@ def main() -> int:
     ap.add_argument('--limit', default='1000')
     ap.add_argument('--timing', action='store_true', default=True)
     ap.add_argument('--include-future', action='store_true')
-    ap.add_argument('--include-heavy', action='store_true')
+    ap.add_argument('--include-heavy', action='store_true', default=True)
     ap.add_argument('--class', dest='classes', action='append', default=[])
     ap.add_argument('--fail-on-error', action='store_true')
     ap.add_argument('--mode', choices=['single-session', 'isolated'], default='single-session')
@@ -417,7 +425,7 @@ def main() -> int:
 
             if record['returncode'] != 0 or record['timed_out']:
                 failures += 1
-            print(f"[{record['phase']}] {record['query_id']}: rc={record['returncode']} timeout={record['timed_out']} rows={record.get('rows_returned')} generated_ms={record.get('generated_execute_ms')}")
+            print(f"[{record['phase']}] {record['query_id']}: rc={record['returncode']} timeout={record['timed_out']} rows={record.get('rows_returned')} execute_ms={record.get('generated_execute_ms')}")
         if proc_rc != 0 and failures == 0:
             failures = 1
         if timed_out and failures == 0:
@@ -447,6 +455,15 @@ def main() -> int:
 
         successful_vals = [v for v in vals if v.get('returncode') == 0 and not v.get('timed_out')]
         last_success = successful_vals[-1] if successful_vals else None
+
+        cold_vals = [v for v in successful_vals if v.get('phase') == 'cold']
+        hot_vals = [v for v in successful_vals if v.get('phase') == 'run']
+
+        if not hot_vals:
+            hot_vals = successful_vals
+        if not cold_vals:
+            cold_vals = successful_vals
+
         aggregate_record = {
             'query_id': key,
             'runs': len(vals),
@@ -456,8 +473,14 @@ def main() -> int:
             'last_timed_out': last_run.get('timed_out'),
             'rows_returned_last': last_success.get('rows_returned') if last_success else None,
         }
-        for field in CANONICAL_TIMING_FIELDS + COMPATIBILITY_TIMING_FIELDS + DERIVED_TIMING_FIELDS:
-            aggregate_record[f'{field}_mean'] = mean_field(successful_vals, field)
+
+        jit_fields = {'codegen_ms', 'compile_ms', 'library_load_ms'}
+
+        for field in CANONICAL_TIMING_FIELDS + DERIVED_TIMING_FIELDS:
+            if field in jit_fields:
+                aggregate_record[field] = cold_vals[0].get(field) if cold_vals else None
+            else:
+                aggregate_record[field] = mean_field(hot_vals, field)
         summary.append(aggregate_record)
 
     for r in rows:
@@ -466,9 +489,8 @@ def main() -> int:
     fields = [
         'class_id','query_id','path','status','phase','run_index','measured','returncode','timed_out',
         'rows_returned','rows_shown',
-        'prepare_ms','codegen_ms','code_generation_ms','compile_ms','acpp_compilation_ms',
-        'library_load_ms','generated_execute_ms','gpu_execution_ms','host_fetch_ms',
-        'result_materialization_fetch_ms','engine_ms','engine_processing_ms','total_query_ms',
+        'prepare_ms','codegen_ms','compile_ms','library_load_ms','generated_execute_ms','host_fetch_ms',
+        'engine_ms','total_query_ms',
         'engine_component_sum_ms','engine_minus_components_ms',
         'timing_component_sum_ms','timing_total_minus_components_ms'
     ]
@@ -477,15 +499,20 @@ def main() -> int:
         w.writeheader()
         for r in rows:
             w.writerow(r)
-    (out_dir / 'summary.json').write_text(json.dumps({
-        'mode': args.mode,
-        'timing_fields_ms': CANONICAL_TIMING_FIELDS,
-        'derived_timing_fields_ms': DERIVED_TIMING_FIELDS,
-        'rows': rows,
-    }, indent=2))
 
+    aggregate_fields = [
+        'query_id','runs','successful_runs','failed_runs','last_returncode','last_timed_out','rows_returned_last',
+        'prepare_ms','codegen_ms','compile_ms','library_load_ms','generated_execute_ms','host_fetch_ms',
+        'engine_ms','total_query_ms',
+        'engine_component_sum_ms','engine_minus_components_ms',
+        'timing_component_sum_ms','timing_total_minus_components_ms'
+    ]
+    with (out_dir / 'aggregate_summary.csv').open('w', newline='') as f:
+        w = csv.DictWriter(f, fieldnames=aggregate_fields, extrasaction='ignore')
+        w.writeheader()
+        for r in summary:
+            w.writerow(r)
 
-    (out_dir / 'aggregate_summary.json').write_text(json.dumps(summary, indent=2))
     print(f'Wrote results to {out_dir}')
     return 1 if failures and args.fail_on_error else 0
 
