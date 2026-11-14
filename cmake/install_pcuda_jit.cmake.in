@@ -1,0 +1,36 @@
+# A Clang PCH records absolute header locations. Build it at the deployment prefix,
+# never silently move a build-tree PCH into a different header/toolchain layout.
+if(NOT "$ENV{DESTDIR}" STREQUAL "")
+    message(FATAL_ERROR "PCUDA PCH installation requires its final prefix (no DESTDIR relocation); prepare again after deployment")
+endif()
+set(_directory "${CMAKE_INSTALL_PREFIX}/lib/crystal/pcuda-jit")
+set(_include "${CMAKE_INSTALL_PREFIX}/include/crystal")
+file(MAKE_DIRECTORY "${_directory}")
+set(_compile "@_pcuda_compile@")
+list(REMOVE_ITEM _compile "-I@CRYSTAL_INCLUDE_DIR@")
+list(APPEND _compile "-I${_include}")
+set(_link "@_pcuda_link@")
+set(_pch "${_directory}/jit_headers.pch")
+set(_manifest "${_directory}/toolchain.manifest")
+execute_process(COMMAND bash -c
+    "export LC_ALL=C; TIMEFORMAT='%6R %6U %6S'; timer=$1; errors=$2; shift 2; { time \"$@\" 2>\"$errors\"; } 2>\"$timer\""
+    pcuda-install "${_directory}/pch.time" "${_directory}/pch.stderr"
+    "@CRYSTAL_PCUDA_COMPILER@" ${_compile} -fpch-instantiate-templates -c -MD -MF "${_pch}.d"
+    -x c++-header "${_include}/jit_headers.h" -o "${_pch}" RESULT_VARIABLE _status)
+if(NOT _status EQUAL 0)
+    message(FATAL_ERROR "Installed PCUDA PCH preparation failed; inspect ${_directory}/pch.stderr")
+endif()
+set(_metadata_args)
+foreach(_flag IN LISTS _compile)
+    list(APPEND _metadata_args "--compile-arg=${_flag}")
+endforeach()
+foreach(_flag IN LISTS _link)
+    list(APPEND _metadata_args "--link-arg=${_flag}")
+endforeach()
+execute_process(COMMAND "@Python3_EXECUTABLE@" "@CMAKE_SOURCE_DIR@/tools/pcuda_pch_manifest.py"
+    --compiler "@CRYSTAL_PCUDA_COMPILER@" --pch "${_pch}" --depfile "${_pch}.d"
+    --header "${_include}/jit_headers.h" --output "${_manifest}" ${_metadata_args}
+    RESULT_VARIABLE _status)
+if(NOT _status EQUAL 0)
+    message(FATAL_ERROR "Installed PCUDA PCH fingerprinting failed")
+endif()

@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cmath>
 #include <cstdlib>
 #include <fstream>
 #include <limits>
@@ -46,6 +47,7 @@ static std::size_t parseSize(const std::string& value, const std::string& key) {
     else if (ends_with("kib")) { mult = 1024ULL; v.resize(v.size() - 3); }
     else if (ends_with("kb")) { mult = 1000ULL; v.resize(v.size() - 2); }
     v = trim(v);
+    if (v.empty() || v.front() == '-') throw std::runtime_error("Invalid size value for config key '" + key + "': " + value);
     std::size_t consumed = 0;
     unsigned long long base = std::stoull(v, &consumed, 10);
     if (consumed != v.size()) {
@@ -81,6 +83,16 @@ static bool readConfigFile(const std::string& path, CrystalConfig& cfg) {
 
         if (key == "crystal_include_dir" || key == "include_dir") cfg.include_dir = value;
         else if (key == "crystal_deps_include_dir" || key == "deps_include_dir") cfg.deps_include_dir = value;
+        else if (key == "device_name") cfg.device_name = value;
+        else if (key == "pcuda_manifest") cfg.pcuda_manifest = value;
+        else if (key == "jit_artifact_dir") cfg.jit_artifact_dir = value;
+        else if (key == "jit_jobs") {
+            cfg.jit_jobs = parseSize(value,key);
+            if (!cfg.jit_jobs || cfg.jit_jobs > 4) throw std::runtime_error("jit_jobs must be between 1 and 4");
+        }
+        else if (key == "jit_keep_artifacts") cfg.jit_keep_artifacts = parseBool(value,key);
+        else if (key == "jit_traces") cfg.jit_traces = parseBool(value,key);
+        else if (key == "jit_overlap_experiment") cfg.jit_overlap_experiment = parseBool(value,key);
         else if (key == "dump_generated_code" || key == "dump_code") cfg.dump_generated_code = parseBool(value, key);
         else if (key == "extended_timing" || key == "timing") cfg.extended_timing = parseBool(value, key);
         else if (key == "memory_guard_enabled") cfg.memory_guard_enabled = parseBool(value, key);
@@ -97,8 +109,9 @@ static bool readConfigFile(const std::string& path, CrystalConfig& cfg) {
         }
         else if (key == "memory_guard_reserve_bytes") cfg.memory_guard_reserve_bytes = parseSize(value, key);
         else if (key == "memory_guard_reserve_fraction") {
-            cfg.memory_guard_reserve_fraction = std::stod(value);
-            if (cfg.memory_guard_reserve_fraction < 0.0 || cfg.memory_guard_reserve_fraction > 0.9) {
+            size_t consumed = 0;
+            cfg.memory_guard_reserve_fraction = std::stod(value, &consumed);
+            if (consumed != value.size() || !std::isfinite(cfg.memory_guard_reserve_fraction) || cfg.memory_guard_reserve_fraction < 0.0 || cfg.memory_guard_reserve_fraction > 0.9) {
                 throw std::runtime_error("memory_guard_reserve_fraction must be in [0.0, 0.9]");
             }
         }
@@ -134,6 +147,8 @@ CrystalConfig loadCrystalConfig() {
     if (const char* p = std::getenv("CRYSTAL_DEPS_INCLUDE_DIR")) {
         if (*p) cfg.deps_include_dir = p;
     }
+    if (const char* p = std::getenv("CRYSTAL_DEVICE_NAME")) cfg.device_name = p;
+    if (const char* p = std::getenv("CRYSTAL_JIT_OVERLAP_EXPERIMENT")) cfg.jit_overlap_experiment=parseBool(p,"CRYSTAL_JIT_OVERLAP_EXPERIMENT");
     return cfg;
 }
 

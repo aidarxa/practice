@@ -1,0 +1,13 @@
+{
+  "version": 1,
+  "inputs": ["include", "src", "deps", "test", "CMakeLists.txt", "cmake", "tools/pcuda_pch_manifest.py"],
+  "build": [
+    ["cmake", "-S", "{root}", "-B", "{out}/engine", "-DCMAKE_BUILD_TYPE=Release", "-DCMAKE_CXX_COMPILER={cxx}"],
+    ["cmake", "--build", "{out}/engine", "--target", "test_pcuda_sql_modules", "-j4"]
+  ],
+  "test": [["{out}/engine/test_pcuda_sql_modules", "{out}/gpu"]],
+  "mutations": [
+    {"id":"frontend-observation-absent", "file":"src/core/execution.cpp", "before":"ctx->timing_.sql_to_pcuda_ms = elapsedMs(frontend_start, Clock::now());", "after":"ctx->timing_.sql_to_pcuda_ms = 0.0;"},
+    {"id":"ready-frontend-unobserved", "file":"src/core/execution.cpp", "before":"} else {\n        sources_ready();\n        recordModuleEvent(counters_.hits,found->second->kernels.size());", "after":"} else {\n        recordModuleEvent(counters_.hits,found->second->kernels.size());"}
+  ]
+}

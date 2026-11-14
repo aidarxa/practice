@@ -1,4 +1,5 @@
 #include "core/translator.h"
+#include <limits>
 
 #include <algorithm>
 #include <cctype>
@@ -20,6 +21,8 @@ void ColumnRefExpr::accept(ExprVisitor& visitor) const  { visitor.visit(*this); 
 void LiteralIntExpr::accept(ExprVisitor& visitor) const { visitor.visit(*this); }
 void LiteralFloatExpr::accept(ExprVisitor& visitor) const { visitor.visit(*this); }
 void LiteralNullExpr::accept(ExprVisitor& visitor) const { visitor.visit(*this); }
+void LiteralTextExpr::accept(ExprVisitor& visitor) const { visitor.visit(*this); }
+void ParameterRefExpr::accept(ExprVisitor& visitor) const { visitor.visit(*this); }
 void BinaryExpr::accept(ExprVisitor& visitor) const     { visitor.visit(*this); }
 void CaseWhenExpr::accept(ExprVisitor& visitor) const   { visitor.visit(*this); }
 void StarExpr::accept(ExprVisitor& visitor) const       { visitor.visit(*this); }
@@ -36,6 +39,7 @@ const char* ExprPrinter::exprTypeName(ExprType t) {
         case ExprType::LITERAL_INT:   return "LITERAL_INT";
         case ExprType::LITERAL_FLOAT: return "LITERAL_FLOAT";
         case ExprType::LITERAL_NULL:  return "LITERAL_NULL";
+        case ExprType::PARAMETER_REF: return "PARAMETER_REF";
         case ExprType::OP_AND:        return "AND";
         case ExprType::OP_OR:         return "OR";
         case ExprType::OP_NOT:        return "NOT";
@@ -77,6 +81,15 @@ void ExprPrinter::visit(const LiteralFloatExpr& node) {
 void ExprPrinter::visit(const LiteralNullExpr& /*node*/) {
     printIndent();
     out_ << "[LiteralNull] NULL\n";
+}
+void ExprPrinter::visit(const LiteralTextExpr& node) {
+    printIndent();
+    out_ << "[LiteralText] " << node.value << '\n';
+}
+
+void ExprPrinter::visit(const ParameterRefExpr& node) {
+    printIndent();
+    out_ << "[ParameterRef] $" << node.slot << "\n";
 }
 
 void ExprPrinter::visit(const BinaryExpr& node) {
@@ -204,7 +217,11 @@ void OperatorPrinter::visit(const SortLimitNode& node) {
             out_ << " #" << key.column_index << (key.descending ? " DESC" : " ASC");
         }
     }
-    if (node.has_limit) out_ << " LIMIT " << node.limit;
+    if (node.hasLimit()) {
+        out_ << " LIMIT:\n";
+        ExprPrinter ep(out_, indent_ + 1);
+        node.limit_expr->accept(ep);
+    }
     out_ << "\n";
     visitChildren(node);
 }
@@ -391,6 +408,23 @@ std::unique_ptr<ExprNode> QueryTranslator::translateCaseExpr(const hsql::Expr* e
     return else_expr;
 }
 
+/** @brief Hyrise represents a negative literal as an operator; its sign belongs to the value.
+ * @throws std::runtime_error For nonliteral operands or an unrepresentable negation.
+ * @details Preserve the operator occurrence as provenance. Independent equal negatives
+ * remain independent slots, while normalized CASE copies retain their original slot.
+ */
+std::unique_ptr<ExprNode> QueryTranslator::translateNegativeLiteral(const hsql::Expr* expr) {
+    if (!expr->expr) throw std::runtime_error("Negative literal is missing an operand");
+    const auto* literal = expr->expr;
+    if (literal->type == hsql::kExprLiteralFloat)
+        return std::make_unique<LiteralFloatExpr>(-literal->fval, literalOrigin(expr));
+    if (literal->type != hsql::kExprLiteralInt)
+        throw std::runtime_error("Unary minus is supported only for numeric literals");
+    if (literal->ival == std::numeric_limits<int64_t>::min())
+        throw std::runtime_error("Negative integer literal is outside the supported range");
+    return std::make_unique<LiteralIntExpr>(-literal->ival, literalOrigin(expr));
+}
+
 // Рекурсивная трансляция hsql::Expr* → ExprNode
 std::unique_ptr<ExprNode> QueryTranslator::translateExpr(const hsql::Expr* expr) {
     if (!expr) {
@@ -407,24 +441,26 @@ std::unique_ptr<ExprNode> QueryTranslator::translateExpr(const hsql::Expr* expr)
             std::string col  = expr->name  ? std::string(expr->name)  : "";
             std::string tbl  = expr->table ? std::string(expr->table) : "";
             if (col == "*") return std::make_unique<StarExpr>();
-            tbl = resolveTableQualifier(tbl);
-            return std::make_unique<ColumnRefExpr>(std::move(col), std::move(tbl));
+            return std::make_unique<ColumnRefExpr>(resolveColumnReference(col, tbl));
         }
 
         // ---- Целочисленный литерал ----
         case hsql::kExprLiteralInt:
-            return std::make_unique<LiteralIntExpr>(expr->ival);
+            return std::make_unique<LiteralIntExpr>(expr->ival, literalOrigin(expr));
 
         // ---- Вещественный литерал ----
         case hsql::kExprLiteralFloat:
-            return std::make_unique<LiteralFloatExpr>(expr->fval);
+            return std::make_unique<LiteralFloatExpr>(expr->fval, literalOrigin(expr));
+        case hsql::kExprLiteralString:
+            return std::make_unique<LiteralTextExpr>(expr->name ? expr->name : "", literalOrigin(expr));
 
         // ---- SQL NULL literal ----
         case hsql::kExprLiteralNull:
-            return std::make_unique<LiteralNullExpr>();
+            return std::make_unique<LiteralNullExpr>(literalOrigin(expr));
 
         // ---- Бинарные/логические операторы ----
         case hsql::kExprOperator: {
+            if (expr->opType == hsql::kOpUnaryMinus) return translateNegativeLiteral(expr);
             if (expr->opType == hsql::kOpCase) {
                 return translateCaseExpr(expr);
             }
@@ -464,7 +500,7 @@ std::unique_ptr<ExprNode> QueryTranslator::translateExpr(const hsql::Expr* expr)
 
             ExprType op = mapBinaryOp(expr->opType);
 
-            // kOpUnaryMinus, kOpNot и прочие унарные — не поддерживаем
+            // Remaining unsupported unary forms must not enter binary lowering.
             if (!expr->expr) {
                 throw std::runtime_error(
                     "QueryTranslator: unsupported unary operator or missing left operand");
@@ -517,13 +553,25 @@ std::unique_ptr<OperatorNode> QueryTranslator::translateFrom(const hsql::TableRe
             std::string name = ref->name ? std::string(ref->name) : "";
             // Переводим в верхний регистр для совместимости с Catalog (LINEORDER, DDATE, ...)
             std::transform(name.begin(), name.end(), name.begin(), ::toupper);
+            if (catalog_) {
+                (void)catalog_->getTableMetadata(name);
+                if (std::find(from_tables_.begin(), from_tables_.end(), name) != from_tables_.end()) {
+                    throw std::runtime_error("Self joins are not supported by the current execution model");
+                }
+            }
+            from_tables_.push_back(name);
             std::string alias;
             if (ref->alias && ref->alias->name) {
                 alias = std::string(ref->alias->name);
                 std::transform(alias.begin(), alias.end(), alias.begin(), ::toupper);
             }
-            table_alias_to_name_[name] = name;
-            if (!alias.empty()) table_alias_to_name_[alias] = name;
+            auto register_qualifier = [&](const std::string& qualifier) {
+                if (!table_alias_to_name_.emplace(qualifier, name).second) {
+                    throw std::runtime_error("Duplicate table qualifier: " + qualifier);
+                }
+            };
+            register_qualifier(name);
+            if (!alias.empty() && alias != name) register_qualifier(alias);
             return std::make_unique<TableScanNode>(std::move(name), std::move(alias));
         }
 
@@ -594,6 +642,57 @@ std::string QueryTranslator::resolveTableQualifier(const std::string& qualifier)
     return key;
 }
 
+ColumnRefExpr QueryTranslator::resolveColumnReference(
+        const std::string& column, const std::string& qualifier) const {
+    std::string normalized = column;
+    std::transform(normalized.begin(), normalized.end(), normalized.begin(), [](unsigned char c) {
+        return static_cast<char>(std::tolower(c));
+    });
+    const std::string table = resolveTableQualifier(qualifier);
+    if (!catalog_) {
+        return ColumnRefExpr(normalized, table.empty() ? getTableName(normalized) : table);
+    }
+    if (!qualifier.empty() && table_alias_to_name_.count(translatorUpperCopy(qualifier)) == 0) {
+        throw std::runtime_error("Unknown table qualifier: " + qualifier);
+    }
+    return resolveCatalogColumn(column, table);
+}
+
+ColumnRefExpr QueryTranslator::resolveCatalogColumn(const std::string& column, const std::string& table) const {
+    std::optional<ColumnRefExpr> resolved;
+    for (const auto& candidate : from_tables_) {
+        if (!table.empty() && candidate != table) continue;
+        const auto& metadata = catalog_->getTableMetadata(candidate);
+        for (const auto& name : metadata.getColumnNames()) {
+            if (translatorUpperCopy(name) != translatorUpperCopy(column)) continue;
+            if (resolved) throw std::runtime_error("Ambiguous column reference: " + column);
+            resolved.emplace(name, candidate);
+            resolved->value_type = metadata.getColumnStorage(name).isNumeric() ? ParameterType::Int64 : ParameterType::Text;
+        }
+    }
+    if (!resolved) throw std::runtime_error("Unknown column reference: " + table + "." + column);
+    return *resolved;
+}
+
+std::size_t QueryTranslator::literalOrigin(const hsql::Expr* expr) {
+    const auto found = literal_origins_.find(expr);
+    if (found != literal_origins_.end()) return found->second;
+    const std::size_t origin = literal_origins_.size();
+    literal_origins_.emplace(expr, origin);
+    return origin;
+}
+
+PreparedQuery QueryTranslator::prepare(const hsql::SelectStatement* stmt, const Catalog& catalog) const {
+    QueryTranslator resolver;
+    resolver.catalog_ = &catalog;
+    return parameterizeQuery(resolver.translate(stmt));
+}
+
+void QueryTranslator::validateProjectionStorage(const ExprNode& expression) const {
+    if (expression.getType() != ExprType::STAR || !catalog_) return;
+    for (const auto& table : from_tables_) (void)catalog_->getTableMetadata(table);
+}
+
 void QueryTranslator::registerSelectAliases(const hsql::SelectStatement* stmt) {
     select_alias_to_select_index_.clear();
     if (!stmt || !stmt->selectList) return;
@@ -618,7 +717,9 @@ static std::string upperCopy(std::string s) {
     return s;
 }
 
-static bool hsqlExprEquivalent(const hsql::Expr* a, const hsql::Expr* b) {
+} // namespace
+
+bool QueryTranslator::hsqlExprEquivalent(const hsql::Expr* a, const hsql::Expr* b) const {
     if (a == b) return true;
     if (!a || !b || a->type != b->type) return false;
 
@@ -626,16 +727,16 @@ static bool hsqlExprEquivalent(const hsql::Expr* a, const hsql::Expr* b) {
         case hsql::kExprStar:
             return true;
         case hsql::kExprColumnRef: {
-            const std::string an = a->name ? a->name : "";
-            const std::string bn = b->name ? b->name : "";
-            const std::string at = a->table ? a->table : "";
-            const std::string bt = b->table ? b->table : "";
-            return upperCopy(an) == upperCopy(bn) && (at.empty() || bt.empty() || upperCopy(at) == upperCopy(bt));
+            const auto left = resolveColumnReference(a->name ? a->name : "", a->table ? a->table : "");
+            const auto right = resolveColumnReference(b->name ? b->name : "", b->table ? b->table : "");
+            return left.column_name == right.column_name && left.table_name == right.table_name;
         }
         case hsql::kExprLiteralInt:
             return a->ival == b->ival;
         case hsql::kExprLiteralFloat:
             return a->fval == b->fval;
+        case hsql::kExprLiteralString:
+            return std::string(a->name ? a->name : "") == std::string(b->name ? b->name : "");
         case hsql::kExprLiteralNull:
             return true;
         case hsql::kExprFunctionRef: {
@@ -666,6 +767,8 @@ static bool hsqlExprEquivalent(const hsql::Expr* a, const hsql::Expr* b) {
     }
 }
 
+namespace {
+
 static std::size_t checkedOrderOrdinal(const hsql::Expr* expr,
                                        std::size_t visible_columns) {
     if (!expr || expr->type != hsql::kExprLiteralInt) {
@@ -689,9 +792,11 @@ static bool resolveSelectAliasReference(
     return true;
 }
 
-static std::size_t aggregateOutputSlotForSelectIndex(
+} // namespace
+
+std::size_t QueryTranslator::aggregateOutputSlotForSelectIndex(
         const hsql::SelectStatement* stmt,
-        std::size_t select_index) {
+        std::size_t select_index) const {
     if (!stmt || !stmt->selectList || select_index >= stmt->selectList->size()) {
         throw std::runtime_error("SELECT alias points outside SELECT list");
     }
@@ -722,54 +827,69 @@ static std::size_t aggregateOutputSlotForSelectIndex(
         "SELECT alias used in ORDER BY/HAVING must refer to a GROUP BY expression or aggregate output");
 }
 
-static std::size_t resolveProjectionOrderKey(
+std::vector<std::size_t> QueryTranslator::projectionSelectOffsets(const hsql::SelectStatement* stmt) const {
+    std::vector<std::size_t> offsets{0};
+    for (const auto* selected : *stmt->selectList) {
+        std::size_t width = 1;
+        if (selected && selected->type == hsql::kExprStar && catalog_) {
+            width = 0;
+            for (const auto& table : from_tables_)
+                width = checkedSizeAdd(width, catalog_->getTableMetadata(table).getColumnNames().size());
+        }
+        offsets.push_back(checkedSizeAdd(offsets.back(), width));
+    }
+    return offsets;
+}
+
+std::size_t QueryTranslator::resolveProjectionOrderKey(
         const hsql::Expr* order_expr,
-        const hsql::SelectStatement* stmt,
-        const std::unordered_map<std::string, std::size_t>& alias_map) {
+        const hsql::SelectStatement* stmt) const {
     if (!stmt->selectList || stmt->selectList->empty()) {
         throw std::runtime_error("ORDER BY requires a non-empty SELECT list");
     }
+    const auto offsets = projectionSelectOffsets(stmt);
     if (order_expr && order_expr->type == hsql::kExprLiteralInt) {
-        return checkedOrderOrdinal(order_expr, stmt->selectList->size());
+        return checkedOrderOrdinal(order_expr, offsets.back());
     }
     std::size_t alias_select_index = 0;
-    if (resolveSelectAliasReference(order_expr, alias_map, alias_select_index)) {
+    if (resolveSelectAliasReference(order_expr, select_alias_to_select_index_, alias_select_index)) {
         if (alias_select_index >= stmt->selectList->size()) {
             throw std::runtime_error("ORDER BY alias points outside SELECT list");
         }
-        return alias_select_index;
+        return offsets.at(alias_select_index);
     }
     for (std::size_t i = 0; i < stmt->selectList->size(); ++i) {
         const hsql::Expr* sel = (*stmt->selectList)[i];
         if (sel && sel->type == hsql::kExprStar) {
+            if (catalog_ && order_expr && order_expr->type == hsql::kExprColumnRef) {
+                const auto target = resolveColumnReference(order_expr->name ? order_expr->name : "", order_expr->table ? order_expr->table : "");
+                auto slot = offsets[i];
+                for (const auto& table : from_tables_)
+                    for (const auto& name : catalog_->getTableMetadata(table).getColumnNames()) {
+                        if (table == target.table_name && name == target.column_name) return slot;
+                        ++slot;
+                    }
+            }
             continue;
         }
-        if (hsqlExprEquivalent(order_expr, sel)) return i;
+        if (hsqlExprEquivalent(order_expr, sel)) return offsets[i];
     }
     throw std::runtime_error(
         "ORDER BY is supported only for visible SELECT expressions in projection queries");
 }
 
-static std::size_t resolveAggregateOrderKey(
+std::size_t QueryTranslator::resolveAggregateOrderKey(
         const hsql::Expr* order_expr,
-        const hsql::SelectStatement* stmt,
-        const std::unordered_map<std::string, std::size_t>& alias_map) {
+        const hsql::SelectStatement* stmt) const {
     const std::size_t group_count = (stmt->groupBy && stmt->groupBy->columns)
         ? stmt->groupBy->columns->size()
         : 0U;
-    std::size_t aggregate_count = 0;
-    if (stmt->selectList) {
-        for (const auto* sel : *stmt->selectList) {
-            if (sel && sel->isType(hsql::kExprFunctionRef) &&
-                isAggregateFunctionName(sel->name ? std::string(sel->name) : std::string())) ++aggregate_count;
-        }
-    }
-    const std::size_t visible_columns = group_count + aggregate_count;
     if (order_expr && order_expr->type == hsql::kExprLiteralInt) {
-        return checkedOrderOrdinal(order_expr, visible_columns);
+        const std::size_t select_count = stmt->selectList ? stmt->selectList->size() : 0;
+        return aggregateOutputSlotForSelectIndex(stmt, checkedOrderOrdinal(order_expr, select_count));
     }
     std::size_t alias_select_index = 0;
-    if (resolveSelectAliasReference(order_expr, alias_map, alias_select_index)) {
+    if (resolveSelectAliasReference(order_expr, select_alias_to_select_index_, alias_select_index)) {
         return aggregateOutputSlotForSelectIndex(stmt, alias_select_index);
     }
 
@@ -792,7 +912,9 @@ static std::size_t resolveAggregateOrderKey(
         "ORDER BY is supported only for GROUP BY expressions, aggregate expressions, or SELECT-list ordinals");
 }
 
-static std::size_t parseLimitValue(const hsql::LimitDescription* limit) {
+namespace {
+
+static int64_t parseLimitValue(const hsql::LimitDescription* limit) {
     if (!limit || !limit->limit) return 0;
     if (limit->limit->type != hsql::kExprLiteralInt || limit->limit->ival < 0) {
         throw std::runtime_error("LIMIT currently requires a non-negative integer literal");
@@ -802,7 +924,7 @@ static std::size_t parseLimitValue(const hsql::LimitDescription* limit) {
             throw std::runtime_error("LIMIT OFFSET is not supported by the GPU ORDER BY/LIMIT path");
         }
     }
-    return static_cast<std::size_t>(limit->limit->ival);
+    return limit->limit->ival;
 }
 
 } // namespace
@@ -866,28 +988,36 @@ std::unique_ptr<ExprNode> QueryTranslator::translateHavingExpr(
         return std::make_unique<ColumnRefExpr>("__result_col_" + std::to_string(slot), "__RESULT__");
     };
 
+    // A repeated grouped expression is an output reference, not new executable
+    // arithmetic/CASE with its own independent parameters.
+    if (expr->type == hsql::kExprOperator && stmt->groupBy && stmt->groupBy->columns) {
+        for (std::size_t i = 0; i < stmt->groupBy->columns->size(); ++i) {
+            if (hsqlExprEquivalent(expr, (*stmt->groupBy->columns)[i])) return result_slot_expr(i);
+        }
+    }
+
     switch (expr->type) {
         case hsql::kExprLiteralInt:
-            return std::make_unique<LiteralIntExpr>(expr->ival);
+            return std::make_unique<LiteralIntExpr>(expr->ival, literalOrigin(expr));
         case hsql::kExprLiteralFloat:
-            return std::make_unique<LiteralFloatExpr>(expr->fval);
+            return std::make_unique<LiteralFloatExpr>(expr->fval, literalOrigin(expr));
+        case hsql::kExprLiteralString:
+            return std::make_unique<LiteralTextExpr>(expr->name ? expr->name : "", literalOrigin(expr));
         case hsql::kExprLiteralNull:
-            return std::make_unique<LiteralNullExpr>();
+            return std::make_unique<LiteralNullExpr>(literalOrigin(expr));
         case hsql::kExprColumnRef: {
             std::size_t alias_select_index = 0;
             if (resolveSelectAliasReference(expr, select_alias_to_select_index_, alias_select_index)) {
                 return result_slot_expr(aggregateOutputSlotForSelectIndex(stmt, alias_select_index));
             }
             if (stmt->groupBy && stmt->groupBy->columns) {
-                const std::string col = expr->name ? std::string(expr->name) : "";
-                const std::string table = resolveTableQualifier(expr->table ? std::string(expr->table) : "");
+                const auto column = resolveColumnReference(expr->name ? expr->name : "", expr->table ? expr->table : "");
                 for (std::size_t i = 0; i < stmt->groupBy->columns->size(); ++i) {
                     const hsql::Expr* group_expr = (*stmt->groupBy->columns)[i];
                     if (!group_expr || group_expr->type != hsql::kExprColumnRef) continue;
-                    const std::string group_col = group_expr->name ? std::string(group_expr->name) : "";
-                    const std::string group_table = resolveTableQualifier(group_expr->table ? std::string(group_expr->table) : "");
-                    if (upperCopy(group_col) == upperCopy(col) &&
-                        (table.empty() || group_table.empty() || table == group_table)) {
+                    const auto group_column = resolveColumnReference(
+                        group_expr->name ? group_expr->name : "", group_expr->table ? group_expr->table : "");
+                    if (group_column.column_name == column.column_name && group_column.table_name == column.table_name) {
                         return result_slot_expr(i);
                     }
                 }
@@ -920,6 +1050,7 @@ std::unique_ptr<ExprNode> QueryTranslator::translateHavingExpr(
                 "HAVING aggregate expression must also appear in SELECT list");
         }
         case hsql::kExprOperator: {
+            if (expr->opType == hsql::kOpUnaryMinus) return translateNegativeLiteral(expr);
             if (expr->opType == hsql::kOpCase) {
                 return translateHavingCaseExpr(expr, stmt);
             }
@@ -962,6 +1093,8 @@ std::unique_ptr<OperatorNode> QueryTranslator::translate(const hsql::SelectState
 
     table_alias_to_name_.clear();
     select_alias_to_select_index_.clear();
+    from_tables_.clear();
+    literal_origins_.clear();
 
     // ---- 1. Трансляция FROM → поддерево scan/join ----
     std::unique_ptr<OperatorNode> root = translateFrom(stmt->fromTable);
@@ -1041,9 +1174,10 @@ std::unique_ptr<OperatorNode> QueryTranslator::translate(const hsql::SelectState
         if (stmt->selectList) {
             for (std::size_t i = 0; i < stmt->selectList->size(); ++i) {
                 const hsql::Expr* sel = (*stmt->selectList)[i];
-                if (!sel || !sel->alias) continue;
+                if (!sel) continue;
                 const std::size_t slot = aggregateOutputSlotForSelectIndex(stmt, i);
-                if (slot < agg_node->output_aliases.size()) {
+                agg_node->select_output_slots.push_back(slot);
+                if (sel->alias && slot < agg_node->output_aliases.size()) {
                     agg_node->output_aliases[slot] = std::string(sel->alias);
                 }
             }
@@ -1063,6 +1197,7 @@ std::unique_ptr<OperatorNode> QueryTranslator::translate(const hsql::SelectState
                 throw std::runtime_error("QueryTranslator: aggregate function in non-aggregate SELECT list is not supported");
             }
             projection->select_exprs.push_back(translateExpr(sel));
+            validateProjectionStorage(*projection->select_exprs.back());
             projection->output_aliases.push_back(sel->alias ? std::string(sel->alias) : std::string());
         }
         if (!projection->select_exprs.empty()) {
@@ -1076,8 +1211,9 @@ std::unique_ptr<OperatorNode> QueryTranslator::translate(const hsql::SelectState
     if (has_order_by || has_limit) {
         auto sort_limit = std::make_unique<SortLimitNode>();
         if (has_limit) {
-            sort_limit->has_limit = true;
-            sort_limit->limit = parseLimitValue(stmt->limit);
+            sort_limit->limit_expr = std::make_unique<LiteralIntExpr>(
+                parseLimitValue(stmt->limit), literalOrigin(stmt->limit->limit));
+            (void)sort_limit->literalLimit();
         }
         if (has_order_by) {
             for (const auto* ord : *stmt->order) {
@@ -1086,8 +1222,8 @@ std::unique_ptr<OperatorNode> QueryTranslator::translate(const hsql::SelectState
                 }
                 SortKeyDef key;
                 key.column_index = (has_group_by || has_aggregation)
-                    ? resolveAggregateOrderKey(ord->expr, stmt, select_alias_to_select_index_)
-                    : resolveProjectionOrderKey(ord->expr, stmt, select_alias_to_select_index_);
+                    ? resolveAggregateOrderKey(ord->expr, stmt)
+                    : resolveProjectionOrderKey(ord->expr, stmt);
                 key.descending = (ord->type == hsql::kOrderDesc);
                 sort_limit->sort_keys.push_back(key);
             }

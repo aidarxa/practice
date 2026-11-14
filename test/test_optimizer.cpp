@@ -10,9 +10,15 @@
 #include "core/optimizer_rules.h"
 #include "core/translator.h"
 #include "core/visitor.h"
+#include "core/query_template.h"
+#include "core/module_codegen.h"
+#include "core/text_plan.h"
+#include "assertions_enabled.h"
 
 #include <SQLParser.h>
+#include <algorithm>
 #include <cassert>
+#include <iterator>
 #include <iostream>
 #include <string>
 #include <vector>
@@ -97,21 +103,67 @@ static hsql::SelectStatement* parseSQL(const std::string& sql,
         static_cast<const hsql::SelectStatement*>(result.getStatement(0)));
 }
 
-static std::string generateJitCodeForSql(const std::string& sql,
+static PlannedQuery physicalPlanForSql(const std::string& sql,
                                          const std::shared_ptr<Catalog>& catalog) {
     hsql::SQLParserResult result;
     auto* ast = parseSQL(sql, result);
     assert(ast != nullptr);
 
     db::QueryTranslator translator;
-    auto tree = translator.translate(ast);
+    auto prepared = translator.prepare(ast, *catalog);
     db::Optimizer opt;
-    tree = opt.optimize(std::move(tree));
+    prepared.query.plan = opt.optimize(std::move(prepared.query.plan));
+    auto tree = bindLegacyPlan(prepared.query, prepared.parameters);
 
     db::JITContext jit_ctx;
     db::JITOperatorVisitor visitor(jit_ctx, *catalog);
     tree->accept(visitor);
-    return visitor.generateCode();
+    return visitor.buildPhysicalPlan();
+}
+
+static std::string generateJitCodeForSql(const std::string& sql, const std::shared_ptr<Catalog>& catalog) {
+    return describePcudamodules(physicalPlanForSql(sql, catalog));
+}
+
+/** @brief Only specialized bodies become SQL modules; universal prefix work is a prebuilt service. */
+static void test_physical_plan_boundaries_and_control_flow() {
+    auto base = buildTestCatalog();
+    auto metadata = std::make_shared<Catalog>();
+    for (auto table : base->getTablesMetadata()) {
+        if (table.getName() == "SUPPLIER") {
+            table.setColumnUnique("s_suppkey", false);
+            table.setColumnStats("s_suppkey", {1, 10, 10});
+        }
+        metadata->pushTableMetadata(std::move(table));
+    }
+    const auto query = physicalPlanForSql("SELECT lo_orderkey,s_nation FROM lineorder,supplier WHERE lo_suppkey=s_suppkey ORDER BY 1,2 LIMIT 3", metadata);
+    std::set<std::string> kernels;
+    for (const auto& kernel : query.plan.kernels) {
+        assert(kernels.insert(kernel.name).second);
+        std::set<std::string> arguments;
+        for (const auto& argument : kernel.arguments) assert(arguments.insert(argument.name).second);
+    }
+    for (const auto& name : {"MHTBlockScan_s", "MHTBlockSumsScan_s", "MHTSuperSumsScan_s", "MHTAddSuperSums_s", "MHTAddSums_s",
+                             "ProjectionTileBlockScan", "ProjectionBlockSumsScan", "ProjectionAddBlockSums"}) assert(!kernels.count(name));
+    assert(kernels.count("MHT_PfxSum_s") == 0);
+    assert(kernels.count("Scan_LINEORDER_Count") && kernels.count("Scan_LINEORDER_Write"));
+    const auto description = describePlan(query.plan);
+    size_t prefixes = 0;
+    for (const auto& step : query.plan.steps) prefixes += std::holds_alternative<DevicePrefix>(step.operation);
+    assert(prefixes == 2); // MHT offsets and exact projection offsets, without host count materialization
+    // Native module lowering preserves fusion and the fixed ABI without host-runtime headers.
+    const auto legacy = describePcudamodules(query);
+    assert(legacy.find("core/execution.h") == std::string::npos);
+    assert(legacy.find("pcudaParallelFor") != std::string::npos);
+    assert(legacy.find("sycl::") == std::string::npos);
+    assert(legacy.find("malloc") == std::string::npos);
+    for (const auto* operation : {"ensure", "fill", "copy", "device-prefix", "branch", "loop", "publish"})
+        assert(description.find(operation) != std::string::npos);
+    const auto old_loop_boundary = physicalPlanForSql("SELECT s_nation,s_region FROM supplier WHERE s_nation>0 ORDER BY s_nation,s_region LIMIT 4096", base);
+    bool full_sort = false;
+    for (const auto& kernel : old_loop_boundary.plan.kernels) full_sort |= kernel.name == "SortLimitBitonicSort";
+    assert(full_sort); // K must not leave the local selector in a non-progressing host loop
+    std::cout << "Physical launch boundaries and control flow... PASSED\n";
 }
 
 // ============================================================================
@@ -248,12 +300,14 @@ static void test_jit_visitor_q11() {
     tree->accept(visitor);
     std::string code = visitor.generateCode();
 
-    assert(code.find("extern \"C\" void execute_query(db::ExecutionContext* ctx)") != std::string::npos);
-    assert(code.find("sycl::queue& q = *(ctx->q_);") != std::string::npos);
-    assert(code.find("class select_kernel;") != std::string::npos);
+    assert(code.find("db_kernel_launch_v2") != std::string::npos);
+    assert(code.find("ExecutionContext") == std::string::npos);
+    const auto physical = visitor.buildPhysicalPlan();
+    assert(std::count_if(physical.plan.kernels.begin(), physical.plan.kernels.end(), [](const auto& kernel) { return kernel.name == "Scan_LINEORDER"; }) == 1);
+    assert(code.find(": Scan_LINEORDER") != std::string::npos);
     // Скалярная агрегация → reduce_over_group + atomic_result
-    assert(code.find("reduce_over_group") != std::string::npos);
-    assert(code.find("atomic_result") != std::string::npos);
+    assert(code.find("crystal::blockReduce") != std::string::npos);
+    assert(code.find("db::atomicAggregate<std::int64_t,db::AggregateOp::Sum>(d_result[0]") != std::string::npos);
     // Нет build-ядер (только LINEORDER, без измерений)
     assert(code.find("build_hashtable_") == std::string::npos);
 
@@ -356,20 +410,20 @@ static void test_jit_visitor_q21() {
     tree->accept(visitor);
     std::string code = visitor.generateCode();
 
-    assert(code.find("extern \"C\" void execute_query(db::ExecutionContext* ctx)") != std::string::npos);
-    assert(code.find("class select_kernel;") != std::string::npos);
+    assert(code.find("db_kernel_launch_v2") != std::string::npos);
+    assert(code.find(": Scan_LINEORDER") != std::string::npos);
     // Build-ядра присутствуют (DDATE, PART, SUPPLIER)
-    assert(code.find("build_hashtable_") != std::string::npos);
-    // Хеш-таблицы аллоцируются
-    assert(code.find("sycl::malloc_device<int>") != std::string::npos);
+    assert(code.find(": build_hashtable_") != std::string::npos);
+    const auto physical = visitor.buildPhysicalPlan();
+    assert(physical.plan.kernels.size() == 4);
+    size_t scratch = 0;
+    for (const auto& buffer : physical.plan.buffers) scratch += buffer.role == BufferRole::Scratch;
+    assert(scratch == 6); // three tables and three explicit PHT occupancy maps
+    assert(code.find("malloc_device") == std::string::npos);
     // Групповая агрегация → atomic_ref, НЕ reduce_over_group
-    assert(code.find("sycl::atomic_ref") != std::string::npos);
-    assert(code.find("fetch_add") != std::string::npos);
+    assert(code.find("db::atomicAggregate") != std::string::npos);
     assert(code.find("reduce_over_group") == std::string::npos);
-    // Ровно один q.wait()
-    size_t waits = 0, pos = 0;
-    while ((pos = code.find("q.wait();", pos)) != std::string::npos) { ++waits; pos += 9; }
-    assert(waits == 1 && "Must have exactly one q.wait()");
+    assert(code.find("q.wait") == std::string::npos); // synchronization belongs to runtime
 
     std::cout << "PASSED\n";
 }
@@ -418,10 +472,10 @@ static void test_jit_visitor_q31() {
 
     // Минимум 3 build-ядра (CUSTOMER, SUPPLIER, DDATE)
     size_t builds = 0, pos = 0;
-    while ((pos = code.find("build_hashtable_", pos)) != std::string::npos) { ++builds; pos += 16; }
+    while ((pos = code.find(": build_hashtable_", pos)) != std::string::npos) { ++builds; pos += 18; }
     assert(builds >= 3 && "Q3.1 must emit at least 3 build kernels");
 
-    assert(code.find("sycl::atomic_ref") != std::string::npos);
+    assert(code.find("db::atomicAggregate") != std::string::npos);
 
     std::cout << "PASSED\n";
 }
@@ -582,28 +636,31 @@ static void test_nullable_expression_codegen_and_typed_result_abi() {
         db::JITContext jit_ctx;
         db::JITOperatorVisitor visitor(jit_ctx, *nullable_catalog);
         tree->accept(visitor);
-        return visitor.generateCode();
+        return visitor.buildPhysicalPlan();
     };
 
-    const std::string agg_code = generate(
+    const auto aggregate = generate(
         "SELECT COUNT(*), COUNT(lo_revenue), SUM(lo_revenue), AVG(lo_revenue) "
         "FROM lineorder");
+    const auto agg_code = describePcudamodules(aggregate);
     assert(agg_code.find("BlockLoadValidity") != std::string::npos);
     assert(agg_code.find("items_valid") != std::string::npos);
-    assert(agg_code.find("getResultColumnUInt64Pointer(0)") != std::string::npos);
-    assert(agg_code.find("getResultColumnUInt64Pointer(1)") != std::string::npos);
-    assert(agg_code.find("getResultColumnUInt64Pointer(2)") != std::string::npos);
-    assert(agg_code.find("getResultColumnFloat64Pointer(3)") != std::string::npos);
+    size_t typed_columns = 0;
+    for (const auto& buffer : aggregate.plan.buffers) {
+        if (buffer.role != BufferRole::ResultColumn) continue;
+        assert(buffer.type == (buffer.column == 3 ? DB_TYPE_FLOAT64 : buffer.column == 2 ? DB_TYPE_INT64 : DB_TYPE_UINT64));
+        ++typed_columns;
+    }
+    assert(typed_columns == 4);
 
-    const std::string is_null_projection = generate(
-        "SELECT lo_revenue IS NULL FROM lineorder");
-    assert(is_null_projection.find("getResultColumnUInt64Pointer(0)") != std::string::npos);
-    assert(is_null_projection.find("(!(items_valid[i]))") != std::string::npos ||
-           is_null_projection.find("!((items_valid[i]))") != std::string::npos);
+    const std::string is_null_projection = describePcudamodules(generate(
+        "SELECT lo_revenue IS NULL FROM lineorder"));
+    assert(is_null_projection.find("std::uint64_t* d_result_col_0") != std::string::npos);
+    assert(is_null_projection.find("(!(db::bitmap_valid_at(n_lo_revenue,") != std::string::npos);
     assert(is_null_projection.find("d_result[out_row") == std::string::npos);
 
-    const std::string where_is_null = generate(
-        "SELECT COUNT(*) FROM lineorder WHERE lo_revenue IS NULL");
+    const std::string where_is_null = describePcudamodules(generate(
+        "SELECT COUNT(*) FROM lineorder WHERE lo_revenue IS NULL"));
     assert(where_is_null.find("flags[i] = flags[i] && 0") == std::string::npos);
     assert(where_is_null.find("!(lo_revenue_valid[i])") != std::string::npos ||
            where_is_null.find("!(items_valid[i])") != std::string::npos);
@@ -652,9 +709,9 @@ static void test_topn_projection_direct_radix_codegen() {
         "LIMIT 4100",
         buildTestCatalog());
 
-    assert(filtered_large_limit_code.find("sort_use_threshold_topk") != std::string::npos);
     assert(filtered_large_limit_code.find("SortLimitTopKThresholdCollect") != std::string::npos);
-    assert(filtered_large_limit_code.find("sort_input_rows / static_cast<std::size_t>(4ULL)") != std::string::npos);
+    const auto physical = physicalPlanForSql("SELECT lo_orderkey, lo_revenue FROM lineorder WHERE lo_revenue > 0 ORDER BY lo_revenue DESC LIMIT 4100", buildTestCatalog());
+    assert(describePlan(physical.plan).find("branch") != std::string::npos);
 
     std::cout << "PASSED\n";
 }
@@ -698,7 +755,7 @@ static void test_grouped_aggregate_local_reduce_cost_model_codegen() {
         "GROUP BY c_nation",
         catalog);
     assert(wide_group_code.find("local_agg_0[25]") == std::string::npos);
-    assert(wide_group_code.find("db::atomic_add_ull(d_result[out + 1]") != std::string::npos);
+    assert(wide_group_code.find("db::atomicAggregate<std::int64_t,db::AggregateOp::Sum>(d_result[out + 1]") != std::string::npos);
 
     const std::string small_group_code = generateJitCodeForSql(
         "SELECT c_region, sum(lo_extendedprice * lo_discount) "
@@ -725,7 +782,7 @@ static void test_or_join_grouped_aggregate_local_reduce_scopes_codegen() {
         "GROUP BY d_year",
         buildTestCatalog());
 
-    const std::string scoped_decl = "            {\n                unsigned long long local_agg_0[7];";
+    const std::string scoped_decl = "            {\n                std::int64_t local_agg_0[7];";
     const std::size_t first = code.find(scoped_decl);
     assert(first != std::string::npos);
     const std::size_t second = code.find(scoped_decl, first + scoped_decl.size());
@@ -735,7 +792,7 @@ static void test_or_join_grouped_aggregate_local_reduce_scopes_codegen() {
 }
 
 // ============================================================================
-// Test 16: generated query records whole generated execute interval
+// Test 16: query modules no longer own the host algorithm or timing
 // ============================================================================
 static void test_generated_execute_timing_codegen() {
     std::cout << "Test 16: generated execute timing codegen... ";
@@ -745,17 +802,171 @@ static void test_generated_execute_timing_codegen() {
         "FROM lineorder",
         buildTestCatalog());
 
-    assert(code.find("ctx->timing_.generated_execute_ms") != std::string::npos);
-    assert(code.find("ctx->timing_.gpu_execute_ms = ctx->timing_.generated_execute_ms") != std::string::npos);
-    assert(code.find("ctx->timing_.jit_execute_ms = ctx->timing_.generated_execute_ms") != std::string::npos);
+    assert(code.find("ctx->") == std::string::npos);
+    assert(code.find("malloc_device") == std::string::npos);
+    assert(code.find("q.memcpy") == std::string::npos);
+    assert(code.find("execute_query") == std::string::npos);
+    assert(code.find("db::abi2::validateInvocation") != std::string::npos);
 
     std::cout << "PASSED\n";
 }
 
 // ============================================================================
+/** @brief Pushdown preserves independent slot bindings and a usable parent chain. */
+static void test_parameterized_pushdown_bindings_and_parents() {
+    std::cout << "Test 17: parameterized pushdown bindings and parents... ";
+    hsql::SQLParserResult parsed;
+    auto* ast = parseSQL(
+        "SELECT SUM(lo_revenue) FROM lineorder, part, supplier "
+        "WHERE lo_partkey = p_partkey AND lo_suppkey = s_suppkey "
+        "AND p_category = 1 AND s_region = 1 AND lo_quantity > 1", parsed);
+    assert(ast);
+    auto metadata = buildTestCatalog();
+    QueryTranslator translator;
+    auto prepared = translator.prepare(ast, *metadata);
+    assert(prepared.parameters.size() == 3);
+    Optimizer optimizer;
+    prepared.query.plan = optimizer.optimize(std::move(prepared.query.plan));
+    std::set<std::size_t> slots;
+    std::function<void(const OperatorNode*, const OperatorNode*)> check =
+        [&](const OperatorNode* node, const OperatorNode* parent) {
+            assert(node->parent_ == parent && "Optimizer must preserve parent ownership links");
+            if (node->getType() == OperatorType::FILTER) {
+                const auto& expr = static_cast<const BinaryExpr&>(*static_cast<const FilterNode*>(node)->predicate);
+                const auto& column = static_cast<const ColumnRefExpr&>(*expr.left);
+                const auto& parameter = static_cast<const ParameterRefExpr&>(*expr.right);
+                const std::size_t expected = column.column_name == "p_category" ? 0 :
+                    column.column_name == "s_region" ? 1 : 2;
+                assert(parameter.slot == expected);
+                assert(collectTableNames(node->getChildren()[0].get()).count(column.table_name) == 1);
+                slots.insert(parameter.slot);
+            }
+            for (const auto& child : node->getChildren()) check(child.get(), node);
+        };
+    check(prepared.query.plan.get(), nullptr);
+    assert(slots == (std::set<std::size_t>{0, 1, 2}));
+    std::cout << "PASSED\n";
+}
+
+/** @brief PHT occupancy is an explicit cleared buffer and a build/probe contract argument. */
+static void test_pht_occupancy_contract() {
+    auto catalog=std::make_shared<Catalog>();
+    const auto original=buildTestCatalog();
+    for (auto table:original->getTablesMetadata()) {
+        if (table.getName()=="LINEORDER") table.setColumnNullable("lo_suppkey");
+        catalog->pushTableMetadata(table);
+    }
+    const auto query = physicalPlanForSql(
+        "SELECT SUM(lo_revenue) FROM lineorder,supplier WHERE lo_suppkey=s_suppkey", catalog);
+    const auto buffer = std::find_if(query.plan.buffers.begin(), query.plan.buffers.end(),
+        [](const auto& b) { return b.name == "d_s_hash_table_occupied"; });
+    assert(buffer != query.plan.buffers.end());
+    assert(buffer->type == DB_TYPE_INT32 && buffer->legacy_cpp_type == "unsigned int");
+    size_t users = 0;
+    for (const auto& kernel : query.plan.kernels)
+        for (const auto& argument : kernel.arguments) users += argument.name == buffer->name;
+    assert(users == 2);
+    const auto code = describePcudamodules(query);
+    assert(code.find("num_tile_items, d_s_hash_table_occupied") != std::string::npos);
+    assert(code.find("BlockLoadValidity<BLOCK_THREADS, ITEMS_PER_THREAD>(n_lo_suppkey") != std::string::npos);
+    assert(code.find("int items_valid[ITEMS_PER_THREAD]") != std::string::npos);
+    size_t checked_bounds=0;
+    for (const auto& step:query.plan.steps) {
+        const auto* guard=std::get_if<Require>(&step.operation);
+        if (!guard || (guard->message.find("row IDs")==std::string::npos && guard->message.find("domain exceeds")==std::string::npos)) continue;
+        assert(guard->condition.evaluate({{"rows_LINEORDER",INT32_MAX},{"rows_SUPPLIER",INT32_MAX}})==1);
+        assert(guard->condition.evaluate({{"rows_LINEORDER",uint64_t(INT32_MAX)+1},{"rows_SUPPLIER",uint64_t(INT32_MAX)+1}})==0);
+        ++checked_bounds;
+    }
+    assert(checked_bounds>=3); // scan, PHT domain and build-row representability
+}
+
+/** @brief Physical flag columns use decoded Int32 buffers and keep value-free parameter slots. */
+static void test_decoded_flag_parameter_plan() {
+    auto catalog = std::make_shared<Catalog>();
+    TableMetadata date("DDATE", db::ssbColumnNames("DDATE"), 2557, false);
+    for (const auto& column : db::ssbColumns)
+        if (std::string(column.table) == "DDATE") date.setColumnStorage(column.name, column.storage);
+    date.setColumnStats("d_weekdayfl", {0, 1, 2});
+    catalog->pushTableMetadata(date);
+    const auto query = physicalPlanForSql("SELECT SUM(d_year) FROM ddate WHERE d_weekdayfl=1", catalog);
+    bool decoded_input = false;
+    for (const auto& kernel : query.plan.kernels)
+        for (const auto& argument : kernel.arguments)
+            if (argument.name == "d_d_weekdayfl") { assert(argument.schema.type == DB_TYPE_INT32); decoded_input = true; }
+    assert(decoded_input);
+    const auto source = describePcudamodules(query);
+    assert(source.find("sycl::") == std::string::npos);
+    assert(source.find("execute_query") == std::string::npos);
+}
+
+/** @brief Text parameters change values/NULL, not optimized structure or native module identity. */
+static void test_text_parameterized_physical_plan() {
+    Catalog catalog;
+    TableMetadata customer("CUSTOMER", {"c_custkey", "c_name"}, 8, false);
+    customer.setColumnStorage("c_name", {PhysicalEncoding::FixedText, 25});
+    customer.setColumnNullable("c_name");
+    catalog.pushTableMetadata(customer);
+    auto prepare = [&](const std::string& value) {
+        hsql::SQLParserResult ast;
+        auto* statement = parseSQL("SELECT COUNT(c_name),c_name,MIN(c_name) FROM customer WHERE c_name>" + value +
+                                   " GROUP BY c_name HAVING MIN(c_name)<>'' ORDER BY 2 LIMIT 3", ast);
+        assert(statement);
+        auto prepared = QueryTranslator{}.prepare(statement, catalog);
+        prepared.query.plan = Optimizer{}.optimize(std::move(prepared.query.plan));
+        return prepared;
+    };
+    auto a = prepare("'Alice'"), b = prepare("'Я🙂'"), null = prepare("NULL");
+    assert(a.query.cacheKey() == b.query.cacheKey() && a.query.cacheKey() == null.query.cacheKey());
+    assert(a.parameters.at(2).asText() == "Alice");
+    assert(b.parameters.at(2).asText() == u8"Я🙂");
+    assert(null.parameters.at(2).isNull() && null.parameters.at(2).type() == ParameterType::Text);
+    assert(usesTextPlan(*a.query.plan, catalog, a.query.parameter_schema));
+    const auto first = lowerTextPlan(*a.query.plan, catalog, a.query.parameter_schema);
+    const auto second = lowerTextPlan(*b.query.plan, catalog, b.query.parameter_schema);
+    assert(first.bodies.size() == second.bodies.size() && !first.bodies.empty());
+    for (size_t i=0;i<first.bodies.size();++i)
+        assert(generatePcudacode(first.plan.kernels[i], first.bodies[i], "fixture").key ==
+               generatePcudacode(second.plan.kernels[i], second.bodies[i], "fixture").key);
+    std::vector<uint32_t> types;
+    for (const auto& buffer : first.plan.buffers)
+        if (buffer.role == BufferRole::ResultColumn) types.push_back(buffer.type);
+    assert(types == (std::vector<uint32_t>{DB_TYPE_UINT64,DB_TYPE_TEXT,DB_TYPE_TEXT}));
+}
+
+/** @brief A changed aggregate keeps the independent build module, without literal-bound lowering. */
+static void test_value_free_cross_plan_modules() {
+    const auto catalog = buildTestCatalog();
+    const auto sources = [&](const std::string& aggregate) {
+        hsql::SQLParserResult parsed;
+        const auto* ast = parseSQL("SELECT " + aggregate + " FROM lineorder,supplier WHERE lo_suppkey=s_suppkey AND s_region>1", parsed);
+        assert(ast);
+        auto prepared = QueryTranslator{}.prepare(ast, *catalog);
+        prepared.query.plan = Optimizer{}.optimize(std::move(prepared.query.plan));
+        JITContext jit; jit.parameter_schema = prepared.query.parameter_schema;
+        JITOperatorVisitor visitor(jit, *catalog);
+        prepared.query.plan->accept(visitor);
+        const auto physical = visitor.buildPhysicalPlan();
+        std::set<std::string> keys;
+        for (size_t i=0;i<physical.bodies.size();++i)
+            keys.insert(generatePcudacode(physical.plan.kernels[i], physical.bodies[i], "acceptance").key);
+        return keys;
+    };
+    const auto count = sources("COUNT(*)"), sum = sources("SUM(lo_revenue)");
+    std::vector<std::string> shared;
+    std::set_intersection(count.begin(), count.end(), sum.begin(), sum.end(), std::back_inserter(shared));
+    assert(!shared.empty() && count != sum);
+}
+
 int main() {
+    test_value_free_cross_plan_modules();
+    test_text_parameterized_physical_plan();
+    test_decoded_flag_parameter_plan();
+    test_pht_occupancy_contract();
+    test_physical_plan_boundaries_and_control_flow();
     std::cout << "=== test_optimizer (new pipeline) ===\n\n";
 
+    test_parameterized_pushdown_bindings_and_parents();
     test_pushdown_rule_basic();
     test_pushdown_rule_via_translator();
     test_jit_visitor_q11();

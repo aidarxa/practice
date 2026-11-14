@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "inputs": ["include/core", "src/core/parameter_value.cpp", "src/core/size_expression.cpp", "src/core/execution_plan.cpp", "src/core/physical_planner.cpp", "src/core/legacy_kernel_codegen.cpp", "test/test_execution_plan.cpp"],
+  "build": [["{cxx}", "-std=c++17", "-O0", "-g", "-UNDEBUG", "{flags}", "-I{root}/include", "{root}/test/test_execution_plan.cpp", "{root}/src/core/parameter_value.cpp", "{root}/src/core/size_expression.cpp", "{root}/src/core/execution_plan.cpp", "{root}/src/core/physical_planner.cpp", "{root}/src/core/legacy_kernel_codegen.cpp", "-o", "{out}/plan-checks"]],
+  "test": [["{out}/plan-checks"]],
+  "objects": ["{out}/plan-checks"],
+  "mutations": [
+    {"id":"counter-destination-lifetime", "file":"src/core/execution_plan.cpp", "before":"int32_t value = 0;\n        PlanCompletion transfer(backend_);", "after":"int32_t value = 0;\n        PlanCompletion transfer(backend_); transfer.finish();"},
+    {"id":"vector-destination-lifetime", "file":"src/core/execution_plan.cpp", "before":"PlanCompletion transfer(backend_);\n    if (src.bytes)", "after":"PlanCompletion transfer(backend_); transfer.finish();\n    if (src.bytes)"},
+    {"id":"exception-drain", "file":"src/core/execution_plan.cpp", "before":"if (!pending_) return;", "after":"return;"}
+  ]
+}

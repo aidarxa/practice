@@ -1,0 +1,47 @@
+{
+  "version": 1,
+  "inputs": [
+    "include/core/size_expression.h",
+    "src/core/size_expression.cpp",
+    "tools/ub/examples/size_checks.cpp"
+  ],
+  "build": [[
+    "{cxx}", "-std=c++17", "-O0", "-UNDEBUG", "{flags}",
+    "-I{root}/include", "{root}/src/core/size_expression.cpp",
+    "{root}/tools/ub/examples/size_checks.cpp", "-o", "{out}/checks"
+  ]],
+  "test": [["{out}/checks"]],
+  "objects": ["{out}/checks"],
+  "mutations": [
+    {
+      "id": "addition-overflow-unchecked",
+      "file": "src/core/size_expression.cpp",
+      "before": "if (b > std::numeric_limits<uint64_t>::max() - a)",
+      "after": "if (false)"
+    },
+    {
+      "id": "multiplication-overflow-unchecked",
+      "file": "src/core/size_expression.cpp",
+      "before": "if (a && b > std::numeric_limits<uint64_t>::max() / a)",
+      "after": "if (false)"
+    },
+    {
+      "id": "addition-is-subtraction",
+      "file": "src/core/size_expression.cpp",
+      "before": "return a + b;",
+      "after": "return a - b;"
+    },
+    {
+      "id": "multiplication-loses-factor",
+      "file": "src/core/size_expression.cpp",
+      "before": "return a * b;",
+      "after": "return a;"
+    },
+    {
+      "id": "ceil-division-truncated",
+      "file": "src/core/size_expression.cpp",
+      "before": "a / b + static_cast<uint64_t>(ceil && a % b != 0)",
+      "after": "a / b"
+    }
+  ]
+}

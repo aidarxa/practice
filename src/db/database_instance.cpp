@@ -1,7 +1,8 @@
 #include "db/database_instance.h"
 #include "core/catalog_cache.h"
 #include "crystal/utils.h"
-#include "core/inline_math.h"
+#include "core/pcuda_services.h"
+#include "core/text_fetch.h"
 
 #include <iostream>
 #include <iomanip>
@@ -20,9 +21,9 @@ static double elapsedMs(const Clock::time_point& start, const Clock::time_point&
 
 DatabaseInstance::DatabaseInstance()
     : config_(loadCrystalConfig()),
-      q_(sycl::gpu_selector_v,sycl::property::queue::in_order()) {
+      runtime_(std::make_shared<DeviceRuntime>(config_)) {
     ctx_ = std::make_unique<ExecutionContext>();
-    ctx_->q_ = &q_;
+    ctx_->runtime_ = runtime_;
     ctx_->config_ = config_;
 
     initCatalog();
@@ -30,40 +31,32 @@ DatabaseInstance::DatabaseInstance()
     engine_ = std::make_unique<QueryEngine>(
         catalog_,
         std::make_unique<FileBasedQueryCache>(),
-        std::make_unique<AdaptiveCppCompiler>(config_.include_dir, config_.deps_include_dir),
+        std::make_unique<AdaptiveCppCompiler>(config_),
         std::make_unique<DynamicLibraryExecutor>()
     );
-
     // Создаём буфер с нулевой начальной ёмкостью.
     // QueryEngine::executeQuery вызовет ensureCapacity с точным размером
     // перед запуском каждого ядра (через expected_result_size_).
-    ctx_->result_buffer_ = std::make_unique<DynamicDeviceBuffer<unsigned long long>>(q_, 0);
-    ctx_->result_validity_buffer_ = std::make_unique<DynamicDeviceBuffer<uint64_t>>(q_, 0);
+    ctx_->result_buffer_ = std::make_unique<DynamicDeviceBuffer<unsigned long long>>(runtime_, 0);
+    ctx_->result_validity_buffer_ = std::make_unique<DynamicDeviceBuffer<uint64_t>>(runtime_, 0);
 }
 
-DatabaseInstance::~DatabaseInstance() {
-    for (auto& pair : ctx_->buffers_) {
-        if (pair.second) {
-            sycl::free(pair.second, q_);
-        }
-    }
-    for (auto& pair : ctx_->null_bitmaps_) {
-        if (pair.second) {
-            sycl::free(pair.second, q_);
-        }
-    }
-}
+DatabaseInstance::~DatabaseInstance() = default;
 
 void DatabaseInstance::initCatalog() {
     catalog_ = std::make_shared<Catalog>();
 
-    // Инициализируем кэш (создаст папку meta рядом с исполняемым файлом)
-    db::CatalogCacheManager cache_manager("meta/catalog_cache.txt");
+    // Инициализируем кэш
+    // A new namespace prevents reuse of old raw-prefix/shifted-DDATE statistics.
+    db::CatalogCacheManager cache_manager("/dev/shm/catalog_cache_numeric_v2.txt");
 
     // Лямбда: берет список колонок и размер таблицы, получает стату и записывает
     auto applyStats = [&](TableMetadata& table) {
         int table_size = table.getSize(); // Возвращает LO_LEN, S_LEN и т.д.
         for (const auto& col_name : table.getColumnNames()) {
+            const auto storage = ssbColumn(col_name).storage;
+            table.setColumnStorage(col_name, storage);
+            if (!storage.isNumeric()) continue;
             db::CachedStats stats = cache_manager.getStatsForColumn(col_name, table_size);
             if (stats.cardinality > 0) {
                 table.setColumnStats(col_name, {stats.min_val, stats.max_val, static_cast<uint64_t>(stats.cardinality)});
@@ -81,11 +74,7 @@ void DatabaseInstance::initCatalog() {
 
     // LINEORDER (fact)
     TableMetadata lo("LINEORDER",
-                     {"lo_orderkey", "lo_linenumber", "lo_custkey", "lo_partkey",
-                      "lo_suppkey", "lo_orderdate", "lo_orderpriority",
-                      "lo_shippriority", "lo_quantity", "lo_extendedprice",
-                      "lo_ordtotalprice", "lo_discount", "lo_revenue",
-                      "lo_supplycost", "lo_tax", "lo_commitdate", "lo_shipmode"},
+                     ssbColumnNames("LINEORDER"),
                      LO_LEN, true);
     applyStats(lo);
     applyNullabilityFromStorage(lo);
@@ -93,8 +82,7 @@ void DatabaseInstance::initCatalog() {
 
     // SUPPLIER (dimension)
     TableMetadata s("SUPPLIER",
-                    {"s_suppkey", "s_name", "s_address", "s_city", "s_nation",
-                     "s_region", "s_phone"},
+                    ssbColumnNames("SUPPLIER"),
                     S_LEN, false);
     applyStats(s);
     applyNullabilityFromStorage(s);
@@ -103,8 +91,7 @@ void DatabaseInstance::initCatalog() {
 
     // CUSTOMER (dimension)
     TableMetadata c("CUSTOMER",
-                    {"c_custkey", "c_name", "c_address", "c_city", "c_nation",
-                     "c_region", "c_phone", "c_mktsegment"},
+                    ssbColumnNames("CUSTOMER"),
                     C_LEN, false);
     applyStats(c);
     applyNullabilityFromStorage(c);
@@ -113,8 +100,7 @@ void DatabaseInstance::initCatalog() {
 
     // PART (dimension)
     TableMetadata p("PART",
-                    {"p_partkey", "p_name", "p_mfgr", "p_category", "p_brand1",
-                     "p_color", "p_type", "p_size", "p_container"},
+                    ssbColumnNames("PART"),
                     P_LEN, false);
     applyStats(p);
     applyNullabilityFromStorage(p);
@@ -123,11 +109,7 @@ void DatabaseInstance::initCatalog() {
 
     // DDATE (dimension)
     TableMetadata d("DDATE",
-                    {"d_datekey", "d_date", "d_dayofweek", "d_month", "d_year",
-                     "d_yearmonthnum", "d_yearmonth", "d_daynuminweek",
-                     "d_daynuminmonth", "d_daynuminyear", "d_sellingseason",
-                     "d_lastdayinweekfl", "d_lastdayinmonthfl", "d_holidayfl",
-                     "d_weekdayfl"},
+                    ssbColumnNames("DDATE"),
                     D_LEN, false);
     applyStats(d);
     applyNullabilityFromStorage(d);
@@ -136,40 +118,59 @@ void DatabaseInstance::initCatalog() {
 }
 
 void DatabaseInstance::loadData() {
+    if (data_loaded_) return;
     std::cout << "Loading data to GPU..." << std::endl;
     int total_columns = 0;
     for (const auto& table : catalog_->getTablesMetadata()) {
         total_columns += table.getColumnCount();
     }
 
-    ctx_->loaded_device_bytes_ = 0;
+    // Commit owners only after the entire load succeeds. A failed load is retryable
+    // and releases its partial device/pinned storage through the same runtime.
+    std::unordered_map<std::string, LoadedDeviceColumn> loaded;
+    std::unordered_map<std::string, LoadedTextColumn> text_loaded;
+    size_t loaded_bytes = 0;
     int current_column = 0;
     for (const auto& table : catalog_->getTablesMetadata()) {
         uint64_t size = table.getSize();
         for (const auto& col_name : table.getColumnNames()) {
             current_column++;
+            const auto storage = table.getColumnStorage(col_name);
+            if (!storage.isNumeric()) {
+                auto validity = loadValidityBitmapIfExists(col_name, size);
+                const auto data = loadTextColumn(std::filesystem::path(DATA_DIR)/lookup(col_name), size, storage, validity);
+                const bool wide = checkedSizeMultiply(size, storage.width) > INT32_MAX;
+                loaded_bytes = checkedSizeAdd(loaded_bytes, checkedSizeAdd(data.bytes.size(), checkedSizeMultiply(data.offsets.size(), wide?8:4)));
+                loaded_bytes = checkedSizeAdd(loaded_bytes, checkedSizeMultiply(validity.size(), sizeof(uint64_t)));
+                text_loaded.emplace(col_name, uploadTextColumn(runtime_, data, wide, validity));
+                continue;
+            }
             std::cout << "\r[" << current_column << "/" << total_columns << "] Loading " << std::left << std::setw(20) << col_name << std::flush;
 
             // Load from disk
             std::vector<int> data = loadColumn<int>(col_name, size);
 
             // Allocate and copy to GPU
-            int* d_ptr = sycl::malloc_device<int>(size, q_);
-            ctx_->loaded_device_bytes_ += static_cast<size_t>(size) * sizeof(int);
-            q_.copy(data.data(), d_ptr, size).wait();
+            LoadedDeviceColumn column;
+            column.values = std::make_unique<DynamicDeviceBuffer<int>>(runtime_, size);
+            column.values->copyFromHost(data);
+            loaded_bytes = checkedSizeAdd(loaded_bytes, checkedSizeMultiply(size, sizeof(int)));
 
             std::string buf_name = "d_" + col_name;
-            ctx_->buffers_[buf_name] = d_ptr;
 
             std::vector<uint64_t> validity = loadValidityBitmapIfExists(col_name, size);
             if (!validity.empty()) {
-                uint64_t* d_null_bitmap = sycl::malloc_device<uint64_t>(validity.size(), q_);
-                ctx_->loaded_device_bytes_ += validity.size() * sizeof(uint64_t);
-                q_.copy(validity.data(), d_null_bitmap, validity.size()).wait();
-                ctx_->null_bitmaps_[buf_name] = d_null_bitmap;
+                column.validity = std::make_unique<DynamicDeviceBuffer<uint64_t>>(runtime_, validity.size());
+                column.validity->copyFromHost(validity);
+                loaded_bytes = checkedSizeAdd(loaded_bytes, checkedSizeMultiply(validity.size(), sizeof(uint64_t)));
             }
+            loaded.emplace(buf_name, std::move(column));
         }
     }
+    ctx_->base_columns_.swap(loaded);
+    ctx_->text_columns_.swap(text_loaded);
+    ctx_->loaded_device_bytes_ = loaded_bytes; // diagnostic only; allocation ledger is authoritative
+    data_loaded_ = true;
     std::cout << "\nData loading complete!" << std::endl;
 }
 
@@ -218,6 +219,7 @@ QueryResult DatabaseInstance::executeQuery(const std::string& sql, const QueryFe
         result.column_i64.resize(ctx_->result_column_count_);
         result.column_u64.resize(ctx_->result_column_count_);
         result.column_f64.resize(ctx_->result_column_count_);
+        result.column_text.resize(ctx_->result_column_count_);
         result.column_validity_bitmap.resize(ctx_->result_column_count_);
         size_t row_offset = 0;
         size_t rows_to_copy = result.row_count;
@@ -228,12 +230,16 @@ QueryResult DatabaseInstance::executeQuery(const std::string& sql, const QueryFe
         }
         result.materialized_row_offset = row_offset;
         result.materialized_row_count = rows_to_copy;
-        const size_t validity_words = (rows_to_copy + 63ULL) / 64ULL;
+        const size_t validity_words = rows_to_copy / 64 + (rows_to_copy % 64 != 0);
         for (size_t col = 0; col < ctx_->result_column_count_; ++col) {
             const db::LogicalType type = (col < result.columns.size()) ? result.columns[col].type : db::LogicalType::UInt64;
             if (col < ctx_->result_column_storage_.size()) {
                 const auto& storage = ctx_->result_column_storage_[col];
-                if (type == db::LogicalType::Float64 && storage.f64) {
+                if (type == db::LogicalType::Text && storage.text) {
+                    if (!ctx_->text_fetch_) ctx_->text_fetch_ = std::make_shared<TextFetch>(runtime_);
+                    result.column_text[col] = ctx_->text_fetch_->read(storage.text->data(), storage.validity->data(),
+                                                                      result.row_count, row_offset, rows_to_copy);
+                } else if (type == db::LogicalType::Float64 && storage.f64) {
                     storage.f64->copyRangeToHost(result.column_f64[col], row_offset, rows_to_copy);
                     result.column_data[col].resize(rows_to_copy);
                     for (size_t r = 0; r < rows_to_copy; ++r) {
@@ -261,8 +267,8 @@ QueryResult DatabaseInstance::executeQuery(const std::string& sql, const QueryFe
                     } else {
                         // Copy the minimal source bitmap word range and rebase bits to row 0.
                         const size_t first_word = row_offset >> 6U;
-                        const size_t last_bit = row_offset + rows_to_copy;
-                        const size_t source_words = ((last_bit + 63ULL) >> 6U) - first_word;
+                        const size_t last_bit = checkedSizeAdd(row_offset, rows_to_copy);
+                        const size_t source_words = last_bit / 64 + (last_bit % 64 != 0) - first_word;
                         std::vector<uint64_t> source_bitmap;
                         storage.validity->copyRangeToHost(source_bitmap, first_word, source_words);
                         result.column_validity_bitmap[col].assign(validity_words, 0ULL);
@@ -291,38 +297,12 @@ QueryResult DatabaseInstance::executeQuery(const std::string& sql, const QueryFe
         const size_t physical_rows = copy_size / result.tuple_size;
         unsigned long long* d_sparse_values = ctx_->getScratchUInt64Buffer("__sparse_result_values", copy_size);
         unsigned long long* d_sparse_count = ctx_->getScratchUInt64Buffer("__sparse_result_count", 1);
-        q_.memset(d_sparse_values, 0, copy_size * sizeof(unsigned long long));
-        q_.memset(d_sparse_count, 0, sizeof(unsigned long long));
-
         unsigned long long* d_source = ctx_->result_buffer_->data();
-        const size_t tuple_size_device = result.tuple_size;
-        q_.submit([&](sycl::handler& h) {
-            h.parallel_for<class CompactSparseAggregateResult>(sycl::range<1>(physical_rows), [=](sycl::id<1> gid) {
-                const unsigned long long row = static_cast<unsigned long long>(gid[0]);
-                const unsigned long long base = row * static_cast<unsigned long long>(tuple_size_device);
-                bool present = false;
-                for (unsigned long long c = 0; c < static_cast<unsigned long long>(tuple_size_device); ++c) {
-                    const unsigned long long idx = base + c;
-                    if (d_source[idx] != 0ULL) {
-                        present = true;
-                        break;
-                    }
-                }
-                if (!present) return;
-                const unsigned long long out_row = db::atomic_fetch_add_ull(d_sparse_count[0], 1ULL);
-                const unsigned long long out_base = out_row * static_cast<unsigned long long>(tuple_size_device);
-                for (unsigned long long c = 0; c < static_cast<unsigned long long>(tuple_size_device); ++c) {
-                    const unsigned long long src_idx = base + c;
-                    const unsigned long long dst_idx = out_base + c;
-                    d_sparse_values[dst_idx] = d_source[src_idx];
-                }
-            });
-        });
-        q_.wait();
-
-        unsigned long long sparse_row_count = 0ULL;
-        q_.memcpy(&sparse_row_count, d_sparse_count, sizeof(unsigned long long)).wait();
-        result.row_count = static_cast<size_t>(sparse_row_count);
+        compactSparseRows(*runtime_, d_source, d_sparse_values, d_sparse_count, physical_rows, result.tuple_size);
+        std::vector<unsigned long long> sparse_count;
+        ctx_->scratch_u64_buffers_.at("__sparse_result_count")->copyToHost(sparse_count, 1);
+        if (sparse_count.front() > physical_rows) throw std::runtime_error("sparse result count exceeds source rows");
+        result.row_count = static_cast<size_t>(sparse_count.front());
         result.dense_result = true;
         result.partial_result = false;
         size_t row_offset = 0;
@@ -334,10 +314,10 @@ QueryResult DatabaseInstance::executeQuery(const std::string& sql, const QueryFe
         }
         result.materialized_row_offset = row_offset;
         result.materialized_row_count = rows_to_copy;
-        const size_t values_to_copy = rows_to_copy * result.tuple_size;
+        const size_t values_to_copy = checkedSizeMultiply(rows_to_copy, result.tuple_size);
         if (values_to_copy != 0) {
             auto& sparse_value_buffer = ctx_->scratch_u64_buffers_.at("__sparse_result_values");
-            sparse_value_buffer->copyRangeToHost(result.data, row_offset * result.tuple_size, values_to_copy);
+            sparse_value_buffer->copyRangeToHost(result.data, checkedSizeMultiply(row_offset, result.tuple_size), values_to_copy);
         }
         // Validity for fast sparse SSB aggregates is absent by design: all copied
         // cells are non-null. Nullable sparse paths use dense/columnar finalization.
@@ -379,7 +359,7 @@ QueryResult DatabaseInstance::executeQuery(const std::string& sql, const QueryFe
             else if (type == db::LogicalType::Int64) result.column_i64[col].assign(physical_rows, 0);
             else result.column_u64[col].assign(physical_rows, 0);
         }
-        const size_t words_per_col = (physical_rows + 63ULL) / 64ULL;
+        const size_t words_per_col = physical_rows / 64 + (physical_rows % 64 != 0);
         result.column_validity_bitmap.assign(result.tuple_size, std::vector<uint64_t>(words_per_col, 0ULL));
         for (size_t row = 0; row < physical_rows; ++row) {
             const size_t base = row * result.tuple_size;
@@ -446,7 +426,7 @@ QueryResult DatabaseInstance::executeQuery(const std::string& sql, const QueryFe
 }
 
 std::string DatabaseInstance::generateQueryCode(const std::string& sql) {
-    q_.wait();
+    runtime_->wait();
     ctx_->resetForQuery();
     return engine_->generateQueryCode(sql);
 }

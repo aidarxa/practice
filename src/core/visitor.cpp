@@ -1,4 +1,7 @@
 #include "core/visitor.h"
+#include "core/module_codegen.h"
+#include "core/result_layout.h"
+#include "core/aggregate_codegen.h"
 #include "core/optimizer_rules.h" // extractTableNames, collectTableNames
 
 #include <algorithm>
@@ -32,22 +35,44 @@ static std::string tablePrefix(const std::string& table_name) {
 }
 
 static std::string sizeMacroFor(const std::string& table_name) {
-    if (table_name == "LINEORDER") return "LO_LEN";
-    if (table_name == "SUPPLIER")  return "S_LEN";
-    if (table_name == "CUSTOMER")  return "C_LEN";
-    if (table_name == "PART")      return "P_LEN";
-    if (table_name == "DDATE")     return "D_LEN";
+    if (table_name == "LINEORDER") return "rows_LINEORDER";
+    if (table_name == "SUPPLIER")  return "rows_SUPPLIER";
+    if (table_name == "CUSTOMER")  return "rows_CUSTOMER";
+    if (table_name == "PART")      return "rows_PART";
+    if (table_name == "DDATE")     return "rows_DDATE";
     return "0";
+}
+
+/** @brief Interpret the legacy planner's atom (catalog row-count name or integer), not C++ source. */
+static SizeExpr sizeAtom(const std::string& text) {
+    if (text.rfind("rows_", 0) == 0) return variable(text);
+    size_t consumed = 0;
+    const auto value = std::stoull(text, &consumed);
+    if (consumed != text.size()) throw std::runtime_error("invalid physical size atom: " + text);
+    return SizeExpr(value);
+}
+
+static uint32_t kernelStorageType(LogicalType type) {
+    if (type == LogicalType::Text) throw std::runtime_error("Text requires the typed Text physical planner");
+    if (type == LogicalType::Int64) return DB_TYPE_INT64;
+    if (type == LogicalType::Float64) return DB_TYPE_FLOAT64;
+    return DB_TYPE_UINT64;
+}
+
+static std::vector<uint32_t> kernelStorageTypes(const std::vector<LogicalType>& types) {
+    std::vector<uint32_t> result;
+    for (const auto type : types) result.push_back(kernelStorageType(type));
+    return result;
 }
 
 static constexpr std::uint64_t kSortLimitSmallTopKRows = 4096ULL;
 static constexpr std::uint64_t kSortLimitAdaptiveRatioDivisor = 4ULL;
 
-static bool adaptiveTopKLimitWorthwhile(std::uint64_t limit, std::uint64_t input_rows) {
-    if (limit == 0ULL || input_rows <= 1ULL) return false;
-    if (limit <= kSortLimitSmallTopKRows) return true;
-    if (limit >= input_rows) return false;
-    return limit <= (input_rows / kSortLimitAdaptiveRatioDivisor);
+/** @brief LIMIT changes runtime control state, never source identity or a static array bound. */
+static SizeExpr limitSize(const SortLimitNode* node) {
+    if (const auto* parameter = dynamic_cast<const ParameterRefExpr*>(node->limit_expr.get()))
+        return variable("db_size_parameter_" + std::to_string(parameter->slot));
+    return node->literalLimit();
 }
 
 enum class FilterPredicateSupport {
@@ -65,6 +90,7 @@ static const char* exprTypeName(ExprType t) {
         case ExprType::COLUMN_REF:    return "COLUMN_REF";
         case ExprType::LITERAL_INT:   return "LITERAL_INT";
         case ExprType::LITERAL_FLOAT: return "LITERAL_FLOAT";
+        case ExprType::LITERAL_TEXT:  return "LITERAL_TEXT";
         case ExprType::LITERAL_NULL:  return "LITERAL_NULL";
         case ExprType::OP_AND:        return "OP_AND";
         case ExprType::OP_OR:         return "OP_OR";
@@ -88,52 +114,13 @@ static const char* exprTypeName(ExprType t) {
 }
 
 
-static LogicalType resultLogicalTypeForExpr(const ExprNode* expr) {
-    if (!expr) return LogicalType::UInt64;
-    switch (expr->getType()) {
-        case ExprType::OP_EQ:
-        case ExprType::OP_NEQ:
-        case ExprType::OP_LT:
-        case ExprType::OP_LTE:
-        case ExprType::OP_GT:
-        case ExprType::OP_GTE:
-        case ExprType::OP_AND:
-        case ExprType::OP_OR:
-        case ExprType::OP_NOT:
-        case ExprType::OP_IS_NULL:
-        case ExprType::OP_IS_NOT_NULL:
-            return LogicalType::UInt64;
-        case ExprType::LITERAL_FLOAT:
-            return LogicalType::Float64;
-        case ExprType::LITERAL_NULL:
-            return LogicalType::UInt64;
-        case ExprType::CASE_WHEN: {
-            const auto* c = static_cast<const CaseWhenExpr*>(expr);
-            const auto then_type = resultLogicalTypeForExpr(c->then_expr.get());
-            const auto else_type = resultLogicalTypeForExpr(c->else_expr.get());
-            if (then_type == LogicalType::Float64 || else_type == LogicalType::Float64) return LogicalType::Float64;
-            if (then_type == LogicalType::Int64 || else_type == LogicalType::Int64) return LogicalType::Int64;
-            return LogicalType::UInt64;
-        }
-        default:
-            return LogicalType::Int64;
-    }
+static LogicalType resultLogicalTypeForExpr(const ExprNode* expr, const ParameterSchema& schema = {}) {
+    return expressionResultType(expr, schema);
 }
 
-static LogicalType resultLogicalTypeForAggregateOutput(const AggregateNode* node, int visible_col) {
+static LogicalType resultLogicalTypeForAggregateOutput(const AggregateNode* node, int visible_col, const ParameterSchema& schema = {}) {
     if (!node) return LogicalType::UInt64;
-    const int group_cols = static_cast<int>(node->group_by_exprs.size());
-    if (visible_col < group_cols) {
-        return resultLogicalTypeForExpr(node->group_by_exprs[static_cast<std::size_t>(visible_col)].get());
-    }
-    const int agg_idx = visible_col - group_cols;
-    if (agg_idx >= 0 && agg_idx < static_cast<int>(node->aggregates.size())) {
-        const auto& agg = node->aggregates[static_cast<std::size_t>(agg_idx)];
-        if (agg.isAvg()) return LogicalType::Float64;
-        if (agg.isCount()) return LogicalType::UInt64;
-        return LogicalType::UInt64;
-    }
-    return LogicalType::UInt64;
+    return aggregateSlotType(*node, static_cast<size_t>(visible_col), schema);
 }
 
 
@@ -144,9 +131,12 @@ static bool resultColumnNullableForExpr(const ExprNode* expr, const Catalog& cat
     switch (expr->getType()) {
         case ExprType::LITERAL_NULL:
             return true;
+        case ExprType::PARAMETER_REF:
+            return true; // validity is runtime data, including initially non-NULL numeric slots
         case ExprType::STAR:
         case ExprType::LITERAL_INT:
         case ExprType::LITERAL_FLOAT:
+        case ExprType::LITERAL_TEXT:
         case ExprType::OP_IS_NULL:
         case ExprType::OP_IS_NOT_NULL:
             return false;
@@ -193,13 +183,14 @@ static bool resultColumnNullableForAggregateOutput(const AggregateNode* node, in
     if (agg_idx >= 0 && agg_idx < static_cast<int>(node->aggregates.size())) {
         const auto& agg = node->aggregates[static_cast<std::size_t>(agg_idx)];
         if (agg.isCount()) return false;
-        return resultColumnNullableForExpr(agg.agg_expr.get(), catalog);
+        return node->group_by_exprs.empty() || resultColumnNullableForExpr(agg.agg_expr.get(), catalog);
     }
     return true;
 }
 
 static std::string resultColumnPointerType(LogicalType type) {
     switch (type) {
+        case LogicalType::Text: throw std::runtime_error("Text requires the typed Text physical planner");
         case LogicalType::Float64: return "double*";
         case LogicalType::Int64:   return "std::int64_t*";
         case LogicalType::UInt64:  return "std::uint64_t*";
@@ -209,6 +200,7 @@ static std::string resultColumnPointerType(LogicalType type) {
 
 static std::string resultColumnGetter(LogicalType type) {
     switch (type) {
+        case LogicalType::Text: throw std::runtime_error("Text requires the typed Text physical planner");
         case LogicalType::Float64: return "getResultColumnFloat64Pointer";
         case LogicalType::Int64:   return "getResultColumnInt64Pointer";
         case LogicalType::UInt64:  return "getResultColumnUInt64Pointer";
@@ -218,6 +210,7 @@ static std::string resultColumnGetter(LogicalType type) {
 
 static std::string castToResultColumnType(const std::string& value, LogicalType type) {
     switch (type) {
+        case LogicalType::Text: throw std::runtime_error("Text requires the typed Text physical planner");
         case LogicalType::Float64: return "static_cast<double>(" + value + ")";
         case LogicalType::Int64:   return "static_cast<std::int64_t>(" + value + ")";
         case LogicalType::UInt64:  return "static_cast<std::uint64_t>(" + value + ")";
@@ -227,6 +220,7 @@ static std::string castToResultColumnType(const std::string& value, LogicalType 
 
 static std::string resultColumnValueByteSizeExpr(LogicalType type) {
     switch (type) {
+        case LogicalType::Text: throw std::runtime_error("Text requires the typed Text physical planner");
         case LogicalType::Float64: return "sizeof(double)";
         case LogicalType::Int64:   return "sizeof(std::int64_t)";
         case LogicalType::UInt64:  return "sizeof(std::uint64_t)";
@@ -236,6 +230,7 @@ static std::string resultColumnValueByteSizeExpr(LogicalType type) {
 
 static std::string resultColumnReadExpr(int col, const std::string& row_expr, LogicalType type) {
     switch (type) {
+        case LogicalType::Text: throw std::runtime_error("Text requires the typed Text physical planner");
         case LogicalType::Float64: return "d_result_col_" + std::to_string(col) + "[" + row_expr + "]";
         case LogicalType::Int64:   return "d_result_col_" + std::to_string(col) + "[" + row_expr + "]";
         case LogicalType::UInt64:  return "d_result_col_" + std::to_string(col) + "[" + row_expr + "]";
@@ -262,7 +257,7 @@ static void collectSortTableScans(const OperatorNode* node, std::vector<const Ta
 static void appendProjectionLayoutForSort(const ProjectionNode* proj,
                                           const Catalog& catalog,
                                           std::vector<LogicalType>& types,
-                                          std::vector<bool>& nullable) {
+                                          std::vector<bool>& nullable, const ParameterSchema& schema) {
     std::vector<const TableScanNode*> scans;
     if (proj && !proj->getChildren().empty()) collectSortTableScans(proj->getChildren()[0].get(), scans);
     if (!proj) return;
@@ -277,20 +272,20 @@ static void appendProjectionLayoutForSort(const ProjectionNode* proj,
                 }
             }
         } else {
-            types.push_back(resultLogicalTypeForExpr(expr.get()));
+            types.push_back(resultLogicalTypeForExpr(expr.get(), schema));
             nullable.push_back(resultColumnNullableForExpr(expr.get(), catalog));
         }
     }
 }
 
 static void appendAggregateLayoutForSort(const AggregateNode* agg,
-                                         const Catalog& catalog,
-                                         std::vector<LogicalType>& types,
-                                         std::vector<bool>& nullable) {
+                                          const Catalog& catalog,
+                                          std::vector<LogicalType>& types,
+                                          std::vector<bool>& nullable, const ParameterSchema& schema) {
     if (!agg) return;
     const int visible = static_cast<int>(agg->visibleTupleSize());
     for (int col = 0; col < visible; ++col) {
-        types.push_back(resultLogicalTypeForAggregateOutput(agg, col));
+        types.push_back(resultLogicalTypeForAggregateOutput(agg, col, schema));
         nullable.push_back(resultColumnNullableForAggregateOutput(agg, col, catalog));
     }
 }
@@ -298,37 +293,20 @@ static void appendAggregateLayoutForSort(const AggregateNode* agg,
 static void collectResultLayoutForSort(const OperatorNode* node,
                                        const Catalog& catalog,
                                        std::vector<LogicalType>& types,
-                                       std::vector<bool>& nullable) {
+                                       std::vector<bool>& nullable, const ParameterSchema& schema) {
     if (!node) return;
     if (node->getType() == OperatorType::PROJECTION) {
-        appendProjectionLayoutForSort(static_cast<const ProjectionNode*>(node), catalog, types, nullable);
+        appendProjectionLayoutForSort(static_cast<const ProjectionNode*>(node), catalog, types, nullable, schema);
         return;
     }
     if (node->getType() == OperatorType::AGGREGATE) {
-        appendAggregateLayoutForSort(static_cast<const AggregateNode*>(node), catalog, types, nullable);
+        appendAggregateLayoutForSort(static_cast<const AggregateNode*>(node), catalog, types, nullable, schema);
         return;
     }
     for (const auto& child : node->getChildren()) {
-        collectResultLayoutForSort(child.get(), catalog, types, nullable);
+        collectResultLayoutForSort(child.get(), catalog, types, nullable, schema);
         if (!types.empty()) return;
     }
-}
-
-static void registerSortLimitKernelClasses(JITContext& ctx, int tuple_size) {
-    auto add = [&](const std::string& name) {
-        if (std::find(ctx.kernel_class_names.begin(), ctx.kernel_class_names.end(), name) == ctx.kernel_class_names.end()) {
-            ctx.kernel_class_names.push_back(name);
-        }
-    };
-    add("SortLimitInitIndices");
-    add("SortLimitBitonicSort");
-    add("SortLimitTopKLocalSelect");
-    add("SortLimitTopKThresholdMinMax");
-    add("SortLimitTopKThresholdCountGE");
-    add("SortLimitTopKThresholdCountGreater");
-    add("SortLimitTopKThresholdInit");
-    add("SortLimitTopKThresholdCollect");
-    for (int col = 0; col < tuple_size; ++col) add("SortLimitReorderCol" + std::to_string(col));
 }
 
 static void emitRightBeforeLeftComparison(std::stringstream& out,
@@ -386,27 +364,20 @@ static void emitRightBeforeLeftComparison(std::stringstream& out,
     out << indent << "}\n";
 }
 
-static void emitSortLimitReorderAndFinalize(std::stringstream& out,
+static void emitSortLimitReorderAndFinalize(JITContext& ctx, PlanBlock& steps,
                                             int tuple_size,
                                             const std::vector<LogicalType>& result_types,
                                             const std::vector<bool>& nullable,
-                                            const std::string& indices_expr,
-                                            const std::string& after_reorder_free_code) {
-    out << "            const std::size_t sort_validity_words = (sort_output_rows + 63ULL) / 64ULL;\n";
-    out << "            if (sort_output_rows != 0 && sort_output_rows > std::numeric_limits<std::size_t>::max() / static_cast<std::size_t>(" << tuple_size << ")) {\n";
-    out << "                throw std::overflow_error(\"ORDER BY/LIMIT result size overflow\");\n";
-    out << "            }\n";
+                                            const std::string& indices_expr) {
+    steps.emplace_back(SetScalar{"sort_validity_words", maximum(ceilDiv(variable("sort_output_rows"), 64), 1)});
     for (int col = 0; col < tuple_size; ++col) {
         const LogicalType type = result_types[static_cast<std::size_t>(col)];
-        const std::string type_name = resultColumnPointerType(type).substr(0, resultColumnPointerType(type).size() - 1);
         const bool col_nullable = nullable[static_cast<std::size_t>(col)];
-        out << "            " << type_name << "* d_sort_tmp_col_" << col << " = sycl::malloc_device<" << type_name << ">(sort_output_rows == 0 ? 1 : sort_output_rows, q);\n";
+        ctx.physical.scratch(steps, "d_sort_tmp_col_" + std::to_string(col), kernelStorageType(type), maximum(variable("sort_output_rows"), 1));
         if (col_nullable) {
-            out << "            std::uint64_t* d_sort_tmp_validity_col_" << col << " = sycl::malloc_device<std::uint64_t>(sort_validity_words == 0 ? 1 : sort_validity_words, q);\n";
-            out << "            q.memset(d_sort_tmp_validity_col_" << col << ", 0, (sort_validity_words == 0 ? 1 : sort_validity_words) * sizeof(std::uint64_t));\n";
+            ctx.physical.scratch(steps, "d_sort_tmp_validity_col_" + std::to_string(col), DB_TYPE_UINT64, variable("sort_validity_words"), true, "std::uint64_t");
         }
-        out << "            q.submit([&](sycl::handler& h) {\n";
-        out << "                h.parallel_for<class SortLimitReorderCol" << col << ">(sycl::range<1>(sort_output_rows), [=](sycl::id<1> gid) {\n";
+        std::stringstream out;
         out << "                    const std::uint64_t out_row = static_cast<std::uint64_t>(gid[0]);\n";
         out << "                    const std::uint64_t src_row = " << indices_expr << "[out_row];\n";
         out << "                    if (src_row == sort_invalid_idx || src_row >= static_cast<std::uint64_t>(sort_input_rows)) return;\n";
@@ -414,69 +385,69 @@ static void emitSortLimitReorderAndFinalize(std::stringstream& out,
         if (col_nullable) {
             out << "                    if (db::bitmap_valid_at(d_result_validity_col_" << col << ", src_row)) db::atomic_set_valid_bit(d_sort_tmp_validity_col_" << col << ", out_row);\n";
         }
-        out << "                });\n";
-        out << "            });\n";
-        out << "            if (sort_output_rows != 0) q.memcpy(d_result_col_" << col << ", d_sort_tmp_col_" << col << ", sort_output_rows * " << resultColumnValueByteSizeExpr(type) << ");\n";
+        ctx.physical.range(steps, "SortLimitReorderCol" + std::to_string(col), out.str(), variable("sort_output_rows"), {"sort_invalid_idx", "sort_input_rows"});
+        steps.emplace_back(CopyBuffer{"d_result_col_" + std::to_string(col), "d_sort_tmp_col_" + std::to_string(col), 0, 0, variable("sort_output_rows")});
         if (col_nullable) {
-            out << "            q.memcpy(d_result_validity_col_" << col << ", d_sort_tmp_validity_col_" << col << ", (sort_validity_words == 0 ? 1 : sort_validity_words) * sizeof(std::uint64_t));\n";
-        }
-        out << "            q.wait();\n";
-        out << "            sycl::free(d_sort_tmp_col_" << col << ", q);\n";
-        if (col_nullable) {
-            out << "            sycl::free(d_sort_tmp_validity_col_" << col << ", q);\n";
+            steps.emplace_back(CopyBuffer{"d_result_validity_col_" + std::to_string(col), "d_sort_tmp_validity_col_" + std::to_string(col), 0, 0, variable("sort_validity_words")});
         }
     }
-    out << after_reorder_free_code;
 }
 
-static void emitSortLimitFullBitonicPostExecution(std::stringstream& out,
+/** @brief Express the host bitonic launch nest without generating host C++ loops. */
+static void emitBitonicLaunchLoop(JITContext& ctx, PlanBlock& steps, const std::string& name,
+                                  const std::string& body, std::vector<std::string> captures) {
+    steps.emplace_back(SetScalar{"sort_k", 2});
+    PlanBlock outer{SetScalar{"sort_j", shiftRight(variable("sort_k"), 1)}};
+    PlanBlock inner;
+    captures.push_back("sort_k");
+    captures.push_back("sort_j");
+    ctx.physical.range(inner, name, body, variable("sort_padded_rows"), std::move(captures));
+    inner.emplace_back(SetScalar{"sort_j", shiftRight(variable("sort_j"), 1)});
+    outer.emplace_back(Loop{less(0, variable("sort_j")), std::move(inner), 64});
+    outer.emplace_back(Branch{equal(variable("sort_k"), variable("sort_padded_rows")),
+        {SetScalar{"sort_k", 0}}, {SetScalar{"sort_k", shiftLeft(variable("sort_k"), 1)}}});
+    steps.emplace_back(Loop{both(less(0, variable("sort_k")), lessEqual(variable("sort_k"), variable("sort_padded_rows"))), std::move(outer), 64});
+}
+
+static void emitSortLimitBitonicSort(JITContext& ctx, PlanBlock& steps, const SortLimitNode* node,
+                                     const std::vector<LogicalType>& result_types, const std::vector<bool>& nullable) {
+    std::stringstream out;
+    out << "const std::uint64_t sort_i = static_cast<std::uint64_t>(gid[0]);\n"
+        << "const std::uint64_t sort_ixj = sort_i ^ sort_j;\n"
+        << "if (sort_ixj > sort_i) {\n"
+        << "const std::uint64_t sort_left_idx = d_sort_indices[sort_i];\n"
+        << "const std::uint64_t sort_right_idx = d_sort_indices[sort_ixj];\n"
+        << "bool sort_right_before_left = false;\n";
+    emitRightBeforeLeftComparison(out, result_types, nullable, node->sort_keys,
+                                  "sort_left_idx", "sort_right_idx", "sort_right_before_left", "");
+    out << "const bool sort_left_before_right = (sort_left_idx != sort_right_idx) && !sort_right_before_left;\n"
+        << "const bool sort_ascending_stage = ((sort_i & sort_k) == 0ULL);\n"
+        << "const bool sort_swap = sort_ascending_stage ? sort_right_before_left : sort_left_before_right;\n"
+        << "if(sort_swap) {d_sort_indices[sort_i]=sort_right_idx; d_sort_indices[sort_ixj]=sort_left_idx;}\n}\n";
+    emitBitonicLaunchLoop(ctx, steps, "SortLimitBitonicSort", out.str(), {"sort_invalid_idx", "sort_input_rows"});
+}
+
+static void emitSortLimitFullBitonicPostExecution(JITContext& ctx, PlanBlock& steps,
                                                   const SortLimitNode* node,
                                                   int tuple_size,
                                                   const std::vector<LogicalType>& result_types,
                                                   const std::vector<bool>& nullable) {
-    out << "            std::uint64_t sort_padded_rows = 1ULL;\n";
-    out << "            while (sort_padded_rows < static_cast<std::uint64_t>(sort_input_rows)) {\n";
-    out << "                if (sort_padded_rows > (std::numeric_limits<std::uint64_t>::max() >> 1)) throw std::overflow_error(\"ORDER BY padded row count overflow\");\n";
-    out << "                sort_padded_rows <<= 1ULL;\n";
-    out << "            }\n";
-    out << "            std::uint64_t* d_sort_indices = sycl::malloc_device<std::uint64_t>(static_cast<std::size_t>(sort_padded_rows), q);\n";
-    out << "            q.submit([&](sycl::handler& h) {\n";
-    out << "                h.parallel_for<class SortLimitInitIndices>(sycl::range<1>(static_cast<std::size_t>(sort_padded_rows)), [=](sycl::id<1> gid) {\n";
+    steps.emplace_back(SetScalar{"sort_padded_rows", nextPowerOfTwo(variable("sort_input_rows"))});
+    ctx.physical.scratch(steps, "d_sort_index_storage", DB_TYPE_UINT64, variable("sort_padded_rows"));
+    ctx.physical.declareBuffer({"d_sort_indices", DB_TYPE_UINT64, BufferRole::Alias, {}, 0, false});
+    steps.emplace_back(AliasBuffer{"d_sort_indices", "d_sort_index_storage"});
+    std::stringstream out;
     out << "                    const std::uint64_t i = static_cast<std::uint64_t>(gid[0]);\n";
     out << "                    d_sort_indices[i] = (i < static_cast<std::uint64_t>(sort_input_rows)) ? i : sort_invalid_idx;\n";
-    out << "                });\n";
-    out << "            });\n";
-    out << "            for (std::uint64_t sort_k = 2ULL; sort_k <= sort_padded_rows; sort_k <<= 1ULL) {\n";
-    out << "                for (std::uint64_t sort_j = sort_k >> 1ULL; sort_j > 0ULL; sort_j >>= 1ULL) {\n";
-    out << "                    q.submit([&](sycl::handler& h) {\n";
-    out << "                        h.parallel_for<class SortLimitBitonicSort>(sycl::range<1>(static_cast<std::size_t>(sort_padded_rows)), [=](sycl::id<1> gid) {\n";
-    out << "                            const std::uint64_t sort_i = static_cast<std::uint64_t>(gid[0]);\n";
-    out << "                            const std::uint64_t sort_ixj = sort_i ^ sort_j;\n";
-    out << "                            if (sort_ixj > sort_i) {\n";
-    out << "                                const std::uint64_t sort_left_idx = d_sort_indices[sort_i];\n";
-    out << "                                const std::uint64_t sort_right_idx = d_sort_indices[sort_ixj];\n";
-    out << "                                bool sort_right_before_left = false;\n";
-    emitRightBeforeLeftComparison(out, result_types, nullable, node->sort_keys,
-                                  "sort_left_idx", "sort_right_idx", "sort_right_before_left", "                                ");
-    out << "                                const bool sort_left_before_right = (sort_left_idx != sort_right_idx) && !sort_right_before_left;\n";
-    out << "                                const bool sort_ascending_stage = ((sort_i & sort_k) == 0ULL);\n";
-    out << "                                const bool sort_swap = sort_ascending_stage ? sort_right_before_left : sort_left_before_right;\n";
-    out << "                                if (sort_swap) {\n";
-    out << "                                    d_sort_indices[sort_i] = sort_right_idx;\n";
-    out << "                                    d_sort_indices[sort_ixj] = sort_left_idx;\n";
-    out << "                                }\n";
-    out << "                            }\n";
-    out << "                        });\n";
-    out << "                    });\n";
-    out << "                }\n";
-    out << "            }\n";
-    emitSortLimitReorderAndFinalize(out, tuple_size, result_types, nullable, "d_sort_indices", "            sycl::free(d_sort_indices, q);\n");
+    ctx.physical.range(steps, "SortLimitInitIndices", out.str(), variable("sort_padded_rows"), {"sort_input_rows", "sort_invalid_idx"});
+    emitSortLimitBitonicSort(ctx, steps, node, result_types, nullable);
+    emitSortLimitReorderAndFinalize(ctx, steps, tuple_size, result_types, nullable, "d_sort_indices");
 }
 
 static bool sortLimitThresholdTopKEligible(const SortLimitNode* node,
                                            const std::vector<LogicalType>& result_types,
                                            const std::vector<bool>& nullable) {
-    if (!node || !node->has_limit || node->limit == 0) return false;
+    if (!node || !node->hasLimit()) return false;
     if (node->sort_keys.size() != 1) return false;
     const SortKeyDef& key = node->sort_keys.front();
     if (!key.descending) return false;
@@ -486,7 +457,7 @@ static bool sortLimitThresholdTopKEligible(const SortLimitNode* node,
     return type == LogicalType::Int64 || type == LogicalType::UInt64;
 }
 
-static void emitSortLimitThresholdTopKPostExecution(std::stringstream& out,
+static void emitSortLimitThresholdTopKPostExecution(JITContext& ctx, PlanBlock& steps,
                                                     const SortLimitNode* node,
                                                     int tuple_size,
                                                     const std::vector<LogicalType>& result_types,
@@ -496,90 +467,64 @@ static void emitSortLimitThresholdTopKPostExecution(std::stringstream& out,
     const std::string key_expr_i = resultColumnOrderedKeyExpr(key_col, "sort_i", key_type);
     const std::string key_expr_row = resultColumnOrderedKeyExpr(key_col, "sort_row", key_type);
 
-    out << "            constexpr std::uint64_t sort_threshold_threads = 256ULL;\n";
-    out << "            const std::size_t sort_threshold_groups = static_cast<std::size_t>((static_cast<std::uint64_t>(sort_input_rows) + sort_threshold_threads - 1ULL) / sort_threshold_threads);\n";
-    out << "            if (sort_threshold_groups > std::numeric_limits<std::size_t>::max() / 2ULL) throw std::overflow_error(\"ORDER BY/LIMIT Top-K threshold group count overflow\");\n";
-    out << "            unsigned long long* d_sort_threshold_bounds = sycl::malloc_device<unsigned long long>(sort_threshold_groups * 2ULL, q);\n";
-    out << "            unsigned long long* d_sort_threshold_group_counts = sycl::malloc_device<unsigned long long>(sort_threshold_groups, q);\n";
-    out << "            unsigned long long* d_sort_threshold_counts = sycl::malloc_device<unsigned long long>(2, q);\n";
-    out << "            std::vector<unsigned long long> sort_threshold_host_bounds(sort_threshold_groups * 2ULL);\n";
-    out << "            std::vector<unsigned long long> sort_threshold_host_counts(sort_threshold_groups);\n";
-    out << "            q.submit([&](sycl::handler& h) {\n";
-    out << "                h.parallel_for<class SortLimitTopKThresholdMinMax>(sycl::nd_range<1>(sycl::range<1>(sort_threshold_groups * static_cast<std::size_t>(sort_threshold_threads)), sycl::range<1>(static_cast<std::size_t>(sort_threshold_threads))), [=](sycl::nd_item<1> it) {\n";
+    steps.emplace_back(SetScalar{"sort_threshold_groups", ceilDiv(variable("sort_input_rows"), 256)});
+    ctx.physical.scratch(steps, "d_sort_threshold_bounds", DB_TYPE_UINT64, variable("sort_threshold_groups") * 2);
+    ctx.physical.scratch(steps, "d_sort_threshold_group_counts", DB_TYPE_UINT64, variable("sort_threshold_groups"));
+    ctx.physical.scratch(steps, "d_sort_threshold_counts", DB_TYPE_UINT64, 2);
+    std::stringstream out;
     out << "                    const std::uint64_t sort_i = static_cast<std::uint64_t>(it.get_global_linear_id());\n";
     out << "                    const bool sort_in_range = sort_i < static_cast<std::uint64_t>(sort_input_rows);\n";
     out << "                    const std::uint64_t sort_key = sort_in_range ? " << key_expr_i << " : 0ULL;\n";
-    out << "                    const std::uint64_t sort_group_min = sycl::reduce_over_group(it.get_group(), sort_in_range ? sort_key : std::numeric_limits<std::uint64_t>::max(), sycl::minimum<std::uint64_t>{});\n";
-    out << "                    const std::uint64_t sort_group_max = sycl::reduce_over_group(it.get_group(), sort_key, sycl::maximum<std::uint64_t>{});\n";
+    out << "                    const std::uint64_t sort_group_min = crystal::blockReduce<unsigned long long>(sort_in_range ? sort_key : UINT64_MAX, db_collective_u64, threadIdx.x, blockDim.x, crystal::Minimum<unsigned long long>{});\n";
+    out << "                    const std::uint64_t sort_group_max = crystal::blockReduce<unsigned long long>(sort_key, db_collective_u64, threadIdx.x, blockDim.x, crystal::Maximum<unsigned long long>{});\n";
     out << "                    if (it.get_local_linear_id() == 0) {\n";
     out << "                        d_sort_threshold_bounds[it.get_group_linear_id()] = sort_group_min;\n";
     out << "                        d_sort_threshold_bounds[sort_threshold_groups + it.get_group_linear_id()] = sort_group_max;\n";
     out << "                    }\n";
-    out << "                });\n";
-    out << "            });\n";
-    out << "            std::uint64_t sort_threshold_low = 0ULL;\n";
-    out << "            std::uint64_t sort_threshold_high = 0ULL;\n";
-    out << "            q.memcpy(sort_threshold_host_bounds.data(), d_sort_threshold_bounds, sort_threshold_host_bounds.size() * sizeof(unsigned long long)).wait();\n";
-    out << "            sort_threshold_low = sort_threshold_host_bounds[0];\n";
-    out << "            sort_threshold_high = sort_threshold_host_bounds[sort_threshold_groups];\n";
-    out << "            for (std::size_t sort_group = 1; sort_group < sort_threshold_groups; ++sort_group) {\n";
-    out << "                if (sort_threshold_host_bounds[sort_group] < sort_threshold_low) sort_threshold_low = sort_threshold_host_bounds[sort_group];\n";
-    out << "                const std::uint64_t sort_group_max = sort_threshold_host_bounds[sort_threshold_groups + sort_group];\n";
-    out << "                if (sort_group_max > sort_threshold_high) sort_threshold_high = sort_group_max;\n";
-    out << "            }\n";
-    out << "            while (sort_threshold_low < sort_threshold_high) {\n";
-    out << "                const std::uint64_t sort_threshold_delta = sort_threshold_high - sort_threshold_low;\n";
-    out << "                const std::uint64_t sort_threshold_mid = sort_threshold_low + (sort_threshold_delta >> 1ULL) + (sort_threshold_delta & 1ULL);\n";
-    out << "                q.submit([&](sycl::handler& h) {\n";
-    out << "                    h.parallel_for<class SortLimitTopKThresholdCountGE>(sycl::nd_range<1>(sycl::range<1>(sort_threshold_groups * static_cast<std::size_t>(sort_threshold_threads)), sycl::range<1>(static_cast<std::size_t>(sort_threshold_threads))), [=](sycl::nd_item<1> it) {\n";
+    ctx.physical.ndRange(steps, "SortLimitTopKThresholdMinMax", out.str(), variable("sort_threshold_groups"), 256, {"sort_input_rows", "sort_threshold_groups"});
+    steps.emplace_back(HostReduce{HostReduce::Kind::Minimum, "d_sort_threshold_bounds", 0, variable("sort_threshold_groups"), "sort_threshold_low"});
+    steps.emplace_back(HostReduce{HostReduce::Kind::Maximum, "d_sort_threshold_bounds", variable("sort_threshold_groups"), variable("sort_threshold_groups"), "sort_threshold_high"});
+    PlanBlock search;
+    search.emplace_back(SetScalar{"sort_threshold_delta", variable("sort_threshold_high") - variable("sort_threshold_low")});
+    search.emplace_back(SetScalar{"sort_threshold_mid", variable("sort_threshold_low") + ceilDiv(variable("sort_threshold_delta"), 2)});
+    out.str("");
     out << "                        const std::uint64_t sort_i = static_cast<std::uint64_t>(it.get_global_linear_id());\n";
     out << "                        std::uint64_t sort_local_count = 0ULL;\n";
     out << "                        if (sort_i < static_cast<std::uint64_t>(sort_input_rows)) {\n";
     out << "                            const std::uint64_t sort_key = " << key_expr_i << ";\n";
     out << "                            sort_local_count = sort_key >= sort_threshold_mid ? 1ULL : 0ULL;\n";
     out << "                        }\n";
-    out << "                        const std::uint64_t sort_group_count = sycl::reduce_over_group(it.get_group(), sort_local_count, sycl::plus<std::uint64_t>{});\n";
+    out << "                        const std::uint64_t sort_group_count = crystal::blockReduce<unsigned long long>(sort_local_count, db_collective_u64, threadIdx.x, blockDim.x, crystal::Sum<unsigned long long>{});\n";
     out << "                        if (it.get_local_linear_id() == 0) d_sort_threshold_group_counts[it.get_group_linear_id()] = sort_group_count;\n";
-    out << "                    });\n";
-    out << "                });\n";
-    out << "                std::uint64_t sort_count_ge = 0ULL;\n";
-    out << "                q.memcpy(sort_threshold_host_counts.data(), d_sort_threshold_group_counts, sort_threshold_groups * sizeof(unsigned long long)).wait();\n";
-    out << "                for (unsigned long long sort_group_count : sort_threshold_host_counts) sort_count_ge += sort_group_count;\n";
-    out << "                if (sort_count_ge >= static_cast<std::uint64_t>(sort_output_rows)) sort_threshold_low = sort_threshold_mid;\n";
-    out << "                else sort_threshold_high = sort_threshold_mid - 1ULL;\n";
-    out << "            }\n";
-    out << "            const std::uint64_t sort_threshold_key = sort_threshold_low;\n";
-    out << "            q.submit([&](sycl::handler& h) {\n";
-    out << "                h.parallel_for<class SortLimitTopKThresholdCountGreater>(sycl::nd_range<1>(sycl::range<1>(sort_threshold_groups * static_cast<std::size_t>(sort_threshold_threads)), sycl::range<1>(static_cast<std::size_t>(sort_threshold_threads))), [=](sycl::nd_item<1> it) {\n";
+    ctx.physical.ndRange(search, "SortLimitTopKThresholdCountGE", out.str(), variable("sort_threshold_groups"), 256, {"sort_input_rows", "sort_threshold_mid"});
+    search.emplace_back(HostReduce{HostReduce::Kind::Sum, "d_sort_threshold_group_counts", 0, variable("sort_threshold_groups"), "sort_count_ge"});
+    search.emplace_back(Branch{lessEqual(variable("sort_output_rows"), variable("sort_count_ge")),
+        {SetScalar{"sort_threshold_low", variable("sort_threshold_mid")}},
+        {SetScalar{"sort_threshold_high", variable("sort_threshold_mid") - 1}}});
+    steps.emplace_back(Loop{less(variable("sort_threshold_low"), variable("sort_threshold_high")), std::move(search), 64});
+    steps.emplace_back(SetScalar{"sort_threshold_key", variable("sort_threshold_low")});
+    out.str("");
     out << "                    const std::uint64_t sort_i = static_cast<std::uint64_t>(it.get_global_linear_id());\n";
     out << "                    std::uint64_t sort_local_count = 0ULL;\n";
     out << "                    if (sort_i < static_cast<std::uint64_t>(sort_input_rows)) {\n";
     out << "                        const std::uint64_t sort_key = " << key_expr_i << ";\n";
     out << "                        sort_local_count = sort_key > sort_threshold_key ? 1ULL : 0ULL;\n";
     out << "                    }\n";
-    out << "                    const std::uint64_t sort_group_count = sycl::reduce_over_group(it.get_group(), sort_local_count, sycl::plus<std::uint64_t>{});\n";
+    out << "                    const std::uint64_t sort_group_count = crystal::blockReduce<unsigned long long>(sort_local_count, db_collective_u64, threadIdx.x, blockDim.x, crystal::Sum<unsigned long long>{});\n";
     out << "                    if (it.get_local_linear_id() == 0) d_sort_threshold_group_counts[it.get_group_linear_id()] = sort_group_count;\n";
-    out << "                });\n";
-    out << "            });\n";
-    out << "            std::uint64_t sort_count_greater = 0ULL;\n";
-    out << "            q.memcpy(sort_threshold_host_counts.data(), d_sort_threshold_group_counts, sort_threshold_groups * sizeof(unsigned long long)).wait();\n";
-    out << "            for (unsigned long long sort_group_count : sort_threshold_host_counts) sort_count_greater += sort_group_count;\n";
-    out << "            if (sort_count_greater > static_cast<std::uint64_t>(sort_output_rows)) sort_count_greater = static_cast<std::uint64_t>(sort_output_rows);\n";
-    out << "            const std::uint64_t sort_equal_needed = static_cast<std::uint64_t>(sort_output_rows) - sort_count_greater;\n";
-    out << "            std::uint64_t sort_padded_rows = 1ULL;\n";
-    out << "            while (sort_padded_rows < static_cast<std::uint64_t>(sort_output_rows)) {\n";
-    out << "                if (sort_padded_rows > (std::numeric_limits<std::uint64_t>::max() >> 1)) throw std::overflow_error(\"ORDER BY/LIMIT Top-K padded row count overflow\");\n";
-    out << "                sort_padded_rows <<= 1ULL;\n";
-    out << "            }\n";
-    out << "            std::uint64_t* d_sort_indices = sycl::malloc_device<std::uint64_t>(static_cast<std::size_t>(sort_padded_rows), q);\n";
-    out << "            q.submit([&](sycl::handler& h) {\n";
-    out << "                h.parallel_for<class SortLimitTopKThresholdInit>(sycl::range<1>(static_cast<std::size_t>(sort_padded_rows)), [=](sycl::id<1> gid) {\n";
+    ctx.physical.ndRange(steps, "SortLimitTopKThresholdCountGreater", out.str(), variable("sort_threshold_groups"), 256, {"sort_input_rows", "sort_threshold_key"});
+    steps.emplace_back(HostReduce{HostReduce::Kind::Sum, "d_sort_threshold_group_counts", 0, variable("sort_threshold_groups"), "sort_count_greater"});
+    steps.emplace_back(SetScalar{"sort_count_greater", minimum(variable("sort_count_greater"), variable("sort_output_rows"))});
+    steps.emplace_back(SetScalar{"sort_equal_needed", variable("sort_output_rows") - variable("sort_count_greater")});
+    steps.emplace_back(SetScalar{"sort_padded_rows", nextPowerOfTwo(variable("sort_output_rows"))});
+    ctx.physical.scratch(steps, "d_sort_index_storage", DB_TYPE_UINT64, variable("sort_padded_rows"));
+    ctx.physical.declareBuffer({"d_sort_indices", DB_TYPE_UINT64, BufferRole::Alias, {}, 0, false});
+    steps.emplace_back(AliasBuffer{"d_sort_indices", "d_sort_index_storage"});
+    out.str("");
     out << "                    d_sort_indices[gid[0]] = sort_invalid_idx;\n";
-    out << "                });\n";
-    out << "            });\n";
-    out << "            q.memset(d_sort_threshold_counts, 0, 2 * sizeof(unsigned long long));\n";
-    out << "            q.submit([&](sycl::handler& h) {\n";
-    out << "                h.parallel_for<class SortLimitTopKThresholdCollect>(sycl::range<1>(sort_input_rows), [=](sycl::id<1> gid) {\n";
+    ctx.physical.range(steps, "SortLimitTopKThresholdInit", out.str(), variable("sort_padded_rows"), {"sort_invalid_idx"});
+    steps.emplace_back(FillBuffer{"d_sort_threshold_counts", 0, 2, 0});
+    out.str("");
     out << "                    const std::uint64_t sort_row = static_cast<std::uint64_t>(gid[0]);\n";
     out << "                    const std::uint64_t sort_key = " << key_expr_row << ";\n";
     out << "                    if (sort_key > sort_threshold_key) {\n";
@@ -589,66 +534,35 @@ static void emitSortLimitThresholdTopKPostExecution(std::stringstream& out,
     out << "                        const std::uint64_t sort_pos = db::atomic_fetch_add_ull(d_sort_threshold_counts[1], 1ULL);\n";
     out << "                        if (sort_pos < sort_equal_needed) d_sort_indices[sort_count_greater + sort_pos] = sort_row;\n";
     out << "                    }\n";
-    out << "                });\n";
-    out << "            });\n";
-    out << "            for (std::uint64_t sort_k = 2ULL; sort_k <= sort_padded_rows; sort_k <<= 1ULL) {\n";
-    out << "                for (std::uint64_t sort_j = sort_k >> 1ULL; sort_j > 0ULL; sort_j >>= 1ULL) {\n";
-    out << "                    q.submit([&](sycl::handler& h) {\n";
-    out << "                        h.parallel_for<class SortLimitBitonicSort>(sycl::range<1>(static_cast<std::size_t>(sort_padded_rows)), [=](sycl::id<1> gid) {\n";
-    out << "                            const std::uint64_t sort_i = static_cast<std::uint64_t>(gid[0]);\n";
-    out << "                            const std::uint64_t sort_ixj = sort_i ^ sort_j;\n";
-    out << "                            if (sort_ixj > sort_i) {\n";
-    out << "                                const std::uint64_t sort_left_idx = d_sort_indices[sort_i];\n";
-    out << "                                const std::uint64_t sort_right_idx = d_sort_indices[sort_ixj];\n";
-    out << "                                bool sort_right_before_left = false;\n";
-    emitRightBeforeLeftComparison(out, result_types, nullable, node->sort_keys,
-                                  "sort_left_idx", "sort_right_idx", "sort_right_before_left", "                                ");
-    out << "                                const bool sort_left_before_right = (sort_left_idx != sort_right_idx) && !sort_right_before_left;\n";
-    out << "                                const bool sort_ascending_stage = ((sort_i & sort_k) == 0ULL);\n";
-    out << "                                const bool sort_swap = sort_ascending_stage ? sort_right_before_left : sort_left_before_right;\n";
-    out << "                                if (sort_swap) {\n";
-    out << "                                    d_sort_indices[sort_i] = sort_right_idx;\n";
-    out << "                                    d_sort_indices[sort_ixj] = sort_left_idx;\n";
-    out << "                                }\n";
-    out << "                            }\n";
-    out << "                        });\n";
-    out << "                    });\n";
-    out << "                }\n";
-    out << "            }\n";
-    emitSortLimitReorderAndFinalize(out, tuple_size, result_types, nullable, "d_sort_indices",
-                                    "            sycl::free(d_sort_indices, q);\n            sycl::free(d_sort_threshold_bounds, q);\n            sycl::free(d_sort_threshold_group_counts, q);\n            sycl::free(d_sort_threshold_counts, q);\n");
+    ctx.physical.range(steps, "SortLimitTopKThresholdCollect", out.str(), variable("sort_input_rows"), {"sort_threshold_key", "sort_count_greater", "sort_equal_needed"});
+    emitSortLimitBitonicSort(ctx, steps, node, result_types, nullable);
+    emitSortLimitReorderAndFinalize(ctx, steps, tuple_size, result_types, nullable, "d_sort_indices");
 }
 
-static void emitSortLimitTopKPostExecution(std::stringstream& out,
+static void emitSortLimitTopKPostExecution(JITContext& ctx, PlanBlock& steps,
                                            const SortLimitNode* node,
                                            int tuple_size,
                                            const std::vector<LogicalType>& result_types,
                                            const std::vector<bool>& nullable) {
     const std::uint64_t topk_chunk_rows = 4096ULL;
     const std::uint64_t topk_threads = 256ULL;
-    out << "            constexpr std::uint64_t sort_topk_chunk_rows = " << topk_chunk_rows << "ULL;\n";
-    out << "            constexpr std::uint64_t sort_topk_threads = " << topk_threads << "ULL;\n";
-    out << "            const std::uint64_t sort_topk_limit = static_cast<std::uint64_t>(sort_output_rows);\n";
-    out << "            std::uint64_t sort_topk_current_count = static_cast<std::uint64_t>(sort_input_rows);\n";
-    out << "            std::uint64_t sort_topk_initial_groups = (sort_topk_current_count + sort_topk_chunk_rows - 1ULL) / sort_topk_chunk_rows;\n";
-    out << "            if (sort_topk_initial_groups > std::numeric_limits<std::uint64_t>::max() / sort_topk_limit) throw std::overflow_error(\"ORDER BY/LIMIT Top-K candidate size overflow\");\n";
-    out << "            const std::uint64_t sort_topk_capacity = sort_topk_initial_groups * sort_topk_limit;\n";
-    out << "            std::uint64_t* d_sort_topk_a = sycl::malloc_device<std::uint64_t>(static_cast<std::size_t>(sort_topk_capacity == 0ULL ? 1ULL : sort_topk_capacity), q);\n";
-    out << "            std::uint64_t* d_sort_topk_b = sycl::malloc_device<std::uint64_t>(static_cast<std::size_t>(sort_topk_capacity == 0ULL ? 1ULL : sort_topk_capacity), q);\n";
-    out << "            std::uint64_t* d_sort_topk_in = nullptr;\n";
-    out << "            std::uint64_t* d_sort_topk_out = d_sort_topk_a;\n";
-    out << "            std::uint64_t* d_sort_indices = d_sort_topk_a;\n";
-    out << "            bool sort_topk_identity_input = true;\n";
-    out << "            while (true) {\n";
-    out << "                const std::uint64_t sort_topk_groups = (sort_topk_current_count + sort_topk_chunk_rows - 1ULL) / sort_topk_chunk_rows;\n";
-    out << "                if (sort_topk_groups > std::numeric_limits<std::uint64_t>::max() / sort_topk_limit) throw std::overflow_error(\"ORDER BY/LIMIT Top-K pass size overflow\");\n";
-    out << "                const std::uint64_t sort_topk_next_count = sort_topk_groups * sort_topk_limit;\n";
-    out << "                const bool sort_topk_this_pass_identity = sort_topk_identity_input;\n";
-    out << "                std::uint64_t* d_sort_topk_this_in = d_sort_topk_in;\n";
-    out << "                std::uint64_t* d_sort_topk_this_out = d_sort_topk_out;\n";
-    out << "                q.submit([&](sycl::handler& h) {\n";
-    out << "                    sycl::local_accessor<std::uint64_t, 1> sort_local_idx(sycl::range<1>(static_cast<std::size_t>(sort_topk_chunk_rows)), h);\n";
-    out << "                    h.parallel_for<class SortLimitTopKLocalSelect>(sycl::nd_range<1>(sycl::range<1>(static_cast<std::size_t>(sort_topk_groups * sort_topk_threads)), sycl::range<1>(static_cast<std::size_t>(sort_topk_threads))), [=](sycl::nd_item<1> it) {\n";
+    steps.emplace_back(SetScalar{"sort_topk_limit", variable("sort_output_rows")});
+    steps.emplace_back(SetScalar{"sort_topk_current_count", variable("sort_input_rows")});
+    const auto capacity = ceilDiv(variable("sort_input_rows"), topk_chunk_rows) * variable("sort_topk_limit");
+    ctx.physical.scratch(steps, "d_sort_topk_a", DB_TYPE_UINT64, maximum(capacity, 1));
+    ctx.physical.scratch(steps, "d_sort_topk_b", DB_TYPE_UINT64, maximum(capacity, 1));
+    for (const auto& name : {"d_sort_topk_this_in", "d_sort_topk_this_out", "d_sort_indices"})
+        ctx.physical.declareBuffer({name, DB_TYPE_UINT64, BufferRole::Alias, {}, 0, false});
+    steps.emplace_back(AliasBuffer{"d_sort_topk_this_in", "d_sort_topk_a"});
+    steps.emplace_back(AliasBuffer{"d_sort_topk_this_out", "d_sort_topk_a"});
+    steps.emplace_back(SetScalar{"sort_topk_this_pass_identity", 1});
+    steps.emplace_back(SetScalar{"sort_topk_output_is_a", 1});
+    steps.emplace_back(SetScalar{"sort_topk_continue", 1});
+    PlanBlock pass{SetScalar{"sort_topk_groups", ceilDiv(variable("sort_topk_current_count"), topk_chunk_rows)},
+                   SetScalar{"sort_topk_next_count", variable("sort_topk_groups") * variable("sort_topk_limit")}};
+    std::stringstream out;
+    out << "constexpr std::uint64_t sort_topk_chunk_rows=" << topk_chunk_rows << "ULL;\n";
+    out << "constexpr std::uint64_t sort_topk_threads=" << topk_threads << "ULL;\n";
     out << "                        const std::uint64_t sort_lid = static_cast<std::uint64_t>(it.get_local_linear_id());\n";
     out << "                        const std::uint64_t sort_group = static_cast<std::uint64_t>(it.get_group_linear_id());\n";
     out << "                        const std::uint64_t sort_base = sort_group * sort_topk_chunk_rows;\n";
@@ -661,7 +575,7 @@ static void emitSortLimitTopKPostExecution(std::stringstream& out,
     out << "                            }\n";
     out << "                            sort_local_idx[sort_pos] = sort_idx;\n";
     out << "                        }\n";
-    out << "                        it.barrier(sycl::access::fence_space::local_space);\n";
+        out << "                        __syncthreads();\n";
     out << "                        for (std::uint64_t sort_k = 2ULL; sort_k <= sort_topk_chunk_rows; sort_k <<= 1ULL) {\n";
     out << "                            for (std::uint64_t sort_j = sort_k >> 1ULL; sort_j > 0ULL; sort_j >>= 1ULL) {\n";
     out << "                                for (std::uint64_t sort_pos = sort_lid; sort_pos < sort_topk_chunk_rows; sort_pos += sort_topk_threads) {\n";
@@ -681,22 +595,24 @@ static void emitSortLimitTopKPostExecution(std::stringstream& out,
     out << "                                        }\n";
     out << "                                    }\n";
     out << "                                }\n";
-    out << "                                it.barrier(sycl::access::fence_space::local_space);\n";
+        out << "                                __syncthreads();\n";
     out << "                            }\n";
     out << "                        }\n";
     out << "                        for (std::uint64_t sort_pos = sort_lid; sort_pos < sort_topk_limit; sort_pos += sort_topk_threads) {\n";
     out << "                            d_sort_topk_this_out[sort_group * sort_topk_limit + sort_pos] = sort_local_idx[sort_pos];\n";
     out << "                        }\n";
-    out << "                    });\n";
-    out << "                });\n";
-    out << "                d_sort_indices = d_sort_topk_out;\n";
-    out << "                sort_topk_current_count = sort_topk_next_count;\n";
-    out << "                if (sort_topk_current_count <= sort_topk_limit) break;\n";
-    out << "                sort_topk_identity_input = false;\n";
-    out << "                d_sort_topk_in = d_sort_topk_out;\n";
-    out << "                d_sort_topk_out = (d_sort_topk_out == d_sort_topk_a) ? d_sort_topk_b : d_sort_topk_a;\n";
-    out << "            }\n";
-    emitSortLimitReorderAndFinalize(out, tuple_size, result_types, nullable, "d_sort_indices", "            sycl::free(d_sort_topk_a, q);\n            sycl::free(d_sort_topk_b, q);\n");
+    ctx.physical.ndRange(pass, "SortLimitTopKLocalSelect", out.str(), variable("sort_topk_groups"), 256,
+        {"sort_invalid_idx", "sort_input_rows", "sort_topk_current_count", "sort_topk_this_pass_identity", "sort_topk_limit"}, {{"sort_local_idx", DB_TYPE_UINT64, topk_chunk_rows}});
+    pass.emplace_back(AliasBuffer{"d_sort_indices", "d_sort_topk_this_out"});
+    pass.emplace_back(SetScalar{"sort_topk_current_count", variable("sort_topk_next_count")});
+    pass.emplace_back(SetScalar{"sort_topk_continue", less(variable("sort_topk_limit"), variable("sort_topk_current_count"))});
+    pass.emplace_back(SetScalar{"sort_topk_this_pass_identity", 0});
+    pass.emplace_back(AliasBuffer{"d_sort_topk_this_in", "d_sort_topk_this_out"});
+    pass.emplace_back(Branch{variable("sort_topk_output_is_a"),
+        {AliasBuffer{"d_sort_topk_this_out", "d_sort_topk_b"}, SetScalar{"sort_topk_output_is_a", 0}},
+        {AliasBuffer{"d_sort_topk_this_out", "d_sort_topk_a"}, SetScalar{"sort_topk_output_is_a", 1}}});
+    steps.emplace_back(Loop{variable("sort_topk_continue"), std::move(pass), 64});
+    emitSortLimitReorderAndFinalize(ctx, steps, tuple_size, result_types, nullable, "d_sort_indices");
 }
 
 static void emitSortLimitPostExecution(const SortLimitNode* node,
@@ -706,7 +622,7 @@ static void emitSortLimitPostExecution(const SortLimitNode* node,
     std::vector<LogicalType> result_types;
     std::vector<bool> nullable;
     if (!node->getChildren().empty()) {
-        collectResultLayoutForSort(node->getChildren()[0].get(), catalog, result_types, nullable);
+        collectResultLayoutForSort(node->getChildren()[0].get(), catalog, result_types, nullable, ctx.parameter_schema);
     }
     int tuple_size = static_cast<int>(result_types.empty() ? static_cast<std::size_t>(ctx.tuple_size) : result_types.size());
     if (tuple_size <= 0) tuple_size = 1;
@@ -721,48 +637,43 @@ static void emitSortLimitPostExecution(const SortLimitNode* node,
 
     ctx.tuple_size = tuple_size;
 
-    std::stringstream& out = ctx.post_execution_code;
-    out << "    {\n";
-    out << "        const std::size_t sort_input_rows = ctx->result_row_count_;\n";
-    if (node->has_limit) {
-        out << "        const std::size_t sort_output_rows = sort_input_rows < " << node->limit << "ULL ? sort_input_rows : " << node->limit << "ULL;\n";
+    auto& steps = ctx.physical.post;
+    steps.emplace_back(SetScalar{"sort_input_rows", variable("result_rows")});
+    if (node->hasLimit()) {
+        steps.emplace_back(SetScalar{"sort_output_rows", minimum(variable("sort_input_rows"), limitSize(node))});
     } else {
-        out << "        const std::size_t sort_output_rows = sort_input_rows;\n";
+        steps.emplace_back(SetScalar{"sort_output_rows", variable("sort_input_rows")});
     }
     if (node->sort_keys.empty()) {
-        out << "        ctx->result_row_count_ = sort_output_rows;\n";
-        out << "        ctx->result_is_dense_ = true;\n";
-        out << "        ctx->expected_result_size_ = sort_output_rows == 0 ? static_cast<std::size_t>(" << tuple_size << ") : sort_output_rows * static_cast<std::size_t>(" << tuple_size << ");\n";
-        out << "    }\n\n";
+        steps.emplace_back(PublishResult{variable("sort_output_rows"), maximum(variable("sort_output_rows"), 1) * static_cast<uint64_t>(tuple_size), true, 0});
         return;
     }
 
-    registerSortLimitKernelClasses(ctx, tuple_size);
     for (int col = 0; col < tuple_size; ++col) {
-        const LogicalType type = result_types[static_cast<std::size_t>(col)];
-        out << "        " << resultColumnPointerType(type) << " d_result_col_" << col << " = ctx->" << resultColumnGetter(type) << "(" << col << ");\n";
-        out << "        std::uint64_t* d_result_validity_col_" << col << " = ctx->getResultColumnValidityPointer(" << col << ");\n";
+        ctx.physical.declareBuffer({"d_result_col_" + std::to_string(col), kernelStorageType(result_types[static_cast<size_t>(col)]), BufferRole::ResultColumn, {}, static_cast<size_t>(col), false});
+        ctx.physical.declareBuffer({"d_result_validity_col_" + std::to_string(col), DB_TYPE_UINT64, BufferRole::ResultColumnValidity, {}, static_cast<size_t>(col), false});
     }
-    out << "        const std::uint64_t sort_invalid_idx = std::numeric_limits<std::uint64_t>::max();\n";
-    out << "        if (sort_input_rows > 1 && sort_output_rows > 0) {\n";
+    steps.emplace_back(SetScalar{"sort_invalid_idx", UINT64_MAX});
+    PlanBlock sorting;
     if (sortLimitThresholdTopKEligible(node, result_types, nullable)) {
-        out << "            const bool sort_use_threshold_topk = sort_output_rows <= static_cast<std::size_t>(" << kSortLimitSmallTopKRows << "ULL) ||\n";
-        out << "                (sort_output_rows < sort_input_rows && sort_output_rows <= (sort_input_rows / static_cast<std::size_t>(" << kSortLimitAdaptiveRatioDivisor << "ULL)));\n";
-        out << "            if (sort_use_threshold_topk) {\n";
-        emitSortLimitThresholdTopKPostExecution(out, node, tuple_size, result_types, nullable);
-        out << "            } else {\n";
-        emitSortLimitFullBitonicPostExecution(out, node, tuple_size, result_types, nullable);
-        out << "            }\n";
-    } else if (node->has_limit && node->limit > 0 && node->limit <= kSortLimitSmallTopKRows) {
-        emitSortLimitTopKPostExecution(out, node, tuple_size, result_types, nullable);
+        PlanBlock topk, full;
+        emitSortLimitThresholdTopKPostExecution(ctx, topk, node, tuple_size, result_types, nullable);
+        emitSortLimitFullBitonicPostExecution(ctx, full, node, tuple_size, result_types, nullable);
+        const auto eligible = either(lessEqual(variable("sort_output_rows"), kSortLimitSmallTopKRows),
+            both(less(variable("sort_output_rows"), variable("sort_input_rows")), lessEqual(variable("sort_output_rows"), variable("sort_input_rows") / kSortLimitAdaptiveRatioDivisor)));
+        sorting.emplace_back(Branch{eligible, std::move(topk), std::move(full)});
+    } else if (node->hasLimit()) {
+        // A 4096-entry local selector may stop shrinking when K > half a chunk.
+        // The existing full GPU sort is the safe path outside this proven bound.
+        PlanBlock topk, full;
+        emitSortLimitTopKPostExecution(ctx, topk, node, tuple_size, result_types, nullable);
+        emitSortLimitFullBitonicPostExecution(ctx, full, node, tuple_size, result_types, nullable);
+        sorting.emplace_back(Branch{lessEqual(variable("sort_output_rows"), 2048), std::move(topk), std::move(full)});
     } else {
-        emitSortLimitFullBitonicPostExecution(out, node, tuple_size, result_types, nullable);
+        emitSortLimitFullBitonicPostExecution(ctx, sorting, node, tuple_size, result_types, nullable);
     }
-    out << "        }\n";
-    out << "        ctx->result_row_count_ = sort_output_rows;\n";
-    out << "        ctx->result_is_dense_ = true;\n";
-    out << "        ctx->expected_result_size_ = sort_output_rows == 0 ? static_cast<std::size_t>(" << tuple_size << ") : sort_output_rows * static_cast<std::size_t>(" << tuple_size << ");\n";
-    out << "    }\n\n";
+    steps.emplace_back(Branch{both(less(1, variable("sort_input_rows")), less(0, variable("sort_output_rows"))), std::move(sorting), {}});
+    steps.emplace_back(PublishResult{variable("sort_output_rows"), maximum(variable("sort_output_rows"), 1) * static_cast<uint64_t>(tuple_size), true, 0});
 }
 
 static bool isComparisonOp(ExprType t) {
@@ -819,6 +730,9 @@ static FilterPredicateSupport validateFilterFastPathPredicate(
 
     const ExprType left_type = cmp->left->getType();
     const ExprType right_type = cmp->right->getType();
+
+    if (left_type == ExprType::PARAMETER_REF || right_type == ExprType::PARAMETER_REF)
+        return FilterPredicateSupport::NeedsUniversalPath;
 
     const bool col_vs_int = left_type == ExprType::COLUMN_REF && right_type == ExprType::LITERAL_INT;
     const bool col_vs_col = left_type == ExprType::COLUMN_REF && right_type == ExprType::COLUMN_REF;
@@ -942,6 +856,7 @@ static void emitLoadOrGatherIntoReg(const std::string& col_name,
     if (nullable) {
         ctx.external_null_columns.insert(nullBitmapSymbolFor(col_name));
         ctx.col_to_valid_reg[col_name] = validRegFor(reg_name);
+        ctx.pipeline_validity_registers.insert(validRegFor(reg_name));
     } else {
         ctx.col_to_valid_reg.erase(col_name);
     }
@@ -1022,6 +937,9 @@ static std::string booleanNotValue(const std::string& a) {
 static std::string expressionValueNoEmit(const ExprNode* e, const JITContext& ctx) {
     if (!e) return "0";
     switch (e->getType()) {
+        case ExprType::LITERAL_TEXT: throw std::runtime_error("Text literals require parameter extraction and the Text planner");
+        case ExprType::PARAMETER_REF:
+            return parameterName(static_cast<const ParameterRefExpr*>(e)->slot);
         case ExprType::COLUMN_REF: {
             const auto* col = static_cast<const ColumnRefExpr*>(e);
             auto it = ctx.col_to_reg.find(col->column_name);
@@ -1097,7 +1015,7 @@ static std::string expressionValueNoEmit(const ExprNode* e, const JITContext& ct
             const std::string cond_valid = expressionValidExpr(c->condition.get(), ctx);
             const std::string cond_value = expressionValueNoEmit(c->condition.get(), ctx);
             const std::string choose_then = combineAndTerms({cond_valid, cond_value});
-            return "((" + choose_then + ") ? (" + expressionValueNoEmit(c->then_expr.get(), ctx) + ") : (" + expressionValueNoEmit(c->else_expr.get(), ctx) + "))";
+            return emitCaseValue(e, choose_then, expressionValueNoEmit(c->then_expr.get(), ctx), expressionValueNoEmit(c->else_expr.get(), ctx), ctx.parameter_schema);
         }
     }
     return "0";
@@ -1106,11 +1024,14 @@ static std::string expressionValueNoEmit(const ExprNode* e, const JITContext& ct
 static std::string expressionValidExpr(const ExprNode* e, const JITContext& ctx) {
     if (!e) return "1";
     switch (e->getType()) {
+        case ExprType::PARAMETER_REF:
+            return parameterName(static_cast<const ParameterRefExpr*>(e)->slot) + "_valid";
         case ExprType::LITERAL_NULL:
             return "0";
         case ExprType::STAR:
         case ExprType::LITERAL_INT:
         case ExprType::LITERAL_FLOAT:
+        case ExprType::LITERAL_TEXT:
         case ExprType::OP_IS_NULL:
         case ExprType::OP_IS_NOT_NULL:
             return "1";
@@ -1203,6 +1124,9 @@ static std::string projectionVectorColumnValid(const std::string& col_name, JITC
 static std::string projectionVectorExprValue(const ExprNode* e, JITContext& ctx) {
     if (!e) return "0";
     switch (e->getType()) {
+        case ExprType::LITERAL_TEXT: throw std::runtime_error("Text literals require parameter extraction and the Text planner");
+        case ExprType::PARAMETER_REF:
+            return parameterName(static_cast<const ParameterRefExpr*>(e)->slot);
         case ExprType::COLUMN_REF:
             return projectionVectorColumnValue(static_cast<const ColumnRefExpr*>(e)->column_name, ctx);
         case ExprType::LITERAL_INT:
@@ -1273,7 +1197,7 @@ static std::string projectionVectorExprValue(const ExprNode* e, JITContext& ctx)
             const auto* c = static_cast<const CaseWhenExpr*>(e);
             const std::string choose_then = combineAndTerms({projectionVectorExprValid(c->condition.get(), ctx),
                                                              projectionVectorExprValue(c->condition.get(), ctx)});
-            return "((" + choose_then + ") ? (" + projectionVectorExprValue(c->then_expr.get(), ctx) + ") : (" + projectionVectorExprValue(c->else_expr.get(), ctx) + "))";
+            return emitCaseValue(e, choose_then, projectionVectorExprValue(c->then_expr.get(), ctx), projectionVectorExprValue(c->else_expr.get(), ctx), ctx.parameter_schema);
         }
     }
     return "0";
@@ -1282,11 +1206,14 @@ static std::string projectionVectorExprValue(const ExprNode* e, JITContext& ctx)
 static std::string projectionVectorExprValid(const ExprNode* e, JITContext& ctx) {
     if (!e) return "1";
     switch (e->getType()) {
+        case ExprType::PARAMETER_REF:
+            return parameterName(static_cast<const ParameterRefExpr*>(e)->slot) + "_valid";
         case ExprType::LITERAL_NULL:
             return "0";
         case ExprType::STAR:
         case ExprType::LITERAL_INT:
         case ExprType::LITERAL_FLOAT:
+        case ExprType::LITERAL_TEXT:
         case ExprType::OP_IS_NULL:
         case ExprType::OP_IS_NOT_NULL:
             return "1";
@@ -1393,6 +1320,10 @@ void JITExprVisitor::visit(const LiteralNullExpr& /*node*/) {
     // No standalone code generation
 }
 
+void JITExprVisitor::visit(const ParameterRefExpr& /*node*/) {
+    // A standalone leaf emits no statements; its ABI binding is captured by the physical planner.
+}
+
 void JITExprVisitor::visit(const StarExpr& /*node*/) {
     // Star is handled by aggregate/projection-specific code.
 }
@@ -1463,6 +1394,8 @@ std::string JITExprVisitor::translateInlineExpr(const ExprNode* expr, bool is_pr
     if (!expr) return "";
 
     switch (expr->getType()) {
+        case ExprType::PARAMETER_REF:
+            return parameterName(static_cast<const ParameterRefExpr*>(expr)->slot);
         case ExprType::COLUMN_REF: {
             const auto* col = static_cast<const ColumnRefExpr*>(expr);
             std::string col_name = col->column_name;
@@ -1556,7 +1489,7 @@ std::string JITExprVisitor::translateInlineExpr(const ExprNode* expr, bool is_pr
             const std::string cond_valid = expressionValidExpr(c->condition.get(), ctx_);
             const std::string cond_value = expressionValueNoEmit(c->condition.get(), ctx_);
             const std::string choose_then = combineAndTerms({cond_valid, cond_value});
-            return "((" + choose_then + ") ? (" + expressionValueNoEmit(c->then_expr.get(), ctx_) + ") : (" + expressionValueNoEmit(c->else_expr.get(), ctx_) + "))";
+            return emitCaseValue(expr, choose_then, expressionValueNoEmit(c->then_expr.get(), ctx_), expressionValueNoEmit(c->else_expr.get(), ctx_), ctx_.parameter_schema);
         }
         default: 
             return "";
@@ -2040,6 +1973,7 @@ void JITOperatorVisitor::produceTableScan(const TableScanNode* node, JITContext&
 
     auto emit_one_scan_pipeline = [&](const std::string& pipeline_name,
                                       ProjectionPass projection_pass) {
+        ctx.physical.plan.steps.emplace_back(Require{lessEqual(variable(size_macro), INT32_MAX), "legacy scan row IDs require at most INT32_MAX rows"});
         ctx.startNewPipeline(pipeline_name);
         projection_pass_ = projection_pass;
 
@@ -2048,16 +1982,13 @@ void JITOperatorVisitor::produceTableScan(const TableScanNode* node, JITContext&
         // register bindings must not leak from Count pass to Write pass.
         ctx.col_to_reg.clear();
         ctx.col_to_valid_reg.clear();
+        ctx.pipeline_validity_registers.clear();
         ctx.table_rowid_regs.clear();
         ctx.loaded_in_probe.clear();
         ctx.current_items_col.clear();
 
         // 1. Kernel launch header.
         std::stringstream header;
-        header << "    q.submit([&](sycl::handler& h) {\n";
-        header << "        int num_tiles = (" << size_macro << " + TILE_SIZE - 1) / TILE_SIZE;\n";
-        header << "        h.parallel_for<class " << ctx.current_pipeline->kernel_name << ">"
-               << "(sycl::nd_range<1>(num_tiles * BLOCK_THREADS, BLOCK_THREADS), [=](sycl::nd_item<1> it) {\n";
         header << "            int tid = it.get_local_linear_id();\n";
         header << "            int tile_offset = it.get_group_linear_id() * TILE_SIZE;\n";
         header << "            int num_tile_items = (it.get_group_linear_id() == it.get_group_range(0) - 1) ? "
@@ -2087,8 +2018,7 @@ void JITOperatorVisitor::produceTableScan(const TableScanNode* node, JITContext&
                 emitted.insert(reg);
             }
         }
-        for (const auto& pair : ctx.col_to_valid_reg) {
-            const std::string& reg = pair.second;
+        for (const auto& reg : ctx.pipeline_validity_registers) {
             if (!reg.empty() && !emitted.count(reg)) {
                 declarations << "            int " << reg << "[ITEMS_PER_THREAD];\n";
                 emitted.insert(reg);
@@ -2101,9 +2031,9 @@ void JITOperatorVisitor::produceTableScan(const TableScanNode* node, JITContext&
         ctx.current_pipeline->kernel_body << existing_body
                                           << header.str()
                                           << declarations.str()
-                                          << pipeline_logic
-                                          << "        });\n";
-        ctx.current_pipeline->kernel_body << "    });\n\n";
+                                          << pipeline_logic;
+        ctx.physical.ndRange(ctx.physical.plan.steps, pipeline_name,
+                             ctx.current_pipeline->kernel_body.str(), ceilDiv(variable(size_macro), 512), 128);
     };
 
     if (exact_projection && direct_dense_projection) {
@@ -2303,6 +2233,8 @@ void JITOperatorVisitor::produceProjection(const ProjectionNode* node, JITContex
 void JITOperatorVisitor::produceSortLimit(const SortLimitNode* node, JITContext& ctx) {
     if (node) {
         ctx.requires_dense_result = true;
+        if (const auto* parameter = dynamic_cast<const ParameterRefExpr*>(node->limit_expr.get()))
+            ctx.physical.plan.size_parameters.push_back(parameter->slot);
     }
     if (emitProjectionSortLimitDirectTopKIfEligible(node, ctx, catalog_)) {
         return;
@@ -2315,79 +2247,6 @@ void JITOperatorVisitor::produceSortLimit(const SortLimitNode* node, JITContext&
     }
 }
 
-static std::string translateMathExprPush(
-        const ExprNode* expr,
-        JITContext& ctx,
-        bool cast_to_ull = false) {
-    if (!expr) return "0";
-
-    switch (expr->getType()) {
-        case ExprType::COLUMN_REF: {
-            const auto* col = static_cast<const ColumnRefExpr*>(expr);
-            std::string reg = ctx.col_to_reg.count(col->column_name) ? ctx.col_to_reg[col->column_name] : col->column_name;
-            std::string res = reg + "[i]";
-            if (cast_to_ull) return "(unsigned long long)" + res;
-            return res;
-        }
-        case ExprType::LITERAL_INT: {
-            const auto* lit = static_cast<const LiteralIntExpr*>(expr);
-            return std::to_string(lit->value);
-        }
-        case ExprType::LITERAL_FLOAT: {
-            const auto* lit = static_cast<const LiteralFloatExpr*>(expr);
-            return std::to_string(lit->value);
-        }
-        case ExprType::STAR:
-            return cast_to_ull ? "(unsigned long long)1" : "1";
-        case ExprType::OP_ADD:
-        case ExprType::OP_SUB:
-        case ExprType::OP_MUL:
-        case ExprType::OP_DIV: {
-            const auto* bin = static_cast<const BinaryExpr*>(expr);
-            std::string left = translateMathExprPush(bin->left.get(), ctx, cast_to_ull);
-            std::string right = translateMathExprPush(bin->right.get(), ctx, false);
-            std::string op;
-            switch (expr->getType()) {
-                case ExprType::OP_ADD: op = " + "; break;
-                case ExprType::OP_SUB: op = " - "; break;
-                case ExprType::OP_MUL: op = " * "; break;
-                case ExprType::OP_DIV: op = " / "; break;
-                default: break;
-            }
-            return "(" + left + op + right + ")";
-        }
-        case ExprType::OP_IS_NULL:
-        case ExprType::OP_IS_NOT_NULL: {
-            const auto* bin = static_cast<const BinaryExpr*>(expr);
-            const std::string valid = expressionValidExpr(bin->left.get(), ctx);
-            std::string res;
-            if (valid == "1" || valid == "true" || valid == "(1)" || valid == "(true)") {
-                res = (expr->getType() == ExprType::OP_IS_NULL) ? "0" : "1";
-            } else {
-                res = (expr->getType() == ExprType::OP_IS_NULL) ? "(!(" + valid + "))" : "(" + valid + ")";
-            }
-            if (cast_to_ull) return "(unsigned long long)" + res;
-            return res;
-        }
-        case ExprType::OP_EQ:
-        case ExprType::OP_NEQ:
-        case ExprType::OP_LT:
-        case ExprType::OP_LTE:
-        case ExprType::OP_GT:
-        case ExprType::OP_GTE:
-        case ExprType::OP_AND:
-        case ExprType::OP_OR:
-        case ExprType::OP_NOT:
-        case ExprType::CASE_WHEN: {
-            std::string res = expressionValueNoEmit(expr, ctx);
-            if (cast_to_ull) return "(unsigned long long)(" + res + ")";
-            return res;
-        }
-        default:
-            return "0";
-    }
-}
-
 static std::string resolveLoadedRegOrThrow(const std::string& col_name, const JITContext& ctx) {
     auto it = ctx.col_to_reg.find(col_name);
     if (it == ctx.col_to_reg.end() || it->second.empty()) {
@@ -2395,28 +2254,6 @@ static std::string resolveLoadedRegOrThrow(const std::string& col_name, const JI
             "Column '" + col_name + "' is not loaded into register before aggregate codegen");
     }
     return it->second;
-}
-
-static void caseIntegerRangeOrThrow(const ExprNode* expr,
-                                    int64_t& min_value,
-                                    int64_t& max_value,
-                                    bool& nullable) {
-    std::vector<int64_t> values;
-    bool may_be_null = false;
-    collectCaseIntegerOutputs(expr, values, may_be_null);
-    if (values.empty()) {
-        if (may_be_null) {
-            min_value = 0;
-            max_value = 0;
-            nullable = true;
-            return;
-        }
-        throw std::runtime_error("GROUP BY CASE has no integer output values");
-    }
-    const auto [lo, hi] = std::minmax_element(values.begin(), values.end());
-    min_value = *lo;
-    max_value = *hi;
-    nullable = may_be_null;
 }
 
 // ============================================================================
@@ -2458,15 +2295,10 @@ static std::pair<std::string, uint64_t> generatePerfectHash(
             valid_expr = (valid_it == ctx.col_to_valid_reg.end() || valid_it->second.empty()) ? "1" : (valid_it->second + "[i]");
             value_expr = reg_name + "[i]";
         } else if (group_by[i]->getType() == ExprType::CASE_WHEN) {
-            int64_t lo = 0;
-            int64_t hi = 0;
-            bool case_nullable = false;
-            caseIntegerRangeOrThrow(group_by[i].get(), lo, hi, case_nullable);
-            min_val = static_cast<uint64_t>(lo);
-            card = static_cast<uint64_t>(hi - lo + 1);
-            value_expr = expressionValueNoEmit(group_by[i].get(), ctx);
-            valid_expr = expressionValidExpr(group_by[i].get(), ctx);
-            nullable = case_nullable || !isLiteralTrue(valid_expr);
+            card = caseLeafCount(group_by[i].get());
+            value_expr = emitCaseGroupCode(group_by[i].get(), [&](const ColumnRefExpr& col) {
+                return ExpressionCode{expressionValueNoEmit(&col, ctx), expressionValidExpr(&col, ctx)};
+            },ctx.parameter_schema);
         } else {
             throw std::runtime_error(std::string("GROUP BY expression is not supported by perfect hash codegen: ") + exprTypeName(group_by[i]->getType()));
         }
@@ -2476,7 +2308,7 @@ static std::pair<std::string, uint64_t> generatePerfectHash(
             // SQL GROUP BY puts all NULL values of the same key into one group.
             // Reserve code 0 for NULL, shift non-NULL values by +1.
             term = "((" + valid_expr + ") ? (" + value_expr + " - " + std::to_string(min_val) + " + 1) : 0)";
-            card += 1;
+            card = checkedSizeAdd(card,1);
         } else {
             term = "(" + value_expr + " - " + std::to_string(min_val) + ")";
         }
@@ -2485,7 +2317,7 @@ static std::pair<std::string, uint64_t> generatePerfectHash(
         } else {
             hash_expr = "(" + hash_expr + " * " + std::to_string(card) + " + " + term + ")";
         }
-        total_size *= card;
+        total_size = checkedSizeMultiply(total_size, card);
     }
 
     if (!hash_expr.empty()) {
@@ -2577,7 +2409,8 @@ static bool expressionHasKnownNonZeroDomain(const ExprNode* expr, const Catalog&
     try {
         const auto& meta = catalog.getTableMetadata(getTableName(col->column_name));
         if (!meta.hasColumnStats(col->column_name)) return false;
-        return meta.getColumnStats(col->column_name).min_value_ != 0;
+        const auto& stats = meta.getColumnStats(col->column_name);
+        return stats.min_value_ > 0 || stats.max_value_ < 0;
     } catch (...) {
         return false;
     }
@@ -2595,16 +2428,44 @@ static bool aggregateFastSparseOutputEligible(const AggregateNode* node, const C
         if (expressionHasKnownNonZeroDomain(g.get(), catalog)) return true;
     }
     for (const auto& agg : node->aggregates) {
-        if (agg.isCount()) return true;
+        if (agg.isCount() && (agg.hasStarArgument() || !resultColumnNullableForExpr(agg.agg_expr.get(), catalog))) return true;
     }
     return false;
 }
 
-static std::string aggregateInputExpr(const AggregateDef& agg, JITContext& ctx, bool cast_to_ull) {
-    if (agg.isCount()) {
-        return cast_to_ull ? "(unsigned long long)1" : "1";
-    }
-    return translateMathExprPush(agg.agg_expr.get(), ctx, cast_to_ull);
+/** @brief Nullable keys and all-NULL aggregate inputs need presence independent of value/validity.
+ * @details Preserve the proven sparse/local optimizations when a nonnullable group
+ * key or COUNT(*) already witnesses a row. Otherwise use a runtime-owned marker.
+ */
+static void ensureAggregatePresence(const AggregateNode* node, JITContext& ctx, const Catalog& catalog, uint64_t groups) {
+    if (node->group_by_exprs.empty()) return;
+    for (const auto& group : node->group_by_exprs)
+        if (!resultColumnNullableForExpr(group.get(), catalog)) return;
+    for (const auto& aggregate : node->aggregates)
+        if (aggregate.isCount() && aggregate.hasStarArgument()) return;
+    if (ctx.emitted_auxiliary_kernels.insert("aggregate_presence").second)
+        ctx.physical.scratch(ctx.physical.plan.steps, "d_aggregate_presence", DB_TYPE_UINT64, groups, true);
+}
+
+/** @brief Neutral MIN/MAX states and a zero SUM do not prove presence of a SQL group. */
+static std::string aggregatePresentExpression(const AggregateNode* node, const Catalog& catalog, const std::string& base) {
+    std::string result = "false";
+    for (size_t slot = 0; slot < node->visibleTupleSize(); ++slot)
+        result += " || db::bitmap_valid_at(d_result_validity," + base + "+" + std::to_string(slot) + ")";
+    for (size_t slot = 0; slot < node->group_by_exprs.size(); ++slot)
+        if (expressionHasKnownNonZeroDomain(node->group_by_exprs[slot].get(), catalog))
+            result += " || d_result[" + base + "+" + std::to_string(slot) + "]!=0ULL";
+    for (size_t a = 0; a < node->aggregates.size(); ++a)
+        if (node->aggregates[a].isCount())
+            result += " || d_result[" + base + "+" + std::to_string(node->group_by_exprs.size() + a) + "]!=0ULL";
+    return "(" + result + ")";
+}
+
+static std::string aggregateInputExpr(const AggregateDef& agg, JITContext& ctx) {
+    if (agg.isCount()) return "1";
+    return emitSqlExpression(agg.agg_expr.get(), [&](const ColumnRefExpr& column) {
+        return ExpressionCode{expressionValueNoEmit(&column, ctx), expressionValidExpr(&column, ctx)};
+    }, ctx.parameter_schema).value;
 }
 
 static bool isAggregateResultSlotRef(const ExprNode* expr, int& slot) {
@@ -2628,16 +2489,16 @@ static bool isAggregateResultSlotRef(const ExprNode* expr, int& slot) {
 static std::string aggregateTupleExprValue(const ExprNode* expr,
                                            const AggregateNode* node,
                                            const Catalog& catalog,
-                                           const std::string& base_expr);
+                                           const std::string& base_expr, const ParameterSchema& schema);
 static std::string aggregateTupleExprValid(const ExprNode* expr,
                                            const AggregateNode* node,
                                            const Catalog& catalog,
-                                           const std::string& base_expr);
+                                           const std::string& base_expr, const ParameterSchema& schema);
 
 static std::string aggregateTupleSlotValue(int slot,
                                            const AggregateNode* node,
-                                           const std::string& base_expr) {
-    const LogicalType type = resultLogicalTypeForAggregateOutput(node, slot);
+                                           const std::string& base_expr, const ParameterSchema& schema) {
+    const LogicalType type = resultLogicalTypeForAggregateOutput(node, slot, schema);
     const std::string raw = "d_result[" + base_expr + " + " + std::to_string(slot) + "]";
     if (type == LogicalType::Float64) return "db::bit_cast_ull_to_double(" + raw + ")";
     if (type == LogicalType::Int64) return "static_cast<std::int64_t>(" + raw + ")";
@@ -2647,14 +2508,17 @@ static std::string aggregateTupleSlotValue(int slot,
 static std::string aggregateTupleExprValue(const ExprNode* expr,
                                            const AggregateNode* node,
                                            const Catalog& catalog,
-                                           const std::string& base_expr) {
+                                           const std::string& base_expr, const ParameterSchema& schema) {
     (void)catalog;
     if (!expr) return "0";
     int slot = -1;
     if (isAggregateResultSlotRef(expr, slot)) {
-        return aggregateTupleSlotValue(slot, node, base_expr);
+        return aggregateTupleSlotValue(slot, node, base_expr, schema);
     }
     switch (expr->getType()) {
+        case ExprType::LITERAL_TEXT: throw std::runtime_error("Text literals require parameter extraction and the Text planner");
+        case ExprType::PARAMETER_REF:
+            return parameterName(static_cast<const ParameterRefExpr*>(expr)->slot);
         case ExprType::LITERAL_INT:
             return std::to_string(static_cast<const LiteralIntExpr*>(expr)->value);
         case ExprType::LITERAL_FLOAT:
@@ -2668,8 +2532,8 @@ static std::string aggregateTupleExprValue(const ExprNode* expr,
         case ExprType::OP_MUL:
         case ExprType::OP_DIV: {
             const auto* b = static_cast<const BinaryExpr*>(expr);
-            const std::string l = aggregateTupleExprValue(b->left.get(), node, catalog, base_expr);
-            const std::string r = aggregateTupleExprValue(b->right.get(), node, catalog, base_expr);
+            const std::string l = aggregateTupleExprValue(b->left.get(), node, catalog, base_expr, schema);
+            const std::string r = aggregateTupleExprValue(b->right.get(), node, catalog, base_expr, schema);
             switch (expr->getType()) {
                 case ExprType::OP_ADD: return "db::safe_add(" + l + ", " + r + ")";
                 case ExprType::OP_SUB: return "db::safe_sub(" + l + ", " + r + ")";
@@ -2686,8 +2550,8 @@ static std::string aggregateTupleExprValue(const ExprNode* expr,
         case ExprType::OP_GT:
         case ExprType::OP_GTE: {
             const auto* b = static_cast<const BinaryExpr*>(expr);
-            const std::string l = aggregateTupleExprValue(b->left.get(), node, catalog, base_expr);
-            const std::string r = aggregateTupleExprValue(b->right.get(), node, catalog, base_expr);
+            const std::string l = aggregateTupleExprValue(b->left.get(), node, catalog, base_expr, schema);
+            const std::string r = aggregateTupleExprValue(b->right.get(), node, catalog, base_expr, schema);
             switch (expr->getType()) {
                 case ExprType::OP_EQ:  return "db::safe_eq(" + l + ", " + r + ")";
                 case ExprType::OP_NEQ: return "db::safe_neq(" + l + ", " + r + ")";
@@ -2702,33 +2566,37 @@ static std::string aggregateTupleExprValue(const ExprNode* expr,
         case ExprType::OP_IS_NULL:
         case ExprType::OP_IS_NOT_NULL: {
             const auto* b = static_cast<const BinaryExpr*>(expr);
-            const std::string valid = aggregateTupleExprValid(b->left.get(), node, catalog, base_expr);
+            const std::string valid = aggregateTupleExprValid(b->left.get(), node, catalog, base_expr, schema);
             if (isLiteralTrue(valid)) return expr->getType() == ExprType::OP_IS_NULL ? "0" : "1";
             if (isLiteralFalse(valid)) return expr->getType() == ExprType::OP_IS_NULL ? "1" : "0";
             return expr->getType() == ExprType::OP_IS_NULL ? "(!(" + valid + "))" : "(" + valid + ")";
         }
         case ExprType::OP_NOT: {
             const auto* b = static_cast<const BinaryExpr*>(expr);
-            return booleanNotValue(aggregateTupleExprValue(b->left.get(), node, catalog, base_expr));
+            return booleanNotValue(aggregateTupleExprValue(b->left.get(), node, catalog, base_expr, schema));
         }
         case ExprType::OP_AND: {
             const auto* b = static_cast<const BinaryExpr*>(expr);
-            return booleanAndValue(aggregateTupleExprValue(b->left.get(), node, catalog, base_expr),
-                                   aggregateTupleExprValue(b->right.get(), node, catalog, base_expr));
+            return booleanAndValue(aggregateTupleExprValue(b->left.get(), node, catalog, base_expr, schema),
+                                   aggregateTupleExprValue(b->right.get(), node, catalog, base_expr, schema));
         }
         case ExprType::OP_OR: {
             const auto* b = static_cast<const BinaryExpr*>(expr);
-            return booleanOrValue(aggregateTupleExprValue(b->left.get(), node, catalog, base_expr),
-                                  aggregateTupleExprValue(b->right.get(), node, catalog, base_expr));
+            return booleanOrValue(aggregateTupleExprValue(b->left.get(), node, catalog, base_expr, schema),
+                                  aggregateTupleExprValue(b->right.get(), node, catalog, base_expr, schema));
         }
         case ExprType::CASE_WHEN: {
             const auto* c = static_cast<const CaseWhenExpr*>(expr);
-            const std::string cv = aggregateTupleExprValid(c->condition.get(), node, catalog, base_expr);
-            const std::string cond = aggregateTupleExprValue(c->condition.get(), node, catalog, base_expr);
+            const std::string cv = aggregateTupleExprValid(c->condition.get(), node, catalog, base_expr, schema);
+            const std::string cond = aggregateTupleExprValue(c->condition.get(), node, catalog, base_expr, schema);
             const std::string selected = isLiteralTrue(cv) ? "(" + cond + ")" : "((" + cv + ") && (" + cond + "))";
-            const std::string then_v = aggregateTupleExprValue(c->then_expr.get(), node, catalog, base_expr);
-            const std::string else_v = c->else_expr ? aggregateTupleExprValue(c->else_expr.get(), node, catalog, base_expr) : "0";
-            return "((" + selected + ") ? (" + then_v + ") : (" + else_v + "))";
+            const std::string then_v = aggregateTupleExprValue(c->then_expr.get(), node, catalog, base_expr, schema);
+            const std::string else_v = c->else_expr ? aggregateTupleExprValue(c->else_expr.get(), node, catalog, base_expr, schema) : "0";
+            return emitCaseValue(expr, selected, then_v, else_v, schema, [&](const ColumnRefExpr& column) {
+                int result_slot = -1;
+                if (!isAggregateResultSlotRef(&column, result_slot)) throw std::runtime_error("Unresolved HAVING CASE reference");
+                return resultLogicalTypeForAggregateOutput(node, result_slot, schema) == LogicalType::Float64 ? ParameterType::Float64 : ParameterType::Int64;
+            });
         }
         case ExprType::COLUMN_REF:
             throw std::runtime_error("HAVING codegen received non-result ColumnRef");
@@ -2739,19 +2607,24 @@ static std::string aggregateTupleExprValue(const ExprNode* expr,
 static std::string aggregateTupleExprValid(const ExprNode* expr,
                                            const AggregateNode* node,
                                            const Catalog& catalog,
-                                           const std::string& base_expr) {
+                                           const std::string& base_expr, const ParameterSchema& schema) {
     if (!expr) return "1";
     int slot = -1;
     if (isAggregateResultSlotRef(expr, slot)) {
         (void)catalog;
+        const auto groups = node->group_by_exprs.size();
+        if (static_cast<size_t>(slot) >= groups && node->aggregates.at(static_cast<size_t>(slot) - groups).isCount()) return "1";
         return "db::bitmap_valid_at(d_result_validity, " + base_expr + " + " + std::to_string(slot) + ")";
     }
     switch (expr->getType()) {
+        case ExprType::PARAMETER_REF:
+            return parameterName(static_cast<const ParameterRefExpr*>(expr)->slot) + "_valid";
         case ExprType::LITERAL_NULL:
             return "0";
         case ExprType::STAR:
         case ExprType::LITERAL_INT:
         case ExprType::LITERAL_FLOAT:
+        case ExprType::LITERAL_TEXT:
         case ExprType::OP_IS_NULL:
         case ExprType::OP_IS_NOT_NULL:
             return "1";
@@ -2766,40 +2639,40 @@ static std::string aggregateTupleExprValid(const ExprNode* expr,
         case ExprType::OP_GT:
         case ExprType::OP_GTE: {
             const auto* b = static_cast<const BinaryExpr*>(expr);
-            return combineAndTerms({aggregateTupleExprValid(b->left.get(), node, catalog, base_expr),
-                                    aggregateTupleExprValid(b->right.get(), node, catalog, base_expr)});
+            return combineAndTerms({aggregateTupleExprValid(b->left.get(), node, catalog, base_expr, schema),
+                                    aggregateTupleExprValid(b->right.get(), node, catalog, base_expr, schema)});
         }
         case ExprType::OP_NOT: {
             const auto* b = static_cast<const BinaryExpr*>(expr);
-            return aggregateTupleExprValid(b->left.get(), node, catalog, base_expr);
+            return aggregateTupleExprValid(b->left.get(), node, catalog, base_expr, schema);
         }
         case ExprType::OP_AND: {
             const auto* b = static_cast<const BinaryExpr*>(expr);
-            const std::string lv = aggregateTupleExprValid(b->left.get(), node, catalog, base_expr);
-            const std::string rv = aggregateTupleExprValid(b->right.get(), node, catalog, base_expr);
-            const std::string lval = aggregateTupleExprValue(b->left.get(), node, catalog, base_expr);
-            const std::string rval = aggregateTupleExprValue(b->right.get(), node, catalog, base_expr);
+            const std::string lv = aggregateTupleExprValid(b->left.get(), node, catalog, base_expr, schema);
+            const std::string rv = aggregateTupleExprValid(b->right.get(), node, catalog, base_expr, schema);
+            const std::string lval = aggregateTupleExprValue(b->left.get(), node, catalog, base_expr, schema);
+            const std::string rval = aggregateTupleExprValue(b->right.get(), node, catalog, base_expr, schema);
             return booleanOrValue(booleanOrValue(combineAndTerms({lv, booleanNotValue(lval)}),
                                                 combineAndTerms({rv, booleanNotValue(rval)})),
                                   combineAndTerms({lv, rv}));
         }
         case ExprType::OP_OR: {
             const auto* b = static_cast<const BinaryExpr*>(expr);
-            const std::string lv = aggregateTupleExprValid(b->left.get(), node, catalog, base_expr);
-            const std::string rv = aggregateTupleExprValid(b->right.get(), node, catalog, base_expr);
-            const std::string lval = aggregateTupleExprValue(b->left.get(), node, catalog, base_expr);
-            const std::string rval = aggregateTupleExprValue(b->right.get(), node, catalog, base_expr);
+            const std::string lv = aggregateTupleExprValid(b->left.get(), node, catalog, base_expr, schema);
+            const std::string rv = aggregateTupleExprValid(b->right.get(), node, catalog, base_expr, schema);
+            const std::string lval = aggregateTupleExprValue(b->left.get(), node, catalog, base_expr, schema);
+            const std::string rval = aggregateTupleExprValue(b->right.get(), node, catalog, base_expr, schema);
             return booleanOrValue(booleanOrValue(combineAndTerms({lv, lval}),
                                                 combineAndTerms({rv, rval})),
                                   combineAndTerms({lv, rv}));
         }
         case ExprType::CASE_WHEN: {
             const auto* c = static_cast<const CaseWhenExpr*>(expr);
-            const std::string cv = aggregateTupleExprValid(c->condition.get(), node, catalog, base_expr);
-            const std::string cond = aggregateTupleExprValue(c->condition.get(), node, catalog, base_expr);
+            const std::string cv = aggregateTupleExprValid(c->condition.get(), node, catalog, base_expr, schema);
+            const std::string cond = aggregateTupleExprValue(c->condition.get(), node, catalog, base_expr, schema);
             const std::string selected = isLiteralTrue(cv) ? "(" + cond + ")" : "((" + cv + ") && (" + cond + "))";
-            const std::string then_valid = aggregateTupleExprValid(c->then_expr.get(), node, catalog, base_expr);
-            const std::string else_valid = c->else_expr ? aggregateTupleExprValid(c->else_expr.get(), node, catalog, base_expr) : "0";
+            const std::string then_valid = aggregateTupleExprValid(c->then_expr.get(), node, catalog, base_expr, schema);
+            const std::string else_valid = c->else_expr ? aggregateTupleExprValid(c->else_expr.get(), node, catalog, base_expr, schema) : "0";
             return "(((" + selected + ") && (" + then_valid + ")) || (!(" + selected + ") && (" + else_valid + ")))";
         }
         case ExprType::COLUMN_REF:
@@ -2809,11 +2682,11 @@ static std::string aggregateTupleExprValid(const ExprNode* expr,
 }
 
 static std::string aggregateHavingPassExpr(const AggregateNode* node,
-                                           const Catalog& catalog,
-                                           const std::string& base_expr) {
+                                          const Catalog& catalog,
+                                          const std::string& base_expr, const ParameterSchema& schema) {
     if (!node || !node->having_predicate) return "true";
-    const std::string valid = aggregateTupleExprValid(node->having_predicate.get(), node, catalog, base_expr);
-    const std::string value = aggregateTupleExprValue(node->having_predicate.get(), node, catalog, base_expr);
+    const std::string valid = aggregateTupleExprValid(node->having_predicate.get(), node, catalog, base_expr, schema);
+    const std::string value = aggregateTupleExprValue(node->having_predicate.get(), node, catalog, base_expr, schema);
     if (isLiteralTrue(valid)) return "(" + value + ")";
     if (isLiteralFalse(valid)) return "false";
     return "((" + valid + ") && (" + value + "))";
@@ -2846,30 +2719,22 @@ static void emitAggregateInitializationIfNeeded(const AggregateNode* node,
                                                 uint64_t group_count,
                                                 int visible_ts,
                                                 int storage_ts) {
-    bool has_min = false;
-    for (const auto& agg : node->aggregates) has_min = has_min || agg.isMin();
-    if (!has_min) return;
+    bool needs_identity = false;
+    for (const auto& agg : node->aggregates) needs_identity = needs_identity || agg.isMin() || agg.isMax();
+    if (!needs_identity) return;
 
     const std::string kernel_name = "init_aggregate_slots";
     if (!ctx.emitted_auxiliary_kernels.insert(kernel_name).second) return;
-    if (std::find(ctx.kernel_class_names.begin(), ctx.kernel_class_names.end(), kernel_name) == ctx.kernel_class_names.end()) {
-        ctx.kernel_class_names.push_back(kernel_name);
-    }
 
-    auto& out = ctx.current_pipeline->includes_and_globals;
-    out << "    q.submit([&](sycl::handler& h) {\n";
-    out << "        h.parallel_for<class " << kernel_name << ">(sycl::range<1>(" << group_count
-        << "), [=](sycl::id<1> gid) {\n";
+    std::stringstream out;
     out << "            unsigned long long base = (unsigned long long)gid[0] * " << storage_ts << ";\n";
     int slot = (int)node->group_by_exprs.size();
     for (const auto& agg : node->aggregates) {
-        if (agg.isMin()) {
-            out << "            d_result[base + " << slot << "] = ~0ULL;\n";
-        }
+        if (agg.isMin() || agg.isMax())
+            out << "d_result[base + " << slot << "] = db::aggregateBits(" << AggregateCode(agg, ctx.parameter_schema).identity() << ");\n";
         ++slot;
     }
-    out << "        });\n";
-    out << "    });\n\n";
+    ctx.physical.range(ctx.physical.plan.steps, kernel_name, out.str(), group_count);
 }
 
 static void emitAggregateFinalizationIfNeeded(const AggregateNode* node,
@@ -2883,20 +2748,13 @@ static void emitAggregateFinalizationIfNeeded(const AggregateNode* node,
 
     const std::string kernel_name = "finalize_aggregate_slots";
     if (!ctx.emitted_auxiliary_kernels.insert(kernel_name).second) return;
-    if (std::find(ctx.kernel_class_names.begin(), ctx.kernel_class_names.end(), kernel_name) == ctx.kernel_class_names.end()) {
-        ctx.kernel_class_names.push_back(kernel_name);
-    }
 
-    const uint64_t visible_size = (uint64_t)group_count * (uint64_t)visible_ts;
-    const uint64_t visible_words = (visible_size + 63ULL) / 64ULL;
-    auto& out = ctx.post_execution_code;
-    out << "    unsigned long long* d_visible_result = sycl::malloc_device<unsigned long long>(" << visible_size << ", q);\n";
-    out << "    uint64_t* d_visible_validity = sycl::malloc_device<uint64_t>(" << (visible_words == 0 ? 1 : visible_words) << ", q);\n";
-    out << "    q.memset(d_visible_result, 0, " << visible_size << " * sizeof(unsigned long long));\n";
-    out << "    q.memset(d_visible_validity, 0, " << (visible_words == 0 ? 1 : visible_words) << " * sizeof(uint64_t));\n";
-    out << "    q.submit([&](sycl::handler& h) {\n";
-    out << "        h.parallel_for<class " << kernel_name << ">(sycl::range<1>(" << group_count
-        << "), [=](sycl::id<1> gid) {\n";
+    const uint64_t visible_size = checkedSizeMultiply(group_count, static_cast<uint64_t>(visible_ts));
+    const uint64_t visible_words = visible_size / 64 + (visible_size % 64 != 0);
+    auto& steps = ctx.physical.post;
+    ctx.physical.scratch(steps, "d_visible_result", DB_TYPE_UINT64, visible_size, true);
+    ctx.physical.scratch(steps, "d_visible_validity", DB_TYPE_UINT64, maximum(visible_words, 1), true, "std::uint64_t");
+    std::stringstream out;
     out << "            unsigned long long g = (unsigned long long)gid[0];\n";
     out << "            unsigned long long src = g * " << storage_ts << ";\n";
     out << "            unsigned long long dst = g * " << visible_ts << ";\n";
@@ -2924,35 +2782,26 @@ static void emitAggregateFinalizationIfNeeded(const AggregateNode* node,
                 out << "            unsigned long long cnt_" << slot << " = d_result[src + " << cnt_slot << "];\n";
                 out << "            if (cnt_" << slot << " != 0ULL) {\n";
                 if (agg.isAvg()) {
-                    out << "                double avg_value_" << slot << " = static_cast<double>(d_result[src + " << slot << "]) / static_cast<double>(cnt_" << slot << ");\n";
+                    out << "                double avg_value_" << slot << " = static_cast<double>("
+                        << AggregateCode(agg, ctx.parameter_schema).read("d_result[src + " + std::to_string(slot) + "]")
+                        << ") / static_cast<double>(cnt_" << slot << ");\n";
                     out << "                d_visible_result[dst + " << slot << "] = db::bit_cast_double_to_ull(avg_value_" << slot << ");\n";
-                } else if (agg.isMin()) {
-                    out << "                d_visible_result[dst + " << slot << "] = (d_result[src + " << slot << "] == ~0ULL) ? 0ULL : d_result[src + " << slot << "];\n";
                 } else {
                     out << "                d_visible_result[dst + " << slot << "] = d_result[src + " << slot << "];\n";
                 }
                 out << "                db::atomic_set_valid_bit(d_visible_validity, dst + " << slot << ");\n";
                 out << "            }\n";
             } else {
-                if (agg.isMin()) {
-                    out << "            d_visible_result[dst + " << slot << "] = (d_result[src + " << slot << "] == ~0ULL) ? 0ULL : d_result[src + " << slot << "];\n";
-                } else {
-                    out << "            d_visible_result[dst + " << slot << "] = d_result[src + " << slot << "];\n";
-                }
+                out << "            d_visible_result[dst + " << slot << "] = d_result[src + " << slot << "];\n";
                 out << "            if (db::bitmap_valid_at(d_result_validity, src + " << slot << ")) db::atomic_set_valid_bit(d_visible_validity, dst + " << slot << ");\n";
             }
         }
         ++slot;
     }
-    out << "        });\n";
-    out << "    });\n";
-    out << "    q.memcpy(d_result, d_visible_result, " << visible_size << " * sizeof(unsigned long long));\n";
-    out << "    q.memcpy(d_result_validity, d_visible_validity, " << (visible_words == 0 ? 1 : visible_words) << " * sizeof(uint64_t));\n";
-    out << "    q.wait();\n";
-    out << "    sycl::free(d_visible_result, q);\n";
-    out << "    sycl::free(d_visible_validity, q);\n";
-    out << "    ctx->expected_result_size_ = " << visible_size << ";\n";
-    out << "    ctx->expected_result_validity_words_ = " << (visible_words == 0 ? 1 : visible_words) << ";\n\n";
+    ctx.physical.range(steps, kernel_name, out.str(), group_count);
+    steps.emplace_back(CopyBuffer{"d_result", "d_visible_result", 0, 0, visible_size});
+    steps.emplace_back(CopyBuffer{"d_result_validity", "d_visible_validity", 0, 0, maximum(visible_words, 1)});
+    steps.emplace_back(PublishResult{0, visible_size, false, visible_words});
 }
 
 
@@ -2966,87 +2815,46 @@ static void emitAggregateDenseColumnarMaterialization(const AggregateNode* node,
     const std::string write_kernel = "AggregateDenseWrite";
     const std::string marker = "aggregate_dense_columnar_materialization";
     if (!ctx.emitted_auxiliary_kernels.insert(marker).second) return;
-    for (const auto& k : {count_kernel, write_kernel}) {
-        if (std::find(ctx.kernel_class_names.begin(), ctx.kernel_class_names.end(), k) == ctx.kernel_class_names.end()) {
-            ctx.kernel_class_names.push_back(k);
-        }
-    }
 
-    auto& out = ctx.post_execution_code;
-    out << "    {\n";
-    out << "        const unsigned long long aggregate_group_count = " << group_count << "ULL;\n";
-    out << "        const unsigned long long aggregate_tuple_size = " << visible_ts << "ULL;\n";
-    out << "        unsigned long long* d_aggregate_counts = sycl::malloc_device<unsigned long long>(aggregate_group_count == 0ULL ? 1ULL : aggregate_group_count, q);\n";
-    out << "        unsigned long long* d_aggregate_offsets = sycl::malloc_device<unsigned long long>(aggregate_group_count == 0ULL ? 1ULL : aggregate_group_count, q);\n";
-    out << "        q.memset(d_aggregate_counts, 0, (aggregate_group_count == 0ULL ? 1ULL : aggregate_group_count) * sizeof(unsigned long long));\n";
-    out << "        q.memset(d_aggregate_offsets, 0, (aggregate_group_count == 0ULL ? 1ULL : aggregate_group_count) * sizeof(unsigned long long));\n";
-    out << "        q.submit([&](sycl::handler& h) {\n";
-    out << "            h.parallel_for<class " << count_kernel << ">(sycl::range<1>(aggregate_group_count == 0ULL ? 1ULL : aggregate_group_count), [=](sycl::id<1> gid) {\n";
+    auto& steps = ctx.physical.post;
+    steps.emplace_back(SetScalar{"aggregate_group_count", group_count});
+    steps.emplace_back(SetScalar{"aggregate_tuple_size", static_cast<uint64_t>(visible_ts)});
+    ctx.physical.scratch(steps, "d_aggregate_counts", DB_TYPE_UINT64, maximum(group_count, 1), true);
+    ctx.physical.scratch(steps, "d_aggregate_offsets", DB_TYPE_UINT64, maximum(group_count, 1), true);
+    std::stringstream out;
     out << "                unsigned long long g = static_cast<unsigned long long>(gid[0]);\n";
     out << "                if (g >= aggregate_group_count) return;\n";
     out << "                bool present = false;\n";
     out << "                unsigned long long base = g * aggregate_tuple_size;\n";
-    if (node->group_by_exprs.empty()) {
+    if (ctx.emitted_auxiliary_kernels.count("aggregate_presence")) {
+        out << "                present = d_aggregate_presence[g] != 0ULL;\n";
+    } else if (node->group_by_exprs.empty()) {
         out << "                present = true;\n";
     } else {
-        out << "                for (unsigned long long c = 0; c < aggregate_tuple_size; ++c) {\n";
-        out << "                    if (db::bitmap_valid_at(d_result_validity, base + c) || d_result[base + c] != 0ULL) { present = true; break; }\n";
-        out << "                }\n";
+        out << "present = " << aggregatePresentExpression(node, catalog, "base") << ";\n";
     }
-    const std::string having_pass = aggregateHavingPassExpr(node, catalog, "base");
+    const std::string having_pass = aggregateHavingPassExpr(node, catalog, "base", ctx.parameter_schema);
     if (having_pass == "true" || having_pass == "(true)" || having_pass == "1" || having_pass == "(1)") {
         out << "                d_aggregate_counts[g] = present ? 1ULL : 0ULL;\n";
     } else {
         out << "                bool having_pass = " << having_pass << ";\n";
         out << "                d_aggregate_counts[g] = (present && having_pass) ? 1ULL : 0ULL;\n";
     }
-    out << "            });\n";
-    out << "        });\n";
-    out << "        std::vector<unsigned long long> h_aggregate_counts(static_cast<std::size_t>(aggregate_group_count == 0ULL ? 1ULL : aggregate_group_count), 0ULL);\n";
-    out << "        std::vector<unsigned long long> h_aggregate_offsets(static_cast<std::size_t>(aggregate_group_count == 0ULL ? 1ULL : aggregate_group_count), 0ULL);\n";
-    out << "        if (aggregate_group_count != 0ULL) {\n";
-    out << "            q.memcpy(h_aggregate_counts.data(), d_aggregate_counts, static_cast<std::size_t>(aggregate_group_count) * sizeof(unsigned long long)).wait();\n";
-    out << "        }\n";
-    out << "        unsigned long long aggregate_row_count = 0ULL;\n";
-    out << "        for (unsigned long long g = 0; g < aggregate_group_count; ++g) {\n";
-    out << "            h_aggregate_offsets[static_cast<std::size_t>(g)] = aggregate_row_count;\n";
-    out << "            aggregate_row_count += h_aggregate_counts[static_cast<std::size_t>(g)];\n";
-    out << "        }\n";
-    out << "        if (aggregate_group_count != 0ULL) {\n";
-    out << "            q.memcpy(d_aggregate_offsets, h_aggregate_offsets.data(), static_cast<std::size_t>(aggregate_group_count) * sizeof(unsigned long long)).wait();\n";
-    out << "        }\n";
-    out << "        if (aggregate_row_count != 0ULL && aggregate_row_count > static_cast<unsigned long long>(std::numeric_limits<std::size_t>::max() / aggregate_tuple_size)) {\n";
-    out << "            throw std::overflow_error(\"Aggregate dense result size overflow\");\n";
-    out << "        }\n";
-    out << "        const std::size_t aggregate_result_values = static_cast<std::size_t>(aggregate_row_count * aggregate_tuple_size);\n";
-    out << "        const std::size_t aggregate_result_bytes = aggregate_result_values * sizeof(unsigned long long);\n";
-    out << "        const std::size_t aggregate_validity_bytes = static_cast<std::size_t>(aggregate_tuple_size) * (((static_cast<std::size_t>(aggregate_row_count) + 63ULL) / 64ULL) == 0 ? 1ULL : ((static_cast<std::size_t>(aggregate_row_count) + 63ULL) / 64ULL)) * sizeof(uint64_t);\n";
-    out << "        const std::size_t aggregate_temp_bytes = static_cast<std::size_t>(aggregate_group_count == 0ULL ? 1ULL : aggregate_group_count) * 2ULL * sizeof(unsigned long long);\n";
-    out << "        const std::size_t aggregate_total_mem = static_cast<std::size_t>(q.get_device().get_info<sycl::info::device::global_mem_size>());\n";
-    out << "        const std::size_t aggregate_reserve_fraction = static_cast<std::size_t>(static_cast<double>(aggregate_total_mem) * ctx->config_.memory_guard_reserve_fraction);\n";
-    out << "        const std::size_t aggregate_reserve = aggregate_reserve_fraction > ctx->config_.memory_guard_reserve_bytes ? aggregate_reserve_fraction : ctx->config_.memory_guard_reserve_bytes;\n";
-    out << "        const std::size_t aggregate_budget = aggregate_total_mem > aggregate_reserve ? aggregate_total_mem - aggregate_reserve : aggregate_total_mem / 2ULL;\n";
-    out << "        const std::size_t aggregate_required = ctx->loaded_device_bytes_ + aggregate_temp_bytes + aggregate_result_bytes + aggregate_validity_bytes;\n";
-    out << "        if (ctx->config_.memory_guard_enabled && aggregate_required > aggregate_budget) {\n";
-    out << "            throw std::runtime_error(\"Insufficient GPU memory after aggregate count: exact dense aggregate result does not fit device memory\");\n";
-    out << "        }\n";
-    out << "        ctx->result_row_count_ = static_cast<std::size_t>(aggregate_row_count);\n";
-    out << "        ctx->result_is_dense_ = true;\n";
-    out << "        ctx->expected_result_size_ = aggregate_result_values == 0 ? aggregate_tuple_size : aggregate_result_values;\n";
-    out << "        ctx->ensureColumnarResultCapacity(static_cast<std::size_t>(aggregate_tuple_size), static_cast<std::size_t>(aggregate_row_count));\n";
+    ctx.physical.range(steps, count_kernel, out.str(), group_count, {"aggregate_group_count", "aggregate_tuple_size"});
+    steps.emplace_back(DevicePrefix{"d_aggregate_counts", "d_aggregate_offsets", group_count, "aggregate_row_count"});
+    std::vector<uint32_t> types;
     for (int c = 0; c < visible_ts; ++c) {
-        const LogicalType type = resultLogicalTypeForAggregateOutput(node, c);
-        out << "        " << resultColumnPointerType(type) << " d_result_col_" << c << " = ctx->" << resultColumnGetter(type) << "(" << c << ");\n";
-        out << "        uint64_t* d_result_validity_col_" << c << " = ctx->getResultColumnValidityPointer(" << c << ");\n";
+        types.push_back(kernelStorageType(resultLogicalTypeForAggregateOutput(node, c, ctx.parameter_schema)));
     }
-    out << "        q.submit([&](sycl::handler& h) {\n";
-    out << "            h.parallel_for<class " << write_kernel << ">(sycl::range<1>(aggregate_group_count == 0ULL ? 1ULL : aggregate_group_count), [=](sycl::id<1> gid) {\n";
+    ctx.physical.columns(steps, types, variable("aggregate_row_count"));
+    steps.emplace_back(PublishResult{variable("aggregate_row_count"), maximum(variable("aggregate_row_count"), 1) * static_cast<uint64_t>(visible_ts), true, 0});
+    out.str("");
     out << "                unsigned long long g = static_cast<unsigned long long>(gid[0]);\n";
     out << "                if (g >= aggregate_group_count || d_aggregate_counts[g] == 0ULL) return;\n";
     out << "                unsigned long long out_row = d_aggregate_offsets[g];\n";
     out << "                unsigned long long src = g * aggregate_tuple_size;\n";
     for (int c = 0; c < visible_ts; ++c) {
-        const LogicalType type = resultLogicalTypeForAggregateOutput(node, c);
+        const LogicalType type = resultLogicalTypeForAggregateOutput(node, c, ctx.parameter_schema);
         std::string value_expr = "d_result[src + " + std::to_string(c) + "]";
         if (type == LogicalType::Float64) {
             value_expr = "db::bit_cast_ull_to_double(" + value_expr + ")";
@@ -3058,12 +2866,7 @@ static void emitAggregateDenseColumnarMaterialization(const AggregateNode* node,
             out << "                if (db::bitmap_valid_at(d_result_validity, src + " << c << ")) db::atomic_set_valid_bit(d_result_validity_col_" << c << ", out_row);\n";
         }
     }
-    out << "            });\n";
-    out << "        });\n";
-    out << "        q.wait();\n";
-    out << "        sycl::free(d_aggregate_counts, q);\n";
-    out << "        sycl::free(d_aggregate_offsets, q);\n";
-    out << "    }\n\n";
+    ctx.physical.range(steps, write_kernel, out.str(), group_count, {"aggregate_group_count", "aggregate_tuple_size"});
 }
 
 
@@ -3093,6 +2896,7 @@ static std::string aggregateSparseSlotValueExpr(int col,
 static void emitAggregateSparseRightBeforeLeftComparison(std::stringstream& out,
                                                          const AggregateNode* node,
                                                          const Catalog& catalog,
+                                                         const ParameterSchema& schema,
                                                          const std::vector<SortKeyDef>& sort_keys,
                                                          const std::string& left_base,
                                                          const std::string& right_base,
@@ -3106,7 +2910,7 @@ static void emitAggregateSparseRightBeforeLeftComparison(std::stringstream& out,
     for (std::size_t k = 0; k < sort_keys.size(); ++k) {
         const auto& key = sort_keys[k];
         const int col = static_cast<int>(key.column_index);
-        const LogicalType type = resultLogicalTypeForAggregateOutput(node, col);
+        const LogicalType type = resultLogicalTypeForAggregateOutput(node, col, schema);
         const bool is_nullable = resultColumnNullableForAggregateOutput(node, col, catalog);
         if (is_nullable) {
             out << indent << "    if (!sort_decided) {\n";
@@ -3152,51 +2956,38 @@ static void emitAggregateSmallFusedColumnarMaterialization(const AggregateNode* 
     const std::string kernel = "AggregateSmallFusedMaterialize";
     const std::string marker = "aggregate_small_fused_columnar_materialization";
     if (!ctx.emitted_auxiliary_kernels.insert(marker).second) return;
-    if (std::find(ctx.kernel_class_names.begin(), ctx.kernel_class_names.end(), kernel) == ctx.kernel_class_names.end()) {
-        ctx.kernel_class_names.push_back(kernel);
-    }
     if (sort_node) ctx.sort_limit_post_execution_fused = true;
 
-    const uint64_t max_rows_no_limit = group_count;
-    uint64_t max_output_rows = max_rows_no_limit;
-    if (sort_node && sort_node->has_limit && sort_node->limit < max_output_rows) {
-        max_output_rows = sort_node->limit;
-    }
+    const SizeExpr max_output_rows = sort_node && sort_node->hasLimit() ? minimum(group_count, limitSize(sort_node)) : SizeExpr(group_count);
     const uint64_t index_array_size = group_count == 0ULL ? 1ULL : group_count;
     const bool has_sort = sort_node && !sort_node->sort_keys.empty();
-    const bool has_limit = sort_node && sort_node->has_limit;
-    const uint64_t limit_value = has_limit ? sort_node->limit : max_output_rows;
+    const bool has_limit = sort_node && sort_node->hasLimit();
 
-    auto& out = ctx.post_execution_code;
-    out << "    {\n";
-    out << "        const unsigned long long aggregate_group_count = " << group_count << "ULL;\n";
-    out << "        const unsigned long long aggregate_visible_tuple_size = " << visible_ts << "ULL;\n";
-    out << "        const unsigned long long aggregate_storage_tuple_size = " << storage_ts << "ULL;\n";
-    out << "        const std::size_t aggregate_max_output_rows = static_cast<std::size_t>(" << max_output_rows << "ULL);\n";
-    out << "        q.wait(); // ensure sparse aggregate writes into d_result/d_result_validity are complete before host-side USM allocation/zeroing\n";
-    out << "        ctx->ensureColumnarResultCapacity(static_cast<std::size_t>(aggregate_visible_tuple_size), aggregate_max_output_rows);\n";
-    out << "        unsigned long long* d_aggregate_output_count = ctx->config_.reuse_scratch_buffers ? ctx->getScratchUInt64Buffer(\"d_aggregate_small_output_count\", static_cast<std::size_t>(1)) : sycl::malloc_device<unsigned long long>(1, q);\n";
-    out << "        q.memset(d_aggregate_output_count, 0, sizeof(unsigned long long));\n";
+    auto& steps = ctx.physical.post;
+    steps.emplace_back(SetScalar{"aggregate_group_count", group_count});
+    steps.emplace_back(SetScalar{"aggregate_output_limit", max_output_rows});
+    steps.emplace_back(SetScalar{"aggregate_visible_tuple_size", static_cast<uint64_t>(visible_ts)});
+    steps.emplace_back(SetScalar{"aggregate_storage_tuple_size", static_cast<uint64_t>(storage_ts)});
+    std::vector<uint32_t> types;
     for (int c = 0; c < visible_ts; ++c) {
-        const LogicalType type = resultLogicalTypeForAggregateOutput(node, c);
-        out << "        " << resultColumnPointerType(type) << " d_result_col_" << c << " = ctx->" << resultColumnGetter(type) << "(" << c << ");\n";
-        out << "        uint64_t* d_result_validity_col_" << c << " = ctx->getResultColumnValidityPointer(" << c << ");\n";
+        types.push_back(kernelStorageType(resultLogicalTypeForAggregateOutput(node, c, ctx.parameter_schema)));
     }
-    out << "        q.submit([&](sycl::handler& h) {\n";
-    out << "            h.parallel_for<class " << kernel << ">(sycl::range<1>(1), [=](sycl::id<1>) {\n";
+    ctx.physical.columns(steps, types, max_output_rows);
+    ctx.physical.scratch(steps, "d_aggregate_output_count", DB_TYPE_UINT64, 1, true);
+    std::stringstream out;
     out << "                std::uint64_t aggregate_indices[" << index_array_size << "];\n";
     out << "                std::uint64_t aggregate_count = 0ULL;\n";
     out << "                for (std::uint64_t g = 0ULL; g < aggregate_group_count; ++g) {\n";
     out << "                    const std::uint64_t base = g * aggregate_storage_tuple_size;\n";
-    if (node->group_by_exprs.empty()) {
+    if (ctx.emitted_auxiliary_kernels.count("aggregate_presence")) {
+        out << "                    bool present = d_aggregate_presence[g] != 0ULL;\n";
+    } else if (node->group_by_exprs.empty()) {
         out << "                    bool present = true;\n";
     } else {
         out << "                    bool present = false;\n";
-        out << "                    for (std::uint64_t c = 0ULL; c < aggregate_visible_tuple_size; ++c) {\n";
-        out << "                        if (db::bitmap_valid_at(d_result_validity, base + c) || d_result[base + c] != 0ULL) { present = true; break; }\n";
-        out << "                    }\n";
+        out << "present = " << aggregatePresentExpression(node, catalog, "base") << ";\n";
     }
-    const std::string having_pass = aggregateHavingPassExpr(node, catalog, "base");
+    const std::string having_pass = aggregateHavingPassExpr(node, catalog, "base", ctx.parameter_schema);
     if (having_pass == "true" || having_pass == "(true)" || having_pass == "1" || having_pass == "(1)") {
         out << "                    bool having_pass = true;\n";
     } else {
@@ -3212,7 +3003,7 @@ static void emitAggregateSmallFusedColumnarMaterialization(const AggregateNode* 
         out << "                        const std::uint64_t left_base = left_group * aggregate_storage_tuple_size;\n";
         out << "                        const std::uint64_t right_base = right_group * aggregate_storage_tuple_size;\n";
         out << "                        bool sort_right_before_left = false;\n";
-        emitAggregateSparseRightBeforeLeftComparison(out, node, catalog, sort_node->sort_keys,
+        emitAggregateSparseRightBeforeLeftComparison(out, node, catalog, ctx.parameter_schema, sort_node->sort_keys,
                                                      "left_base", "right_base", "left_group", "right_group",
                                                      "sort_right_before_left", "                        ");
         out << "                        if (sort_right_before_left) {\n";
@@ -3224,12 +3015,12 @@ static void emitAggregateSmallFusedColumnarMaterialization(const AggregateNode* 
     }
     out << "                std::uint64_t aggregate_output_count = aggregate_count;\n";
     if (has_limit) {
-        out << "                if (aggregate_output_count > " << limit_value << "ULL) aggregate_output_count = " << limit_value << "ULL;\n";
+        out << "                if (aggregate_output_count > aggregate_output_limit) aggregate_output_count = aggregate_output_limit;\n";
     }
     out << "                for (std::uint64_t out_row = 0ULL; out_row < aggregate_output_count; ++out_row) {\n";
     out << "                    const std::uint64_t src = aggregate_indices[out_row] * aggregate_storage_tuple_size;\n";
     for (int c = 0; c < visible_ts; ++c) {
-        const LogicalType type = resultLogicalTypeForAggregateOutput(node, c);
+        const LogicalType type = resultLogicalTypeForAggregateOutput(node, c, ctx.parameter_schema);
         std::string value_expr = "d_result[src + " + std::to_string(c) + "]";
         if (type == LogicalType::Float64) value_expr = "db::bit_cast_ull_to_double(" + value_expr + ")";
         else value_expr = castToResultColumnType(value_expr, type);
@@ -3240,29 +3031,17 @@ static void emitAggregateSmallFusedColumnarMaterialization(const AggregateNode* 
     }
     out << "                }\n";
     out << "                d_aggregate_output_count[0] = static_cast<unsigned long long>(aggregate_output_count);\n";
-    out << "            });\n";
-    out << "        });\n";
-    out << "        unsigned long long aggregate_row_count = 0ULL;\n";
-    out << "        q.memcpy(&aggregate_row_count, d_aggregate_output_count, sizeof(unsigned long long)).wait();\n";
-    out << "        if (!ctx->config_.reuse_scratch_buffers) sycl::free(d_aggregate_output_count, q);\n";
-    out << "        if (aggregate_row_count > " << max_output_rows << "ULL) throw std::runtime_error(\"Aggregate fused materialization row count overflow\");\n";
-    out << "        ctx->result_row_count_ = static_cast<std::size_t>(aggregate_row_count);\n";
-    out << "        ctx->result_is_dense_ = true;\n";
-    out << "        ctx->expected_result_size_ = aggregate_row_count == 0ULL ? static_cast<std::size_t>(aggregate_visible_tuple_size) : static_cast<std::size_t>(aggregate_row_count * aggregate_visible_tuple_size);\n";
-    out << "    }\n\n";
+    ctx.physical.range(steps, kernel, out.str(), 1, {"aggregate_group_count", "aggregate_output_limit", "aggregate_visible_tuple_size", "aggregate_storage_tuple_size"});
+    steps.emplace_back(ReadScalar{"aggregate_row_count", "d_aggregate_output_count", 0});
+    steps.emplace_back(Require{lessEqual(variable("aggregate_row_count"), max_output_rows), "Aggregate fused materialization row count overflow"});
+    steps.emplace_back(PublishResult{variable("aggregate_row_count"), maximum(variable("aggregate_row_count"), 1) * static_cast<uint64_t>(visible_ts), true, 0});
 }
 
 static void emitAtomicAggregateUpdate(std::stringstream& code,
                                       const std::string& ref_expr,
                                       const AggregateDef& agg,
-                                      const std::string& value_expr) {
-    if (agg.isMin()) {
-        code << "                    db::atomic_min_ull(" << ref_expr << ", " << value_expr << ");\n";
-    } else if (agg.isMax()) {
-        code << "                    db::atomic_max_ull(" << ref_expr << ", " << value_expr << ");\n";
-    } else {
-        code << "                    db::atomic_add_ull(" << ref_expr << ", " << value_expr << ");\n";
-    }
+                                      const std::string& value_expr, const ParameterSchema& schema) {
+    code << AggregateCode(agg, schema).atomic(ref_expr, value_expr);
 }
 
 
@@ -3288,7 +3067,7 @@ static void emitAggregateGroupedLocalReduceVector(const AggregateNode* node,
     auto& code = ctx.current_pipeline->kernel_body;
     code << "            {\n";
     for (std::size_t a = 0; a < node->aggregates.size(); ++a) {
-        code << "                unsigned long long local_agg_" << a << "[" << total_size << "];\n";
+        code << "                " << AggregateCode(node->aggregates[a], ctx.parameter_schema).type << " local_agg_" << a << "[" << total_size << "];\n";
         code << "                unsigned long long local_seen_" << a << "[" << total_size << "];\n";
     }
 
@@ -3322,7 +3101,7 @@ static void emitAggregateGroupedLocalReduceVector(const AggregateNode* node,
     agg_values.reserve(node->aggregates.size());
     agg_valids.reserve(node->aggregates.size());
     for (const auto& agg : node->aggregates) {
-        agg_values.push_back(aggregateInputExpr(agg, ctx, true));
+        agg_values.push_back(aggregateInputExpr(agg, ctx));
         agg_valids.push_back(agg.hasStarArgument() ? "1" : expressionValidExpr(agg.agg_expr.get(), ctx));
     }
 
@@ -3332,8 +3111,10 @@ static void emitAggregateGroupedLocalReduceVector(const AggregateNode* node,
     code << "                        int hash = " << hash_expr << ";\n";
     code << "                        if (hash >= 0 && hash < " << total_size << ") {\n";
     code << "                            int out = hash * " << storage_ts << ";\n";
+    if (ctx.emitted_auxiliary_kernels.count("aggregate_presence"))
+        code << "atomicExch(&d_aggregate_presence[hash],1ULL);\n";
     for (int gslot = 0; gslot < static_cast<int>(node->group_by_exprs.size()); ++gslot) {
-        code << "                            d_result[out + " << gslot << "] = static_cast<unsigned long long>(" << group_values[static_cast<std::size_t>(gslot)] << ");\n";
+        code << "                            atomicExch(&d_result[out + " << gslot << "], static_cast<unsigned long long>(" << group_values[static_cast<std::size_t>(gslot)] << "));\n";
         if (!fast_sparse_output) {
             const std::string& valid = group_valids[static_cast<std::size_t>(gslot)];
             if (isTriviallyTrueExpr(valid)) {
@@ -3349,11 +3130,11 @@ static void emitAggregateGroupedLocalReduceVector(const AggregateNode* node,
         const std::string& val = agg_values[a];
         const std::string& valid = agg_valids[a];
         if (isTriviallyTrueExpr(valid)) {
-            code << "                            local_agg_" << a << "[hash] += " << val << ";\n";
+            code << "                            local_agg_" << a << "[hash] += static_cast<" << AggregateCode(agg, ctx.parameter_schema).type << ">(" << val << ");\n";
             code << "                            local_seen_" << a << "[hash] += 1ULL;\n";
         } else if (!isTriviallyFalseExpr(valid)) {
             code << "                            if (" << valid << ") {\n";
-            code << "                                local_agg_" << a << "[hash] += " << val << ";\n";
+            code << "                                local_agg_" << a << "[hash] += static_cast<" << AggregateCode(agg, ctx.parameter_schema).type << ">(" << val << ");\n";
             code << "                                local_seen_" << a << "[hash] += 1ULL;\n";
             code << "                            }\n";
         }
@@ -3365,7 +3146,7 @@ static void emitAggregateGroupedLocalReduceVector(const AggregateNode* node,
     code << "                for (int aggregate_group = 0; aggregate_group < " << total_size << "; ++aggregate_group) {\n";
     if (!fast_sparse_output) {
         for (int gslot = 0; gslot < static_cast<int>(node->group_by_exprs.size()); ++gslot) {
-            code << "                    unsigned long long group_seen_" << gslot << " = sycl::reduce_over_group(it.get_group(), local_group_seen_" << gslot << "[aggregate_group], sycl::plus<unsigned long long>{});\n";
+            code << "                    unsigned long long group_seen_" << gslot << " = crystal::blockReduce<unsigned long long>(local_group_seen_" << gslot << "[aggregate_group], db_collective_u64, threadIdx.x, blockDim.x, crystal::Sum<unsigned long long>{});\n";
             code << "                    if (tid == 0 && group_seen_" << gslot << " != 0ULL) {\n";
             code << "                        db::atomic_set_valid_bit(d_result_validity, (unsigned long long)aggregate_group * " << storage_ts << " + " << gslot << ");\n";
             code << "                    }\n";
@@ -3374,10 +3155,11 @@ static void emitAggregateGroupedLocalReduceVector(const AggregateNode* node,
     const int agg_base_slot = static_cast<int>(node->group_by_exprs.size());
     for (std::size_t a = 0; a < node->aggregates.size(); ++a) {
         const int out_slot = agg_base_slot + static_cast<int>(a);
-        code << "                    unsigned long long agg_val_" << a << " = sycl::reduce_over_group(it.get_group(), local_agg_" << a << "[aggregate_group], sycl::plus<unsigned long long>{});\n";
-        code << "                    unsigned long long agg_seen_" << a << " = sycl::reduce_over_group(it.get_group(), local_seen_" << a << "[aggregate_group], sycl::plus<unsigned long long>{});\n";
+        const AggregateCode state(node->aggregates[a], ctx.parameter_schema);
+        code << "                    auto agg_val_" << a << " = " << state.reduce("local_agg_" + std::to_string(a) + "[aggregate_group]") << ";\n";
+        code << "                    unsigned long long agg_seen_" << a << " = crystal::blockReduce<unsigned long long>(local_seen_" << a << "[aggregate_group], db_collective_u64, threadIdx.x, blockDim.x, crystal::Sum<unsigned long long>{});\n";
         code << "                    if (tid == 0 && agg_seen_" << a << " != 0ULL) {\n";
-        code << "                        db::atomic_add_ull(d_result[(unsigned long long)aggregate_group * " << storage_ts << " + " << out_slot << "], agg_val_" << a << ");\n";
+        code << state.atomic("d_result[(unsigned long long)aggregate_group * " + std::to_string(storage_ts) + " + " + std::to_string(out_slot) + "]", "agg_val_" + std::to_string(a));
         if (!fast_sparse_output) {
             code << "                        db::atomic_set_valid_bit(d_result_validity, (unsigned long long)aggregate_group * " << storage_ts << " + " << out_slot << ");\n";
         }
@@ -3417,7 +3199,6 @@ void JITOperatorVisitor::consumeAggregateVector(const AggregateNode* node, JITCo
     }
 
     const int visible_ts = (int)node->visibleTupleSize();
-    const bool needs_hidden_count = node->needsHiddenCountSlot();
     const int storage_ts = (int)node->storageTupleSize();
     const int hidden_count_slot = visible_ts;
     const bool fast_sparse_candidate = aggregateFastSparseOutputEligible(node, catalog_);
@@ -3429,117 +3210,31 @@ void JITOperatorVisitor::consumeAggregateVector(const AggregateNode* node, JITCo
         ctx.visible_result_size_expr = std::to_string(visible_ts);
         emitAggregateInitializationIfNeeded(node, ctx, 1, visible_ts, storage_ts);
 
-        for (std::size_t a = 0; a < node->aggregates.size(); ++a) {
-            const auto& agg = node->aggregates[a];
-            if (agg.isMin()) {
-                code << "            unsigned long long local_" << a << " = ~0ULL;\n";
-            } else {
-                code << "            unsigned long long local_" << a << " = 0ULL;\n";
-            }
-        }
-        if (needs_hidden_count) {
-            for (std::size_t a = 0; a < node->aggregates.size(); ++a) {
-                if (node->aggregates[a].needsNonNullCount()) {
-                    code << "            unsigned long long local_count_hidden_" << a << " = 0ULL;\n";
-                }
-            }
-        }
-        for (std::size_t a = 0; a < node->aggregates.size(); ++a) {
-            if (!node->aggregates[a].isCount() && !node->aggregates[a].needsNonNullCount()) {
-                code << "            unsigned long long local_seen_" << a << " = 0ULL;\n";
-            }
-        }
-
-        code << "            #pragma unroll\n";
-        code << "            for (int i = 0; i < ITEMS_PER_THREAD; ++i) {\n";
-        code << "                if (flags[i] && (tid + BLOCK_THREADS * i < num_tile_items)) {\n";
-        for (std::size_t a = 0; a < node->aggregates.size(); ++a) {
-            const auto& agg = node->aggregates[a];
-            std::string val = aggregateInputExpr(agg, ctx, true);
-            std::string valid = agg.hasStarArgument() ? "1" : expressionValidExpr(agg.agg_expr.get(), ctx);
-            if (agg.isCount()) {
-                code << "                    if (" << valid << ") local_" << a << " += 1ULL;\n";
-            } else if (agg.isMin()) {
-                code << "                    if ((" << valid << ") && " << val << " < local_" << a << ") local_" << a << " = " << val << ";\n";
-                if (agg.needsNonNullCount()) {
-                    code << "                    if (" << valid << ") local_count_hidden_" << a << " += 1ULL;\n";
-                } else {
-                    code << "                    if (" << valid << ") local_seen_" << a << " += 1ULL;\n";
-                }
-            } else if (agg.isMax()) {
-                code << "                    if ((" << valid << ") && " << val << " > local_" << a << ") local_" << a << " = " << val << ";\n";
-                if (agg.needsNonNullCount()) {
-                    code << "                    if (" << valid << ") local_count_hidden_" << a << " += 1ULL;\n";
-                } else {
-                    code << "                    if (" << valid << ") local_seen_" << a << " += 1ULL;\n";
-                }
-            } else {
-                code << "                    if (" << valid << ") local_" << a << " += " << val << ";\n";
-                if (agg.needsNonNullCount()) {
-                    code << "                    if (" << valid << ") local_count_hidden_" << a << " += 1ULL;\n";
-                } else if (!agg.isCount()) {
-                    code << "                    if (" << valid << ") local_seen_" << a << " += 1ULL;\n";
-                }
-            }
-        }
-        code << "                }\n";
-        code << "            }\n";
-
-        for (std::size_t a = 0; a < node->aggregates.size(); ++a) {
-            const auto& agg = node->aggregates[a];
-            const char* op = agg.isMin() ? "sycl::minimum<unsigned long long>{}" :
-                             agg.isMax() ? "sycl::maximum<unsigned long long>{}" :
-                                           "sycl::plus<unsigned long long>{}";
-            code << "            unsigned long long agg_" << a
-                 << " = sycl::reduce_over_group(it.get_group(), local_" << a << ", " << op << ");\n";
-            code << "            if (tid == 0) {\n";
-            if (agg.isMin()) {
-                code << "                db::atomic_min_ull(d_result[" << a << "], agg_" << a << ");\n";
-            } else if (agg.isMax()) {
-                code << "                db::atomic_max_ull(d_result[" << a << "], agg_" << a << ");\n";
-            } else {
-                code << "                db::atomic_add_ull(d_result[" << a << "], agg_" << a << ");\n";
-            }
-            if (agg.isCount()) {
-                code << "                db::atomic_set_valid_bit(d_result_validity, " << a << ");\n";
-            }
-            code << "            }\n";
-            if (!agg.isCount() && !agg.needsNonNullCount()) {
-                code << "            unsigned long long agg_seen_" << a << " = sycl::reduce_over_group(it.get_group(), local_seen_" << a << ", sycl::plus<unsigned long long>{});\n";
-                code << "            if (tid == 0 && agg_seen_" << a << " != 0ULL) {\n";
-                code << "                db::atomic_set_valid_bit(d_result_validity, " << a << ");\n";
-                code << "            }\n";
-            }
-            if (agg.needsNonNullCount()) {
-                const int cnt_slot = hiddenCountSlotForAggregate(node, a);
-                code << "            unsigned long long agg_hidden_count_" << a << " = sycl::reduce_over_group(it.get_group(), local_count_hidden_" << a << ", sycl::plus<unsigned long long>{});\n";
-                code << "            if (tid == 0) {\n";
-                code << "                db::atomic_add_ull(d_result[" << cnt_slot << "], agg_hidden_count_" << a << ");\n";
-                code << "            }\n";
-            }
-        }
+        std::vector<ExpressionCode> inputs;
+        for (const auto& agg : node->aggregates)
+            inputs.push_back({aggregateInputExpr(agg, ctx), agg.hasStarArgument() ? "1" : expressionValidExpr(agg.agg_expr.get(), ctx)});
+        code << emitScalarAggregate(*node, ctx.parameter_schema, inputs);
         emitAggregateFinalizationIfNeeded(node, ctx, 1, visible_ts, storage_ts, hidden_count_slot);
         if (!fast_sparse_output) {
             const SortLimitNode* sort_node = parentSortLimitNode(node);
             if (aggregateSmallFusedMaterializationEligible(node, 1, sort_node)) {
-                emitAggregateSmallFusedColumnarMaterialization(node, sort_node, ctx, catalog_, 1, visible_ts, storage_ts);
+                emitAggregateSmallFusedColumnarMaterialization(node, sort_node, ctx, catalog_, 1, visible_ts, visible_ts);
             } else {
                 emitAggregateDenseColumnarMaterialization(node, ctx, catalog_, 1, visible_ts);
             }
         } else {
-            ctx.post_execution_code << "    ctx->result_is_dense_ = false;\n";
-            ctx.post_execution_code << "    ctx->result_row_count_ = 0;\n";
-            ctx.post_execution_code << "    ctx->expected_result_validity_words_ = 0;\n";
+            ctx.physical.post.emplace_back(PublishResult{0, sizeAtom(ctx.result_size_expr), false, 0});
         }
     } else {
         auto [hash_expr, total_size] = generatePerfectHash(node->group_by_exprs, catalog_, ctx);
+        ensureAggregatePresence(node, ctx, catalog_, total_size);
         const SortLimitNode* sort_node = parentSortLimitNode(node);
         const bool skip_hot_validity =
             fast_sparse_output ||
             (fast_sparse_candidate && aggregateSmallFusedMaterializationEligible(node, total_size, sort_node));
         ctx.tuple_size = visible_ts;
-        ctx.result_size_expr = std::to_string((uint64_t)total_size * (uint64_t)storage_ts);
-        ctx.visible_result_size_expr = std::to_string((uint64_t)total_size * (uint64_t)visible_ts);
+        ctx.result_size_expr = std::to_string(checkedSizeMultiply(total_size, static_cast<uint64_t>(storage_ts)));
+        ctx.visible_result_size_expr = std::to_string(checkedSizeMultiply(total_size, static_cast<uint64_t>(visible_ts)));
         emitAggregateInitializationIfNeeded(node, ctx, total_size, visible_ts, storage_ts);
 
         if (aggregateLocalGroupReduceEligible(node, total_size)) {
@@ -3550,13 +3245,15 @@ void JITOperatorVisitor::consumeAggregateVector(const AggregateNode* node, JITCo
         code << "                if (flags[i] && (tid + BLOCK_THREADS * i < num_tile_items)) {\n";
         code << "                    int hash = " << hash_expr << ";\n";
         code << "                    int out = hash * " << storage_ts << ";\n";
+        if (ctx.emitted_auxiliary_kernels.count("aggregate_presence"))
+            code << "atomicExch(&d_aggregate_presence[hash],1ULL);\n";
 
         int slot = 0;
         JITExprVisitor group_expr_vis(ctx, code, "flags");
         for (const auto& g : node->group_by_exprs) {
             const std::string group_value = group_expr_vis.translateInlineExpr(g.get(), true);
             std::string valid = expressionValidExpr(g.get(), ctx);
-            code << "                    d_result[out + " << slot << "] = static_cast<unsigned long long>(" << group_value << ");\n";
+            code << "                    atomicExch(&d_result[out + " << slot << "], static_cast<unsigned long long>(" << group_value << "));\n";
             if (!skip_hot_validity) {
                 if (isTriviallyTrueExpr(valid)) {
                     code << "                    db::atomic_set_valid_bit(d_result_validity, out + " << slot << ");\n";
@@ -3567,14 +3264,14 @@ void JITOperatorVisitor::consumeAggregateVector(const AggregateNode* node, JITCo
             ++slot;
         }
         for (const auto& agg : node->aggregates) {
-            std::string val = aggregateInputExpr(agg, ctx, true);
+            std::string val = aggregateInputExpr(agg, ctx);
             std::string valid = agg.hasStarArgument() ? "1" : expressionValidExpr(agg.agg_expr.get(), ctx);
             std::string ref = "d_result[out + " + std::to_string(slot) + "]";
             const bool valid_is_true = isTriviallyTrueExpr(valid);
             if (!valid_is_true) {
                 code << "                    if (" << valid << ") {\n";
             }
-            emitAtomicAggregateUpdate(code, ref, agg, val);
+            emitAtomicAggregateUpdate(code, ref, agg, val, ctx.parameter_schema);
             if (agg.needsNonNullCount()) {
                 const int cnt_slot = hiddenCountSlotForAggregate(node, slot - (int)node->group_by_exprs.size());
                 code << "                    db::atomic_add_ull(d_result[out + " << cnt_slot << "], 1ULL);\n";
@@ -3595,14 +3292,12 @@ void JITOperatorVisitor::consumeAggregateVector(const AggregateNode* node, JITCo
         emitAggregateFinalizationIfNeeded(node, ctx, total_size, visible_ts, storage_ts, hidden_count_slot);
         if (!fast_sparse_output) {
             if (aggregateSmallFusedMaterializationEligible(node, total_size, sort_node)) {
-                emitAggregateSmallFusedColumnarMaterialization(node, sort_node, ctx, catalog_, total_size, visible_ts, storage_ts);
+                emitAggregateSmallFusedColumnarMaterialization(node, sort_node, ctx, catalog_, total_size, visible_ts, visible_ts);
             } else {
                 emitAggregateDenseColumnarMaterialization(node, ctx, catalog_, total_size, visible_ts);
             }
         } else {
-            ctx.post_execution_code << "    ctx->result_is_dense_ = false;\n";
-            ctx.post_execution_code << "    ctx->result_row_count_ = 0;\n";
-            ctx.post_execution_code << "    ctx->expected_result_validity_words_ = 0;\n";
+            ctx.physical.post.emplace_back(PublishResult{0, sizeAtom(ctx.result_size_expr), false, 0});
         }
     }
 }
@@ -3616,7 +3311,6 @@ void JITOperatorVisitor::consumeAggregateItem(const AggregateNode* node, JITCont
     auto& code = ctx.current_pipeline->kernel_body;
     const bool has_group_by = !node->group_by_exprs.empty();
     const int visible_ts = (int)node->visibleTupleSize();
-    const bool needs_hidden_count = node->needsHiddenCountSlot();
     const int storage_ts = (int)node->storageTupleSize();
     const int hidden_count_slot = visible_ts;
 
@@ -3631,13 +3325,7 @@ void JITOperatorVisitor::consumeAggregateItem(const AggregateNode* node, JITCont
             std::string valid = agg.hasStarArgument() ? "1" : itemExprValid(agg.agg_expr.get(), ctx);
             std::string ref = "d_result[" + std::to_string(a) + "]";
             code << "                        if (" << valid << ") {\n";
-            if (agg.isMin()) {
-                code << "                            db::atomic_min_ull(" << ref << ", " << val << ");\n";
-            } else if (agg.isMax()) {
-                code << "                            db::atomic_max_ull(" << ref << ", " << val << ");\n";
-            } else {
-                code << "                            db::atomic_add_ull(" << ref << ", " << val << ");\n";
-            }
+            emitAtomicAggregateUpdate(code, ref, agg, val, ctx.parameter_schema);
             if (agg.needsNonNullCount()) {
                 const int cnt_slot = hiddenCountSlotForAggregate(node, a);
                 code << "                            db::atomic_add_ull(d_result[" << cnt_slot << "], 1ULL);\n";
@@ -3650,24 +3338,27 @@ void JITOperatorVisitor::consumeAggregateItem(const AggregateNode* node, JITCont
         {
             const SortLimitNode* sort_node = parentSortLimitNode(node);
             if (aggregateSmallFusedMaterializationEligible(node, 1, sort_node)) {
-                emitAggregateSmallFusedColumnarMaterialization(node, sort_node, ctx, catalog_, 1, visible_ts, storage_ts);
+                emitAggregateSmallFusedColumnarMaterialization(node, sort_node, ctx, catalog_, 1, visible_ts, visible_ts);
             } else {
                 emitAggregateDenseColumnarMaterialization(node, ctx, catalog_, 1, visible_ts);
             }
         }
     } else {
         auto [hash_expr, total_size] = generatePerfectHashItem(node->group_by_exprs, catalog_, ctx);
+        ensureAggregatePresence(node, ctx, catalog_, total_size);
         ctx.tuple_size = visible_ts;
-        ctx.result_size_expr = std::to_string((uint64_t)total_size * (uint64_t)storage_ts);
-        ctx.visible_result_size_expr = std::to_string((uint64_t)total_size * (uint64_t)visible_ts);
+        ctx.result_size_expr = std::to_string(checkedSizeMultiply(total_size, static_cast<uint64_t>(storage_ts)));
+        ctx.visible_result_size_expr = std::to_string(checkedSizeMultiply(total_size, static_cast<uint64_t>(visible_ts)));
         emitAggregateInitializationIfNeeded(node, ctx, total_size, visible_ts, storage_ts);
         code << "                        int hash = " << hash_expr << ";\n";
+        if (ctx.emitted_auxiliary_kernels.count("aggregate_presence"))
+            code << "atomicExch(&d_aggregate_presence[hash],1ULL);\n";
         int slot = 0;
         for (const auto& g : node->group_by_exprs) {
             const std::string value = itemExprValue(g.get(), ctx);
             std::string valid = itemExprValid(g.get(), ctx);
-            code << "                        d_result[(unsigned long long)hash*" << storage_ts
-                 << "+" << slot << "] = (unsigned long long)(" << value << ");\n";
+            code << "                        atomicExch(&d_result[(unsigned long long)hash*" << storage_ts
+                 << "+" << slot << "], (unsigned long long)(" << value << "));\n";
             code << "                        if (" << valid << ") db::atomic_set_valid_bit(d_result_validity, (unsigned long long)hash*"
                  << storage_ts << "+" << slot << ");\n";
             ++slot;
@@ -3677,13 +3368,7 @@ void JITOperatorVisitor::consumeAggregateItem(const AggregateNode* node, JITCont
             std::string valid = agg.hasStarArgument() ? "1" : itemExprValid(agg.agg_expr.get(), ctx);
             std::string ref = "d_result[(unsigned long long)hash*" + std::to_string(storage_ts) + "+" + std::to_string(slot) + "]";
             code << "                        if (" << valid << ") {\n";
-            if (agg.isMin()) {
-                code << "                            db::atomic_min_ull(" << ref << ", " << val << ");\n";
-            } else if (agg.isMax()) {
-                code << "                            db::atomic_max_ull(" << ref << ", " << val << ");\n";
-            } else {
-                code << "                            db::atomic_add_ull(" << ref << ", " << val << ");\n";
-            }
+            emitAtomicAggregateUpdate(code, ref, agg, val, ctx.parameter_schema);
             if (agg.needsNonNullCount()) {
                 const int cnt_slot = hiddenCountSlotForAggregate(node, slot - (int)node->group_by_exprs.size());
                 code << "                            db::atomic_add_ull(d_result[(unsigned long long)hash*" << storage_ts << "+" << cnt_slot << "], 1ULL);\n";
@@ -3700,7 +3385,7 @@ void JITOperatorVisitor::consumeAggregateItem(const AggregateNode* node, JITCont
         {
             const SortLimitNode* sort_node = parentSortLimitNode(node);
             if (aggregateSmallFusedMaterializationEligible(node, total_size, sort_node)) {
-                emitAggregateSmallFusedColumnarMaterialization(node, sort_node, ctx, catalog_, total_size, visible_ts, storage_ts);
+                emitAggregateSmallFusedColumnarMaterialization(node, sort_node, ctx, catalog_, total_size, visible_ts, visible_ts);
             } else {
                 emitAggregateDenseColumnarMaterialization(node, ctx, catalog_, total_size, visible_ts);
             }
@@ -3733,26 +3418,14 @@ static void ensureProjectionExactBuffers(JITContext& ctx,
                                          int tuple_size,
                                          const std::vector<LogicalType>& result_types,
                                          bool needs_write_counts) {
-    const std::string num_tiles_expr = "((" + row_count_expr + " + TILE_SIZE - 1) / TILE_SIZE)";
-    auto has_buffer = [&](const std::string& name) {
-        for (const auto& ht : ctx.hash_tables) {
-            if (ht.name == name) return true;
-        }
-        return false;
+    const auto tiles = ceilDiv(variable(row_count_expr), 512);
+    auto declare = [&](const std::string& name, SizeExpr count) {
+        if (ctx.physical.declareBuffer({name, DB_TYPE_UINT64, BufferRole::Scratch, {}, 0, false}))
+            ctx.physical.scratch(ctx.physical.plan.steps, name, DB_TYPE_UINT64, count, true);
     };
-    if (!has_buffer("d_projection_counts")) {
-        ctx.hash_tables.push_back({"d_projection_counts", "unsigned long long", num_tiles_expr});
-    }
-    if (!has_buffer("d_projection_offsets")) {
-        ctx.hash_tables.push_back({"d_projection_offsets", "unsigned long long", num_tiles_expr});
-    }
-    if (needs_write_counts && !has_buffer("d_projection_write_counts")) {
-        ctx.hash_tables.push_back({"d_projection_write_counts", "unsigned long long", num_tiles_expr});
-    }
-    const std::string scan_blocks_expr = "(((" + row_count_expr + " + TILE_SIZE - 1) / TILE_SIZE + 255) / 256)";
-    if (!has_buffer("d_projection_block_sums")) {
-        ctx.hash_tables.push_back({"d_projection_block_sums", "unsigned long long", scan_blocks_expr});
-    }
+    declare("d_projection_counts", tiles);
+    declare("d_projection_offsets", tiles);
+    if (needs_write_counts) declare("d_projection_write_counts", tiles);
 
     ctx.projection_exact_materialization = true;
     ctx.projection_row_count_expr = row_count_expr;
@@ -3774,39 +3447,9 @@ static void emitProjectionDirectDenseSetup(JITContext& ctx,
     ctx.result_size_expr = "1";
     ctx.visible_result_size_expr = "1";
 
-    auto& out = ctx.current_pipeline->includes_and_globals;
-    for (int col = 0; col < tuple_size; ++col) {
-        const LogicalType type = (col < static_cast<int>(result_types.size())) ? result_types[static_cast<std::size_t>(col)] : LogicalType::UInt64;
-        out << "    " << resultColumnPointerType(type) << " d_result_col_" << col << " = nullptr;\n";
-        out << "    uint64_t* d_result_validity_col_" << col << " = nullptr;\n";
-    }
-    out << "    {\n";
-    out << "        const unsigned long long projection_running = static_cast<unsigned long long>(" << row_count_expr << ");\n";
-    out << "        if (projection_running != 0ULL && projection_running > static_cast<unsigned long long>(std::numeric_limits<size_t>::max() / " << tuple_size << ")) {\n";
-    out << "            throw std::overflow_error(\"Projection result size overflow\");\n";
-    out << "        }\n";
-    out << "        ctx->result_row_count_ = static_cast<size_t>(projection_running);\n";
-    out << "        ctx->result_is_dense_ = true;\n";
-    out << "        ctx->expected_result_size_ = static_cast<size_t>(projection_running) * " << tuple_size << ";\n";
-    out << "        const size_t projection_result_bytes = ctx->expected_result_size_ * sizeof(unsigned long long);\n";
-    out << "        const size_t projection_validity_words = (static_cast<size_t>(projection_running) + 63ULL) / 64ULL;\n";
-    out << "        const size_t projection_validity_bytes = static_cast<size_t>(" << tuple_size << ") * (projection_validity_words == 0 ? 1ULL : projection_validity_words) * sizeof(uint64_t);\n";
-    out << "        const size_t projection_total_mem = static_cast<size_t>(q.get_device().get_info<sycl::info::device::global_mem_size>());\n";
-    out << "        const size_t projection_reserve_a = projection_total_mem / 10ULL;\n";
-    out << "        const size_t projection_reserve_b = static_cast<size_t>(512ULL * 1024ULL * 1024ULL);\n";
-    out << "        const size_t projection_reserve = projection_reserve_a > projection_reserve_b ? projection_reserve_a : projection_reserve_b;\n";
-    out << "        const size_t projection_budget = projection_total_mem > projection_reserve ? projection_total_mem - projection_reserve : projection_total_mem / 2ULL;\n";
-    out << "        const size_t projection_required = ctx->loaded_device_bytes_ + projection_result_bytes + projection_validity_bytes;\n";
-    out << "        if (projection_required > projection_budget) {\n";
-    out << "            throw std::runtime_error(\"Insufficient GPU memory before projection write: dense projection result does not fit device memory\");\n";
-    out << "        }\n";
-    out << "        ctx->ensureColumnarResultCapacity(" << tuple_size << ", static_cast<size_t>(projection_running));\n";
-    for (int col = 0; col < tuple_size; ++col) {
-        const LogicalType type = (col < static_cast<int>(result_types.size())) ? result_types[static_cast<std::size_t>(col)] : LogicalType::UInt64;
-        out << "        d_result_col_" << col << " = ctx->" << resultColumnGetter(type) << "(" << col << ");\n";
-        out << "        d_result_validity_col_" << col << " = ctx->getResultColumnValidityPointer(" << col << ");\n";
-    }
-    out << "    }\n\n";
+    auto& steps = ctx.physical.plan.steps;
+    ctx.physical.columns(steps, kernelStorageTypes(result_types), variable(row_count_expr));
+    steps.emplace_back(PublishResult{variable(row_count_expr), variable(row_count_expr) * static_cast<uint64_t>(tuple_size), true, 0});
 }
 
 static void emitProjectionPrefixScanBeforeWrite(JITContext& ctx,
@@ -3817,76 +3460,12 @@ static void emitProjectionPrefixScanBeforeWrite(JITContext& ctx,
     const std::string marker = "projection_exact_prefix_scan";
     if (!ctx.emitted_auxiliary_kernels.insert(marker).second) return;
 
-    auto& out = ctx.current_pipeline->includes_and_globals;
-    for (int col = 0; col < tuple_size; ++col) {
-        const LogicalType type = (col < static_cast<int>(result_types.size())) ? result_types[static_cast<std::size_t>(col)] : LogicalType::UInt64;
-        out << "    " << resultColumnPointerType(type) << " d_result_col_" << col << " = nullptr;\n";
-        out << "    uint64_t* d_result_validity_col_" << col << " = nullptr;\n";
-    }
-    out << "    {\n";
-    out << "        const int projection_num_tiles = (" << row_count_expr << " + TILE_SIZE - 1) / TILE_SIZE;\n";
-    out << "        const int projection_scan_blocks = (projection_num_tiles + 255) / 256;\n";
-    out << "        q.submit([&](sycl::handler& h) {\n";
-    out << "            h.parallel_for<class ProjectionTileBlockScan>(sycl::nd_range<1>(projection_scan_blocks * 256, 256), [=](sycl::nd_item<1> it) {\n";
-    out << "                const int gid = static_cast<int>(it.get_global_linear_id());\n";
-    out << "                const int lid = static_cast<int>(it.get_local_linear_id());\n";
-    out << "                unsigned long long val = (gid < projection_num_tiles) ? d_projection_counts[gid] : 0ULL;\n";
-    out << "                unsigned long long scanned = sycl::exclusive_scan_over_group(it.get_group(), val, sycl::plus<unsigned long long>{});\n";
-    out << "                if (gid < projection_num_tiles) d_projection_offsets[gid] = scanned;\n";
-    out << "                if (lid == 255) d_projection_block_sums[it.get_group_linear_id()] = scanned + val;\n";
-    out << "            });\n";
-    out << "        });\n";
-    out << "        q.submit([&](sycl::handler& h) {\n";
-    out << "            h.parallel_for<class ProjectionBlockSumsScan>(sycl::nd_range<1>(1024, 1024), [=](sycl::nd_item<1> it) {\n";
-    out << "                const int gid = static_cast<int>(it.get_global_linear_id());\n";
-    out << "                unsigned long long val = (gid < projection_scan_blocks) ? d_projection_block_sums[gid] : 0ULL;\n";
-    out << "                unsigned long long scanned = sycl::exclusive_scan_over_group(it.get_group(), val, sycl::plus<unsigned long long>{});\n";
-    out << "                if (gid < projection_scan_blocks) d_projection_block_sums[gid] = scanned;\n";
-    out << "            });\n";
-    out << "        });\n";
-    out << "        q.submit([&](sycl::handler& h) {\n";
-    out << "            h.parallel_for<class ProjectionAddBlockSums>(sycl::nd_range<1>(projection_scan_blocks * 256, 256), [=](sycl::nd_item<1> it) {\n";
-    out << "                const int gid = static_cast<int>(it.get_global_linear_id());\n";
-    out << "                if (gid < projection_num_tiles) {\n";
-    out << "                    d_projection_offsets[gid] += d_projection_block_sums[it.get_group_linear_id()];\n";
-    out << "                }\n";
-    out << "            });\n";
-    out << "        });\n";
-    out << "        unsigned long long projection_last_offset = 0ULL;\n";
-    out << "        unsigned long long projection_last_count = 0ULL;\n";
-    out << "        if (projection_num_tiles > 0) {\n";
-    out << "            q.memcpy(&projection_last_offset, d_projection_offsets + projection_num_tiles - 1, sizeof(unsigned long long)).wait();\n";
-    out << "            q.memcpy(&projection_last_count, d_projection_counts + projection_num_tiles - 1, sizeof(unsigned long long)).wait();\n";
-    out << "        }\n";
-    out << "        unsigned long long projection_running = projection_last_offset + projection_last_count;\n";
-    out << "        if (projection_running != 0ULL && projection_running > static_cast<unsigned long long>(std::numeric_limits<size_t>::max() / " << tuple_size << ")) {\n";
-    out << "            throw std::overflow_error(\"Projection result size overflow\");\n";
-    out << "        }\n";
-    out << "        ctx->result_row_count_ = static_cast<size_t>(projection_running);\n";
-    out << "        ctx->result_is_dense_ = true;\n";
-    out << "        ctx->expected_result_size_ = static_cast<size_t>(projection_running) * " << tuple_size << ";\n";
-    out << "        const size_t projection_result_bytes = ctx->expected_result_size_ * sizeof(unsigned long long);\n";
-    out << "        const size_t projection_temp_tile_buffers = " << (needs_write_counts ? "3ULL" : "2ULL") << ";\n";
-    out << "        const size_t projection_temp_bytes = static_cast<size_t>(projection_num_tiles) * projection_temp_tile_buffers * sizeof(unsigned long long) + static_cast<size_t>(projection_scan_blocks) * sizeof(unsigned long long);\n";
-    out << "        const size_t projection_total_mem = static_cast<size_t>(q.get_device().get_info<sycl::info::device::global_mem_size>());\n";
-    out << "        const size_t projection_reserve_a = projection_total_mem / 10ULL;\n";
-    out << "        const size_t projection_reserve_b = static_cast<size_t>(512ULL * 1024ULL * 1024ULL);\n";
-    out << "        const size_t projection_reserve = projection_reserve_a > projection_reserve_b ? projection_reserve_a : projection_reserve_b;\n";
-    out << "        const size_t projection_budget = projection_total_mem > projection_reserve ? projection_total_mem - projection_reserve : projection_total_mem / 2ULL;\n";
-    out << "        const size_t projection_required = ctx->loaded_device_bytes_ + projection_temp_bytes + projection_result_bytes;\n";
-    out << "        if (projection_required > projection_budget) {\n";
-    out << "            throw std::runtime_error(\"Insufficient GPU memory after projection count: exact materialized result does not fit device memory\");\n";
-    out << "        }\n";
-    out << "        ctx->ensureColumnarResultCapacity(" << tuple_size << ", static_cast<size_t>(projection_running));\n";
-    if (needs_write_counts) {
-        out << "        q.memset(d_projection_write_counts, 0, projection_num_tiles * sizeof(unsigned long long));\n";
-    }
-    for (int col = 0; col < tuple_size; ++col) {
-        const LogicalType type = (col < static_cast<int>(result_types.size())) ? result_types[static_cast<std::size_t>(col)] : LogicalType::UInt64;
-        out << "        d_result_col_" << col << " = ctx->" << resultColumnGetter(type) << "(" << col << ");\n";
-        out << "        d_result_validity_col_" << col << " = ctx->getResultColumnValidityPointer(" << col << ");\n";
-    }
-    out << "    }\n\n";
+    auto& steps = ctx.physical.plan.steps;
+    steps.emplace_back(SetScalar{"projection_num_tiles", ceilDiv(variable(row_count_expr), 512)});
+    steps.emplace_back(DevicePrefix{"d_projection_counts", "d_projection_offsets", variable("projection_num_tiles"), "projection_running"});
+    ctx.physical.columns(steps, kernelStorageTypes(result_types), variable("projection_running"));
+    steps.emplace_back(PublishResult{variable("projection_running"), variable("projection_running") * static_cast<uint64_t>(tuple_size), true, 0});
+    if (needs_write_counts) steps.emplace_back(FillBuffer{"d_projection_write_counts", 0, variable("projection_num_tiles"), 0});
 }
 
 static void collectTableScans(const OperatorNode* node, std::vector<const TableScanNode*>& out) {
@@ -3959,6 +3538,9 @@ static std::string projectionScalarExprValue(const ExprNode* expr,
                                              const Catalog& catalog) {
     if (!expr) return "0";
     switch (expr->getType()) {
+        case ExprType::LITERAL_TEXT: throw std::runtime_error("Text literals require parameter extraction and the Text planner");
+        case ExprType::PARAMETER_REF:
+            return parameterName(static_cast<const ParameterRefExpr*>(expr)->slot);
         case ExprType::COLUMN_REF:
             return projectionScalarColumnValue(static_cast<const ColumnRefExpr*>(expr)->column_name, row_expr, ctx);
         case ExprType::LITERAL_INT:
@@ -4031,9 +3613,8 @@ static std::string projectionScalarExprValue(const ExprNode* expr,
             const auto* c = static_cast<const CaseWhenExpr*>(expr);
             const std::string choose_then = combineAndTerms({projectionScalarExprValid(c->condition.get(), row_expr, ctx, catalog),
                                                              projectionScalarExprValue(c->condition.get(), row_expr, ctx, catalog)});
-            return "((" + choose_then + ") ? (" +
-                   projectionScalarExprValue(c->then_expr.get(), row_expr, ctx, catalog) + ") : (" +
-                   projectionScalarExprValue(c->else_expr.get(), row_expr, ctx, catalog) + "))";
+            return emitCaseValue(expr, choose_then, projectionScalarExprValue(c->then_expr.get(), row_expr, ctx, catalog),
+                                 projectionScalarExprValue(c->else_expr.get(), row_expr, ctx, catalog), ctx.parameter_schema);
         }
     }
     return "0";
@@ -4045,11 +3626,14 @@ static std::string projectionScalarExprValid(const ExprNode* expr,
                                              const Catalog& catalog) {
     if (!expr) return "1";
     switch (expr->getType()) {
+        case ExprType::PARAMETER_REF:
+            return parameterName(static_cast<const ParameterRefExpr*>(expr)->slot) + "_valid";
         case ExprType::LITERAL_NULL:
             return "0";
         case ExprType::STAR:
         case ExprType::LITERAL_INT:
         case ExprType::LITERAL_FLOAT:
+        case ExprType::LITERAL_TEXT:
         case ExprType::OP_IS_NULL:
         case ExprType::OP_IS_NOT_NULL:
             return "1";
@@ -4133,7 +3717,7 @@ static bool emitProjectionSortLimitDirectTopKIfEligible(const SortLimitNode* nod
                                                         JITContext& ctx,
                                                         const Catalog& catalog) {
     constexpr unsigned long long kProjectionDirectTopKChunkRows = 4096ULL;
-    if (!node || !node->has_limit || node->limit == 0) return false;
+    if (!node || !node->hasLimit()) return false;
     if (node->sort_keys.size() != 1 || !node->sort_keys.front().descending) return false;
     if (node->getChildren().empty()) return false;
 
@@ -4145,7 +3729,6 @@ static bool emitProjectionSortLimitDirectTopKIfEligible(const SortLimitNode* nod
     if (!scan_child || scan_child->getType() != OperatorType::TABLE_SCAN) return false;
     const auto* scan = static_cast<const TableScanNode*>(scan_child);
     const auto& scan_meta = catalog.getTableMetadata(scan->table_name);
-    if (!adaptiveTopKLimitWorthwhile(static_cast<std::uint64_t>(node->limit), scan_meta.getSize())) return false;
 
     std::vector<const ExprNode*> expanded;
     std::vector<std::unique_ptr<ExprNode>> owned_expanded;
@@ -4165,7 +3748,7 @@ static bool emitProjectionSortLimitDirectTopKIfEligible(const SortLimitNode* nod
     const SortKeyDef& key = node->sort_keys.front();
     if (key.column_index >= expanded.size()) return false;
     const ExprNode* key_expr = expanded[key.column_index];
-    const LogicalType key_type = resultLogicalTypeForExpr(key_expr);
+    const LogicalType key_type = resultLogicalTypeForExpr(key_expr, ctx.parameter_schema);
     if (key_type != LogicalType::Int64 && key_type != LogicalType::UInt64) return false;
     if (resultColumnNullableForExpr(key_expr, catalog)) return false;
     if (!projectionExpressionsReferenceOnlyTable(expanded, scan->table_name)) return false;
@@ -4173,19 +3756,7 @@ static bool emitProjectionSortLimitDirectTopKIfEligible(const SortLimitNode* nod
     const int tuple_size = static_cast<int>(expanded.size());
     std::vector<LogicalType> projection_types;
     projection_types.reserve(expanded.size());
-    for (const auto* expr : expanded) projection_types.push_back(resultLogicalTypeForExpr(expr));
-
-    auto add_kernel = [&](const std::string& name) {
-        if (std::find(ctx.kernel_class_names.begin(), ctx.kernel_class_names.end(), name) == ctx.kernel_class_names.end()) {
-            ctx.kernel_class_names.push_back(name);
-        }
-    };
-    add_kernel("ProjectionDirectTopKRadixHistogram");
-    add_kernel("ProjectionDirectTopKRadixReduce");
-    add_kernel("ProjectionDirectTopKInitIndices");
-    add_kernel("ProjectionDirectTopKCollect");
-    add_kernel("ProjectionDirectTopKSort");
-    add_kernel("ProjectionDirectTopKMaterialize");
+    for (const auto* expr : expanded) projection_types.push_back(resultLogicalTypeForExpr(expr, ctx.parameter_schema));
 
     ctx.tuple_size = tuple_size;
     ctx.result_size_expr = "1";
@@ -4193,85 +3764,40 @@ static bool emitProjectionSortLimitDirectTopKIfEligible(const SortLimitNode* nod
     ctx.sort_limit_post_execution_fused = true;
 
     const std::string row_count_expr = sizeMacroFor(scan->table_name);
-    std::stringstream& out = ctx.post_execution_code;
-    out << "    {\n";
-    out << "        constexpr unsigned long long projection_topk_chunk_rows = " << kProjectionDirectTopKChunkRows << "ULL;\n";
-    out << "        constexpr unsigned long long projection_topk_threads = 256ULL;\n";
-    out << "        constexpr unsigned long long projection_topk_radix_buckets = 256ULL;\n";
-    out << "        const unsigned long long projection_topk_input_rows = static_cast<unsigned long long>(" << row_count_expr << ");\n";
-    out << "        if (projection_topk_input_rows > static_cast<unsigned long long>(std::numeric_limits<std::size_t>::max())) {\n";
-    out << "            throw std::overflow_error(\"Projection Top-K input row count overflow\");\n";
-    out << "        }\n";
-    out << "        const unsigned long long projection_topk_output_rows = projection_topk_input_rows < " << node->limit << "ULL ? projection_topk_input_rows : " << node->limit << "ULL;\n";
-    out << "        if (projection_topk_output_rows != 0ULL && projection_topk_output_rows > std::numeric_limits<unsigned long long>::max() / " << tuple_size << "ULL) {\n";
-    out << "            throw std::overflow_error(\"Projection Top-K result size overflow\");\n";
-    out << "        }\n";
-    out << "        ctx->result_row_count_ = static_cast<std::size_t>(projection_topk_output_rows);\n";
-    out << "        ctx->result_is_dense_ = true;\n";
-    out << "        ctx->expected_result_size_ = projection_topk_output_rows == 0ULL ? static_cast<std::size_t>(" << tuple_size << ") : static_cast<std::size_t>(projection_topk_output_rows) * static_cast<std::size_t>(" << tuple_size << "ULL);\n";
-    out << "        const unsigned long long projection_topk_hist_groups = (projection_topk_input_rows + projection_topk_chunk_rows - 1ULL) / projection_topk_chunk_rows;\n";
-    out << "        if (projection_topk_hist_groups > std::numeric_limits<unsigned long long>::max() / projection_topk_radix_buckets) {\n";
-    out << "            throw std::overflow_error(\"Projection Top-K histogram size overflow\");\n";
-    out << "        }\n";
-    out << "        const unsigned long long projection_topk_hist_entries = projection_topk_hist_groups == 0ULL ? projection_topk_radix_buckets : projection_topk_hist_groups * projection_topk_radix_buckets;\n";
-    out << "        if (projection_topk_hist_entries > static_cast<unsigned long long>(std::numeric_limits<std::size_t>::max() / sizeof(unsigned long long))) {\n";
-    out << "            throw std::overflow_error(\"Projection Top-K histogram byte size overflow\");\n";
-    out << "        }\n";
-    out << "        unsigned long long projection_topk_padded_rows = 1ULL;\n";
-    out << "        while (projection_topk_padded_rows < (projection_topk_output_rows == 0ULL ? 1ULL : projection_topk_output_rows)) {\n";
-    out << "            if (projection_topk_padded_rows > (std::numeric_limits<unsigned long long>::max() >> 1)) throw std::overflow_error(\"Projection Top-K padded row count overflow\");\n";
-    out << "            projection_topk_padded_rows <<= 1ULL;\n";
-    out << "        }\n";
-    out << "        if (projection_topk_padded_rows > static_cast<unsigned long long>(std::numeric_limits<std::size_t>::max() / sizeof(unsigned long long))) {\n";
-    out << "            throw std::overflow_error(\"Projection Top-K indices byte size overflow\");\n";
-    out << "        }\n";
-    out << "        const std::size_t projection_topk_validity_words = (static_cast<std::size_t>(projection_topk_output_rows) + 63ULL) / 64ULL;\n";
-    out << "        const std::size_t projection_topk_result_bytes = static_cast<std::size_t>(projection_topk_output_rows) * static_cast<std::size_t>(" << tuple_size << "ULL) * sizeof(unsigned long long);\n";
-    out << "        const std::size_t projection_topk_validity_bytes = static_cast<std::size_t>(" << tuple_size << ") * (projection_topk_validity_words == 0 ? 1ULL : projection_topk_validity_words) * sizeof(uint64_t);\n";
-    out << "        const std::size_t projection_topk_temp_bytes = projection_topk_output_rows == 0ULL ? 0ULL : (static_cast<std::size_t>(projection_topk_hist_entries) + static_cast<std::size_t>(projection_topk_radix_buckets) + static_cast<std::size_t>(projection_topk_padded_rows) + 2ULL) * sizeof(unsigned long long);\n";
-    out << "        const std::size_t projection_topk_total_mem = static_cast<std::size_t>(q.get_device().get_info<sycl::info::device::global_mem_size>());\n";
-    out << "        const std::size_t projection_topk_reserve_a = projection_topk_total_mem / 10ULL;\n";
-    out << "        const std::size_t projection_topk_reserve_b = static_cast<std::size_t>(512ULL * 1024ULL * 1024ULL);\n";
-    out << "        const std::size_t projection_topk_reserve = projection_topk_reserve_a > projection_topk_reserve_b ? projection_topk_reserve_a : projection_topk_reserve_b;\n";
-    out << "        const std::size_t projection_topk_budget = projection_topk_total_mem > projection_topk_reserve ? projection_topk_total_mem - projection_topk_reserve : projection_topk_total_mem / 2ULL;\n";
-    out << "        const std::size_t projection_topk_required = ctx->loaded_device_bytes_ + projection_topk_result_bytes + projection_topk_validity_bytes + projection_topk_temp_bytes;\n";
-    out << "        if (projection_topk_required > projection_topk_budget) {\n";
-    out << "            throw std::runtime_error(\"Insufficient GPU memory before projection Top-K: result and scratch buffers do not fit device memory\");\n";
-    out << "        }\n";
-    out << "        ctx->ensureColumnarResultCapacity(" << tuple_size << ", static_cast<std::size_t>(projection_topk_output_rows));\n";
-    for (int col = 0; col < tuple_size; ++col) {
-        const LogicalType type = projection_types[static_cast<std::size_t>(col)];
-        out << "        " << resultColumnPointerType(type) << " d_result_col_" << col << " = ctx->" << resultColumnGetter(type) << "(" << col << ");\n";
-        if (resultColumnNullableForExpr(expanded[static_cast<std::size_t>(col)], catalog)) {
-            out << "        uint64_t* d_result_validity_col_" << col << " = ctx->getResultColumnValidityPointer(" << col << ");\n";
-        }
-    }
+    auto& steps = ctx.physical.post;
+    steps.emplace_back(SetScalar{"projection_topk_input_rows", variable(row_count_expr)});
+    steps.emplace_back(SetScalar{"projection_topk_output_rows", minimum(variable("projection_topk_input_rows"), limitSize(node))});
+    steps.emplace_back(SetScalar{"projection_topk_hist_groups", ceilDiv(variable("projection_topk_input_rows"), kProjectionDirectTopKChunkRows)});
+    steps.emplace_back(SetScalar{"projection_topk_hist_entries", maximum(variable("projection_topk_hist_groups"), 1) * 256});
+    steps.emplace_back(SetScalar{"projection_topk_padded_rows", nextPowerOfTwo(variable("projection_topk_output_rows"))});
+    ctx.physical.columns(steps, kernelStorageTypes(projection_types), variable("projection_topk_output_rows"));
+    steps.emplace_back(PublishResult{variable("projection_topk_output_rows"), maximum(variable("projection_topk_output_rows"), 1) * static_cast<uint64_t>(tuple_size), true, 0});
+    std::stringstream out;
     const std::string row_key = projectionScalarOrderedKeyExpr(key_expr, key_type, "projection_topk_idx", ctx, catalog);
     const std::string left_key = projectionScalarOrderedKeyExpr(key_expr, key_type, "projection_topk_left_idx", ctx, catalog);
     const std::string right_key = projectionScalarOrderedKeyExpr(key_expr, key_type, "projection_topk_right_idx", ctx, catalog);
-    out << "        if (projection_topk_output_rows != 0ULL) {\n";
-    out << "            const unsigned long long projection_topk_invalid_idx = std::numeric_limits<unsigned long long>::max();\n";
-    out << "            unsigned long long* d_projection_topk_hist = ctx->config_.reuse_scratch_buffers ? ctx->getScratchUInt64Buffer(\"d_projection_topk_hist\", static_cast<std::size_t>(projection_topk_hist_entries)) : sycl::malloc_device<unsigned long long>(static_cast<std::size_t>(projection_topk_hist_entries), q);\n";
-    out << "            unsigned long long* d_projection_topk_bucket_counts = ctx->config_.reuse_scratch_buffers ? ctx->getScratchUInt64Buffer(\"d_projection_topk_bucket_counts\", static_cast<std::size_t>(projection_topk_radix_buckets)) : sycl::malloc_device<unsigned long long>(static_cast<std::size_t>(projection_topk_radix_buckets), q);\n";
-    out << "            unsigned long long* d_projection_topk_counts = ctx->config_.reuse_scratch_buffers ? ctx->getScratchUInt64Buffer(\"d_projection_topk_counts\", static_cast<std::size_t>(2)) : sycl::malloc_device<unsigned long long>(static_cast<std::size_t>(2), q);\n";
-    out << "            unsigned long long* d_projection_topk_indices = ctx->config_.reuse_scratch_buffers ? ctx->getScratchUInt64Buffer(\"d_projection_topk_indices\", static_cast<std::size_t>(projection_topk_padded_rows)) : sycl::malloc_device<unsigned long long>(static_cast<std::size_t>(projection_topk_padded_rows), q);\n";
-    out << "            std::vector<unsigned long long> projection_topk_host_bucket_counts(static_cast<std::size_t>(projection_topk_radix_buckets));\n";
-    out << "            unsigned long long projection_topk_prefix = 0ULL;\n";
-    out << "            unsigned int projection_topk_prefix_bits = 0U;\n";
-    out << "            unsigned long long projection_topk_rank_needed = projection_topk_output_rows;\n";
-    out << "            for (int projection_topk_shift = 56; projection_topk_shift >= 0; projection_topk_shift -= 8) {\n";
-    out << "                q.memset(d_projection_topk_hist, 0, static_cast<std::size_t>(projection_topk_hist_entries) * sizeof(unsigned long long));\n";
-    out << "                const unsigned long long projection_topk_this_prefix = projection_topk_prefix;\n";
-    out << "                const unsigned int projection_topk_this_prefix_bits = projection_topk_prefix_bits;\n";
-    out << "                if (projection_topk_hist_groups > std::numeric_limits<unsigned long long>::max() / projection_topk_threads) throw std::overflow_error(\"Projection Top-K histogram work size overflow\");\n";
-    out << "                const std::size_t projection_topk_hist_work = static_cast<std::size_t>(projection_topk_hist_groups * projection_topk_threads);\n";
-    out << "                q.submit([&](sycl::handler& h) {\n";
-    out << "                    sycl::local_accessor<unsigned long long, 1> projection_local_hist(sycl::range<1>(static_cast<std::size_t>(projection_topk_radix_buckets)), h);\n";
-    out << "                    h.parallel_for<class ProjectionDirectTopKRadixHistogram>(sycl::nd_range<1>(sycl::range<1>(projection_topk_hist_work), sycl::range<1>(static_cast<std::size_t>(projection_topk_threads))), [=](sycl::nd_item<1> it) {\n";
+    PlanBlock selecting;
+    selecting.emplace_back(SetScalar{"projection_topk_invalid_idx", UINT64_MAX});
+    ctx.physical.scratch(selecting, "d_projection_topk_hist", DB_TYPE_UINT64, variable("projection_topk_hist_entries"));
+    ctx.physical.scratch(selecting, "d_projection_topk_bucket_counts", DB_TYPE_UINT64, 256);
+    ctx.physical.scratch(selecting, "d_projection_topk_counts", DB_TYPE_UINT64, 2);
+    ctx.physical.scratch(selecting, "d_projection_topk_indices", DB_TYPE_UINT64, variable("projection_topk_padded_rows"));
+    selecting.emplace_back(SetScalar{"projection_topk_prefix", 0});
+    selecting.emplace_back(SetScalar{"projection_topk_prefix_bits", 0});
+    selecting.emplace_back(SetScalar{"projection_topk_rank_needed", variable("projection_topk_output_rows")});
+    selecting.emplace_back(SetScalar{"projection_topk_pass", 0});
+    PlanBlock radix{
+        FillBuffer{"d_projection_topk_hist", 0, variable("projection_topk_hist_entries"), 0},
+        SetScalar{"projection_topk_shift", SizeExpr(56) - variable("projection_topk_pass") * 8},
+        SetScalar{"projection_topk_this_prefix", variable("projection_topk_prefix")},
+        SetScalar{"projection_topk_this_prefix_bits", variable("projection_topk_prefix_bits")}};
+    out << "constexpr unsigned long long projection_topk_chunk_rows=4096ULL;\n"
+        << "constexpr unsigned long long projection_topk_threads=256ULL;\n"
+        << "constexpr unsigned long long projection_topk_radix_buckets=256ULL;\n";
     out << "                        const unsigned long long projection_topk_lid = static_cast<unsigned long long>(it.get_local_linear_id());\n";
     out << "                        const unsigned long long projection_topk_group = static_cast<unsigned long long>(it.get_group_linear_id());\n";
     out << "                        if (projection_topk_lid < projection_topk_radix_buckets) projection_local_hist[projection_topk_lid] = 0ULL;\n";
-    out << "                        it.barrier(sycl::access::fence_space::local_space);\n";
+    out << "                        __syncthreads();\n";
     out << "                        const unsigned long long projection_topk_base = projection_topk_group * projection_topk_chunk_rows;\n";
     out << "                        for (unsigned long long projection_topk_pos = projection_topk_lid; projection_topk_pos < projection_topk_chunk_rows; projection_topk_pos += projection_topk_threads) {\n";
     out << "                            const unsigned long long projection_topk_idx = projection_topk_base + projection_topk_pos;\n";
@@ -4283,54 +3809,40 @@ static bool emitProjectionSortLimitDirectTopKIfEligible(const SortLimitNode* nod
     out << "                                }\n";
     out << "                                if (projection_topk_prefix_match) {\n";
     out << "                                    const unsigned long long projection_topk_bucket = (projection_topk_key >> static_cast<unsigned int>(projection_topk_shift)) & 255ULL;\n";
-    out << "                                    sycl::atomic_ref<unsigned long long, sycl::memory_order::relaxed, sycl::memory_scope::work_group, sycl::access::address_space::local_space> projection_topk_bucket_count(projection_local_hist[projection_topk_bucket]);\n";
-    out << "                                    projection_topk_bucket_count.fetch_add(1ULL);\n";
+    out << "                                    atomicAdd(&projection_local_hist[projection_topk_bucket], 1ULL);\n";
     out << "                                }\n";
     out << "                            }\n";
     out << "                        }\n";
-    out << "                        it.barrier(sycl::access::fence_space::local_space);\n";
+    out << "                        __syncthreads();\n";
     out << "                        if (projection_topk_lid < projection_topk_radix_buckets) {\n";
     out << "                            d_projection_topk_hist[projection_topk_group * projection_topk_radix_buckets + projection_topk_lid] = projection_local_hist[projection_topk_lid];\n";
     out << "                        }\n";
-    out << "                    });\n";
-    out << "                });\n";
-    out << "                q.submit([&](sycl::handler& h) {\n";
-    out << "                    h.parallel_for<class ProjectionDirectTopKRadixReduce>(sycl::nd_range<1>(sycl::range<1>(static_cast<std::size_t>(projection_topk_radix_buckets * projection_topk_threads)), sycl::range<1>(static_cast<std::size_t>(projection_topk_threads))), [=](sycl::nd_item<1> it) {\n";
+    ctx.physical.ndRange(radix, "ProjectionDirectTopKRadixHistogram", out.str(), variable("projection_topk_hist_groups"), 256,
+        {"projection_topk_input_rows", "projection_topk_this_prefix", "projection_topk_this_prefix_bits", "projection_topk_shift"}, {{"projection_local_hist", DB_TYPE_UINT64, 256}});
+    out.str("");
+    out << "constexpr unsigned long long projection_topk_threads=256ULL;\n"
+        << "constexpr unsigned long long projection_topk_radix_buckets=256ULL;\n";
     out << "                        const unsigned long long projection_topk_bucket = static_cast<unsigned long long>(it.get_group_linear_id());\n";
     out << "                        const unsigned long long projection_topk_lid = static_cast<unsigned long long>(it.get_local_linear_id());\n";
     out << "                        unsigned long long projection_topk_local_count = 0ULL;\n";
     out << "                        for (unsigned long long projection_topk_group = projection_topk_lid; projection_topk_group < projection_topk_hist_groups; projection_topk_group += projection_topk_threads) {\n";
     out << "                            projection_topk_local_count += d_projection_topk_hist[projection_topk_group * projection_topk_radix_buckets + projection_topk_bucket];\n";
     out << "                        }\n";
-    out << "                        const unsigned long long projection_topk_bucket_count = sycl::reduce_over_group(it.get_group(), projection_topk_local_count, sycl::plus<unsigned long long>{});\n";
+    out << "                        const unsigned long long projection_topk_bucket_count = crystal::blockReduce<unsigned long long>(projection_topk_local_count, db_collective_u64, threadIdx.x, blockDim.x, crystal::Sum<unsigned long long>{});\n";
     out << "                        if (projection_topk_lid == 0ULL) d_projection_topk_bucket_counts[projection_topk_bucket] = projection_topk_bucket_count;\n";
-    out << "                    });\n";
-    out << "                });\n";
-    out << "                q.memcpy(projection_topk_host_bucket_counts.data(), d_projection_topk_bucket_counts, static_cast<std::size_t>(projection_topk_radix_buckets) * sizeof(unsigned long long)).wait();\n";
-    out << "                unsigned int projection_topk_selected_bucket = 0U;\n";
-    out << "                for (int projection_topk_bucket = 255; projection_topk_bucket >= 0; --projection_topk_bucket) {\n";
-    out << "                    const unsigned long long projection_topk_bucket_count = projection_topk_host_bucket_counts[static_cast<std::size_t>(projection_topk_bucket)];\n";
-    out << "                    if (projection_topk_rank_needed > projection_topk_bucket_count) {\n";
-    out << "                        projection_topk_rank_needed -= projection_topk_bucket_count;\n";
-    out << "                    } else {\n";
-    out << "                        projection_topk_selected_bucket = static_cast<unsigned int>(projection_topk_bucket);\n";
-    out << "                        break;\n";
-    out << "                    }\n";
-    out << "                }\n";
-    out << "                projection_topk_prefix = (projection_topk_prefix << 8U) | static_cast<unsigned long long>(projection_topk_selected_bucket);\n";
-    out << "                projection_topk_prefix_bits += 8U;\n";
-    out << "            }\n";
-    out << "            const unsigned long long projection_topk_threshold_key = projection_topk_prefix;\n";
-    out << "            const unsigned long long projection_topk_equal_needed = projection_topk_rank_needed;\n";
-    out << "            const unsigned long long projection_topk_count_greater = projection_topk_output_rows - projection_topk_equal_needed;\n";
-    out << "            q.submit([&](sycl::handler& h) {\n";
-    out << "                h.parallel_for<class ProjectionDirectTopKInitIndices>(sycl::range<1>(static_cast<std::size_t>(projection_topk_padded_rows)), [=](sycl::id<1> gid) {\n";
+    ctx.physical.ndRange(radix, "ProjectionDirectTopKRadixReduce", out.str(), 256, 256, {"projection_topk_hist_groups"});
+    radix.emplace_back(SelectRadixBucket{"d_projection_topk_bucket_counts", "projection_topk_rank_needed", "projection_topk_prefix"});
+    radix.emplace_back(SetScalar{"projection_topk_prefix_bits", variable("projection_topk_prefix_bits") + 8});
+    radix.emplace_back(SetScalar{"projection_topk_pass", variable("projection_topk_pass") + 1});
+    selecting.emplace_back(Loop{less(variable("projection_topk_pass"), 8), std::move(radix), 8});
+    selecting.emplace_back(SetScalar{"projection_topk_threshold_key", variable("projection_topk_prefix")});
+    selecting.emplace_back(SetScalar{"projection_topk_equal_needed", variable("projection_topk_rank_needed")});
+    selecting.emplace_back(SetScalar{"projection_topk_count_greater", variable("projection_topk_output_rows") - variable("projection_topk_equal_needed")});
+    out.str("");
     out << "                    d_projection_topk_indices[gid[0]] = projection_topk_invalid_idx;\n";
-    out << "                });\n";
-    out << "            });\n";
-    out << "            q.memset(d_projection_topk_counts, 0, 2ULL * sizeof(unsigned long long));\n";
-    out << "            q.submit([&](sycl::handler& h) {\n";
-    out << "                h.parallel_for<class ProjectionDirectTopKCollect>(sycl::range<1>(static_cast<std::size_t>(projection_topk_input_rows)), [=](sycl::id<1> gid) {\n";
+    ctx.physical.range(selecting, "ProjectionDirectTopKInitIndices", out.str(), variable("projection_topk_padded_rows"), {"projection_topk_invalid_idx"});
+    selecting.emplace_back(FillBuffer{"d_projection_topk_counts", 0, 2, 0});
+    out.str("");
     out << "                    const unsigned long long projection_topk_idx = static_cast<unsigned long long>(gid[0]);\n";
     out << "                    const unsigned long long projection_topk_key = " << row_key << ";\n";
     out << "                    if (projection_topk_key > projection_topk_threshold_key) {\n";
@@ -4340,14 +3852,12 @@ static bool emitProjectionSortLimitDirectTopKIfEligible(const SortLimitNode* nod
     out << "                        const unsigned long long projection_topk_pos = db::atomic_fetch_add_ull(d_projection_topk_counts[1], 1ULL);\n";
     out << "                        if (projection_topk_pos < projection_topk_equal_needed) d_projection_topk_indices[projection_topk_count_greater + projection_topk_pos] = projection_topk_idx;\n";
     out << "                    }\n";
-    out << "                });\n";
-    out << "            });\n";
-    out << "            for (unsigned long long projection_topk_k = 2ULL; projection_topk_k <= projection_topk_padded_rows; projection_topk_k <<= 1ULL) {\n";
-    out << "                for (unsigned long long projection_topk_j = projection_topk_k >> 1ULL; projection_topk_j > 0ULL; projection_topk_j >>= 1ULL) {\n";
-    out << "                    q.submit([&](sycl::handler& h) {\n";
-    out << "                        h.parallel_for<class ProjectionDirectTopKSort>(sycl::range<1>(static_cast<std::size_t>(projection_topk_padded_rows)), [=](sycl::id<1> gid) {\n";
+    ctx.physical.range(selecting, "ProjectionDirectTopKCollect", out.str(), variable("projection_topk_input_rows"),
+        {"projection_topk_threshold_key", "projection_topk_equal_needed", "projection_topk_count_greater"});
+    selecting.emplace_back(SetScalar{"sort_padded_rows", variable("projection_topk_padded_rows")});
+    out.str("");
     out << "                            const unsigned long long projection_topk_i = static_cast<unsigned long long>(gid[0]);\n";
-    out << "                            const unsigned long long projection_topk_ixj = projection_topk_i ^ projection_topk_j;\n";
+    out << "                            const unsigned long long projection_topk_ixj = projection_topk_i ^ sort_j;\n";
     out << "                            if (projection_topk_ixj > projection_topk_i) {\n";
     out << "                                const unsigned long long projection_topk_left_idx = d_projection_topk_indices[projection_topk_i];\n";
     out << "                                const unsigned long long projection_topk_right_idx = d_projection_topk_indices[projection_topk_ixj];\n";
@@ -4363,19 +3873,15 @@ static bool emitProjectionSortLimitDirectTopKIfEligible(const SortLimitNode* nod
     out << "                                    else if (projection_topk_right_key == projection_topk_left_key && projection_topk_right_idx < projection_topk_left_idx) projection_topk_right_before_left = true;\n";
     out << "                                }\n";
     out << "                                const bool projection_topk_left_before_right = (projection_topk_left_idx != projection_topk_right_idx) && !projection_topk_right_before_left;\n";
-    out << "                                const bool projection_topk_ascending_stage = ((projection_topk_i & projection_topk_k) == 0ULL);\n";
+    out << "                                const bool projection_topk_ascending_stage = ((projection_topk_i & sort_k) == 0ULL);\n";
     out << "                                const bool projection_topk_swap = projection_topk_ascending_stage ? projection_topk_right_before_left : projection_topk_left_before_right;\n";
     out << "                                if (projection_topk_swap) {\n";
     out << "                                    d_projection_topk_indices[projection_topk_i] = projection_topk_right_idx;\n";
     out << "                                    d_projection_topk_indices[projection_topk_ixj] = projection_topk_left_idx;\n";
     out << "                                }\n";
     out << "                            }\n";
-    out << "                        });\n";
-    out << "                    });\n";
-    out << "                }\n";
-    out << "            }\n";
-    out << "            q.submit([&](sycl::handler& h) {\n";
-    out << "                h.parallel_for<class ProjectionDirectTopKMaterialize>(sycl::range<1>(static_cast<std::size_t>(projection_topk_output_rows)), [=](sycl::id<1> gid) {\n";
+    emitBitonicLaunchLoop(ctx, selecting, "ProjectionDirectTopKSort", out.str(), {"projection_topk_invalid_idx"});
+    out.str("");
     out << "                    const unsigned long long projection_topk_out_row = static_cast<unsigned long long>(gid[0]);\n";
     out << "                    const unsigned long long projection_topk_src_row = d_projection_topk_indices[projection_topk_out_row];\n";
     out << "                    if (projection_topk_src_row == projection_topk_invalid_idx || projection_topk_src_row >= projection_topk_input_rows) return;\n";
@@ -4384,7 +3890,7 @@ static bool emitProjectionSortLimitDirectTopKIfEligible(const SortLimitNode* nod
         const LogicalType type = projection_types[static_cast<std::size_t>(col)];
         const std::string value = projectionScalarExprValue(expr, "projection_topk_src_row", ctx, catalog);
         const std::string valid = projectionScalarExprValid(expr, "projection_topk_src_row", ctx, catalog);
-        out << "                    d_result_col_" << col << "[projection_topk_out_row] = " << castToResultColumnType(value, type) << ";\n";
+        out << "                    d_result_col_" << col << "[projection_topk_out_row] = " << castToResultColumnType("(("+valid+") ? ("+value+") : 0)", type) << ";\n";
         if (resultColumnNullableForExpr(expr, catalog)) {
             if (isLiteralTrue(valid)) {
                 out << "                    db::atomic_set_valid_bit(d_result_validity_col_" << col << ", projection_topk_out_row);\n";
@@ -4393,17 +3899,8 @@ static bool emitProjectionSortLimitDirectTopKIfEligible(const SortLimitNode* nod
             }
         }
     }
-    out << "                });\n";
-    out << "            });\n";
-    out << "            q.wait();\n";
-    out << "            if (!ctx->config_.reuse_scratch_buffers) {\n";
-    out << "                sycl::free(d_projection_topk_hist, q);\n";
-    out << "                sycl::free(d_projection_topk_bucket_counts, q);\n";
-    out << "                sycl::free(d_projection_topk_counts, q);\n";
-    out << "                sycl::free(d_projection_topk_indices, q);\n";
-    out << "            }\n";
-    out << "        }\n";
-    out << "    }\n\n";
+    ctx.physical.range(selecting, "ProjectionDirectTopKMaterialize", out.str(), variable("projection_topk_output_rows"), {"projection_topk_input_rows", "projection_topk_invalid_idx"});
+    steps.emplace_back(Branch{less(0, variable("projection_topk_output_rows")), std::move(selecting), {}});
     return true;
 }
 
@@ -4439,8 +3936,8 @@ void JITOperatorVisitor::consumeProjectionVector(const ProjectionNode* node, JIT
     ctx.tuple_size = tuple_size > 0 ? tuple_size : 1;
     std::vector<LogicalType> projection_types;
     projection_types.reserve(expanded.size());
-    for (const auto* expr : expanded) projection_types.push_back(resultLogicalTypeForExpr(expr));
-    std::string row_count = "LO_LEN";
+    for (const auto* expr : expanded) projection_types.push_back(resultLogicalTypeForExpr(expr, ctx.parameter_schema));
+    std::string row_count = sizeMacroFor("LINEORDER");
     if (scans.size() == 1) row_count = sizeMacroFor(scans[0]->table_name);
     if (projection_pass_ == ProjectionPass::DirectDense) {
         emitProjectionDirectDenseSetup(ctx, row_count, ctx.tuple_size, projection_types);
@@ -4456,7 +3953,7 @@ void JITOperatorVisitor::consumeProjectionVector(const ProjectionNode* node, JIT
         code << "                    ++projection_local_count;\n";
         code << "                }\n";
         code << "            }\n";
-        code << "            unsigned long long projection_tile_count = sycl::reduce_over_group(it.get_group(), projection_local_count, sycl::plus<unsigned long long>{});\n";
+        code << "            unsigned long long projection_tile_count = crystal::blockReduce<unsigned long long>(projection_local_count, db_collective_u64, threadIdx.x, blockDim.x, crystal::Sum<unsigned long long>{});\n";
         code << "            if (tid == 0) {\n";
         code << "                d_projection_counts[it.get_group_linear_id()] = projection_tile_count;\n";
         code << "            }\n";
@@ -4475,7 +3972,7 @@ void JITOperatorVisitor::consumeProjectionVector(const ProjectionNode* node, JIT
         code << "                    ++projection_local_count;\n";
         code << "                }\n";
         code << "            }\n";
-        code << "            unsigned long long projection_thread_base = sycl::exclusive_scan_over_group(it.get_group(), projection_local_count, sycl::plus<unsigned long long>{});\n";
+        code << "            unsigned long long projection_thread_base = crystal::blockExclusiveScan<unsigned long long>(projection_local_count, db_collective_u64, threadIdx.x, blockDim.x, 0ULL, crystal::Sum<unsigned long long>{});\n";
         code << "            unsigned long long projection_local_row = 0ULL;\n";
     }
     code << "            #pragma unroll\n";
@@ -4491,7 +3988,7 @@ void JITOperatorVisitor::consumeProjectionVector(const ProjectionNode* node, JIT
         std::string val = projectionVectorExprValue(expanded[slot], ctx);
         std::string valid = projectionVectorExprValid(expanded[slot], ctx);
         const LogicalType out_type = (slot < static_cast<int>(projection_types.size())) ? projection_types[static_cast<std::size_t>(slot)] : LogicalType::UInt64;
-        code << "                    d_result_col_" << slot << "[out_row] = " << castToResultColumnType(val, out_type) << ";\n";
+        code << "                    d_result_col_" << slot << "[out_row] = " << castToResultColumnType("(("+valid+") ? ("+val+") : 0)", out_type) << ";\n";
         if (resultColumnNullableForExpr(expanded[slot], catalog_)) {
             if (valid == "1" || valid == "true" || valid == "(1)" || valid == "(true)") {
                 code << "                    db::atomic_set_valid_bit(d_result_validity_col_" << slot << ", out_row);\n";
@@ -4543,6 +4040,9 @@ static std::string itemExprValid(const ExprNode* e, JITContext& ctx);
 static std::string itemExprValue(const ExprNode* e, JITContext& ctx) {
     if (!e) return "0";
     switch (e->getType()) {
+        case ExprType::LITERAL_TEXT: throw std::runtime_error("Text literals require parameter extraction and the Text planner");
+        case ExprType::PARAMETER_REF:
+            return parameterName(static_cast<const ParameterRefExpr*>(e)->slot);
         case ExprType::COLUMN_REF:
             return itemColumnValueExpr(static_cast<const ColumnRefExpr*>(e)->column_name, ctx);
         case ExprType::LITERAL_INT:
@@ -4612,7 +4112,7 @@ static std::string itemExprValue(const ExprNode* e, JITContext& ctx) {
         case ExprType::CASE_WHEN: {
             const auto* c = static_cast<const CaseWhenExpr*>(e);
             const std::string choose_then = combineAndTerms({itemExprValid(c->condition.get(), ctx), itemExprValue(c->condition.get(), ctx)});
-            return "((" + choose_then + ") ? (" + itemExprValue(c->then_expr.get(), ctx) + ") : (" + itemExprValue(c->else_expr.get(), ctx) + "))";
+            return emitCaseValue(e, choose_then, itemExprValue(c->then_expr.get(), ctx), itemExprValue(c->else_expr.get(), ctx), ctx.parameter_schema);
         }
     }
     return "0";
@@ -4621,11 +4121,14 @@ static std::string itemExprValue(const ExprNode* e, JITContext& ctx) {
 static std::string itemExprValid(const ExprNode* e, JITContext& ctx) {
     if (!e) return "1";
     switch (e->getType()) {
+        case ExprType::PARAMETER_REF:
+            return parameterName(static_cast<const ParameterRefExpr*>(e)->slot) + "_valid";
         case ExprType::LITERAL_NULL:
             return "0";
         case ExprType::STAR:
         case ExprType::LITERAL_INT:
         case ExprType::LITERAL_FLOAT:
+        case ExprType::LITERAL_TEXT:
         case ExprType::OP_IS_NULL:
         case ExprType::OP_IS_NOT_NULL:
             return "1";
@@ -4708,28 +4211,23 @@ static std::pair<std::string, uint64_t> generatePerfectHashItem(
             value = itemExprValue(g.get(), ctx);
             valid = itemExprValid(g.get(), ctx);
         } else if (g->getType() == ExprType::CASE_WHEN) {
-            int64_t lo = 0;
-            int64_t hi = 0;
-            bool case_nullable = false;
-            caseIntegerRangeOrThrow(g.get(), lo, hi, case_nullable);
-            min_val = static_cast<uint64_t>(lo);
-            card = static_cast<uint64_t>(hi - lo + 1);
-            value = itemExprValue(g.get(), ctx);
-            valid = itemExprValid(g.get(), ctx);
-            nullable = case_nullable || !isLiteralTrue(valid);
+            card = caseLeafCount(g.get());
+            value = emitCaseGroupCode(g.get(), [&](const ColumnRefExpr& col) {
+                return ExpressionCode{itemExprValue(&col, ctx), itemExprValid(&col, ctx)};
+            },ctx.parameter_schema);
         } else {
             throw std::runtime_error(std::string("GROUP BY expression is not supported by item hash codegen: ") + exprTypeName(g->getType()));
         }
         std::string term;
         if (nullable) {
             term = "((" + valid + ") ? (" + value + " - " + std::to_string(min_val) + " + 1) : 0)";
-            ++card;
+            card = checkedSizeAdd(card,1);
         } else {
             term = "(" + value + " - " + std::to_string(min_val) + ")";
         }
         if (hash_expr.empty()) hash_expr = term;
         else hash_expr = "(" + hash_expr + " * " + std::to_string(card) + " + " + term + ")";
-        total_size *= card;
+        total_size = checkedSizeMultiply(total_size, card);
     }
     if (hash_expr.empty()) {
         return {"0", 1};
@@ -4764,8 +4262,8 @@ void JITOperatorVisitor::consumeProjectionItem(const ProjectionNode* node, JITCo
     const int tuple_size = expanded.empty() ? 1 : static_cast<int>(expanded.size());
     ctx.tuple_size = tuple_size;
     std::vector<LogicalType> projection_types;
-    for (const auto* expr : expanded) projection_types.push_back(resultLogicalTypeForExpr(expr));
-    std::string row_count = "LO_LEN";
+    for (const auto* expr : expanded) projection_types.push_back(resultLogicalTypeForExpr(expr, ctx.parameter_schema));
+    std::string row_count = sizeMacroFor("LINEORDER");
     for (const auto* scan : scans) {
         try {
             if (catalog_.getTableMetadata(scan->table_name).isFactTable()) {
@@ -4789,7 +4287,7 @@ void JITOperatorVisitor::consumeProjectionItem(const ProjectionNode* node, JITCo
             const LogicalType out_type = (slot < static_cast<int>(projection_types.size())) ? projection_types[static_cast<std::size_t>(slot)] : LogicalType::UInt64;
             const std::string val = itemExprValue(expanded[slot], ctx);
             const std::string valid = itemExprValid(expanded[slot], ctx);
-            code << "                        d_result_col_" << slot << "[out_row] = " << castToResultColumnType(val, out_type) << ";\n";
+            code << "                        d_result_col_" << slot << "[out_row] = " << castToResultColumnType("(("+valid+") ? ("+val+") : 0)", out_type) << ";\n";
             if (resultColumnNullableForExpr(expanded[slot], catalog_)) {
                 if (isLiteralTrue(valid)) {
                     code << "                        db::atomic_set_valid_bit(d_result_validity_col_" << slot << ", out_row);\n";
@@ -4830,6 +4328,7 @@ JITOperatorVisitor::BuildInfo JITOperatorVisitor::computeBuildInfo(
     bi.dim_prefix  = tablePrefix(dim_table);
     bi.size_macro  = sizeMacro(dim_table);
     bi.ht_name     = "d_" + bi.dim_prefix + "_hash_table";
+    bi.occupancy_name = bi.ht_name + "_occupied";
     bi.variant     = 1;
     bi.use_mht     = false;
     bi.key_mins    = "0";
@@ -4839,13 +4338,13 @@ JITOperatorVisitor::BuildInfo JITOperatorVisitor::computeBuildInfo(
     // zero-based perfect-hash domains for PART/SUPPLIER/CUSTOMER.  Keeping the
     // same domains avoids subtle off-by-one differences for encoded key columns.
     if (dim_table == "PART") {
-        bi.ht_size_expr = "P_LEN";
+        bi.ht_size_expr = sizeMacroFor("PART");
         bi.key_mins = "0";
     } else if (dim_table == "SUPPLIER") {
-        bi.ht_size_expr = "S_LEN";
+        bi.ht_size_expr = sizeMacroFor("SUPPLIER");
         bi.key_mins = "0";
     } else if (dim_table == "CUSTOMER") {
-        bi.ht_size_expr = "C_LEN";
+        bi.ht_size_expr = sizeMacroFor("CUSTOMER");
         bi.key_mins = "0";
     } else if (dim_table == "DDATE") {
         // Leave one spare slot beyond the historic 19981230 upper bound.  This
@@ -5011,6 +4510,24 @@ std::string JITOperatorVisitor::emitBuildFilter(
         JITContext& ctx) const {
     if (!filter || !filter->predicate) return "";
 
+    if (!ctx.parameter_schema.empty()) {
+        const auto expression = emitSqlExpression(filter->predicate.get(), [&](const ColumnRefExpr& column) {
+            const auto& name = column.column_name;
+            ctx.external_columns.insert("d_" + name);
+            const auto row = "(static_cast<unsigned long long>(tile_offset) + tid + BLOCK_THREADS * i)";
+            std::string valid = "1";
+            if (catalogColumnNullable(catalog_, name)) {
+                ctx.external_null_columns.insert(nullBitmapSymbolFor(name));
+                valid = "db::bitmap_valid_at(" + nullBitmapSymbolFor(name) + ", " + row + ")";
+            }
+            return ExpressionCode{"d_" + name + "[" + row + "]", valid};
+        }, ctx.parameter_schema);
+        code << "for(int i=0;i<ITEMS_PER_THREAD;++i) {\n"
+             << "if(tid+BLOCK_THREADS*i<num_tile_items) flags[i] = flags[i] && (" << expression.valid
+             << ") && (" << expression.value << ");\n}\n";
+        return "";
+    }
+
     int mask_counter = 0;
     std::string current_items_col;
 
@@ -5172,10 +4689,11 @@ void JITOperatorVisitor::emitPHTBuildKernel(
     ctx.startNewPipeline("Build_" + bi.dim_prefix);
     auto& code = ctx.current_pipeline->kernel_body;
 
-    // HT size: 2× for open-addressing headroom
-    std::string ht_size = "2*" + bi.ht_size_expr;
-    ctx.hash_tables.push_back({bi.ht_name, "int",
-                               bi.variant == 1 ? ht_size : "2*" + bi.ht_size_expr});
+    // Interleaved key/payload storage, not open-addressing headroom.
+    ctx.physical.plan.steps.emplace_back(Require{lessEqual(sizeAtom(bi.ht_size_expr), INT32_MAX), "legacy PHT domain exceeds Int32 indexing"});
+    ctx.physical.scratch(ctx.physical.plan.steps, bi.ht_name, DB_TYPE_INT32, SizeExpr(2) * sizeAtom(bi.ht_size_expr), true);
+    ctx.physical.plan.steps.emplace_back(Require{lessEqual(variable(bi.size_macro), INT32_MAX), "legacy PHT build row IDs exceed Int32"});
+    ctx.physical.scratch(ctx.physical.plan.steps, bi.occupancy_name, DB_TYPE_INT32, sizeAtom(bi.ht_size_expr), true, "unsigned int");
 
     // Register PK column as external
     if (!bi.pk_col.empty()) {
@@ -5192,12 +4710,6 @@ void JITOperatorVisitor::emitPHTBuildKernel(
         markExpressionNullability(ctx, catalog_, build_filter->predicate.get());
     }
 
-    code << "    q.submit([&](sycl::handler& h) {\n";
-    code << "        int num_tiles = (" << bi.size_macro << " + TILE_SIZE - 1) / TILE_SIZE;\n";
-    code << "        size_t local  = BLOCK_THREADS;\n";
-    code << "        size_t global = num_tiles * BLOCK_THREADS;\n";
-    code << "        h.parallel_for<class " << kname << ">"
-         << "(sycl::nd_range<1>(global, local), [=](sycl::nd_item<1> it) {\n";
     code << "            int items[ITEMS_PER_THREAD];\n";
     if (bi.variant == 2) code << "            int items2[ITEMS_PER_THREAD];\n";
     code << "            int flags[ITEMS_PER_THREAD];\n";
@@ -5229,7 +4741,7 @@ void JITOperatorVisitor::emitPHTBuildKernel(
         // PHT_1: key-only
         code << "            BlockBuildSelectivePHT_1<int, BLOCK_THREADS, ITEMS_PER_THREAD>"
              << "(tid, items, flags, " << bi.ht_name << ", "
-             << bi.ht_size_expr << ", " << bi.key_mins << ", num_tile_items);\n";
+             << bi.ht_size_expr << ", " << bi.key_mins << ", num_tile_items, " << bi.occupancy_name << ");\n";
     } else {
         // PHT_2: key+value. For projection/materialization the value is the
         // build-side row_id; for aggregation/filter pushdown it remains a
@@ -5243,14 +4755,14 @@ void JITOperatorVisitor::emitPHTBuildKernel(
         }
         code << "            BlockBuildSelectivePHT_2<int, int, BLOCK_THREADS, ITEMS_PER_THREAD>"
              << "(tid, items, items2, flags, " << bi.ht_name << ", "
-             << bi.ht_size_expr << ", " << bi.key_mins << ", num_tile_items);\n";
+             << bi.ht_size_expr << ", " << bi.key_mins << ", num_tile_items, " << bi.occupancy_name << ");\n";
     }
 
-    code << "        });\n    });\n\n";
+    ctx.physical.ndRange(ctx.physical.plan.steps, kname, code.str(), ceilDiv(variable(bi.size_macro), 512), 128);
 }
 
 // ============================================================================
-// emitMHTBuildKernels — two-pass MHT build for 1-to-N joins (future use)
+// emitMHTBuildKernels — existing two-pass MHT build, now with explicit physical operations
 // ============================================================================
 void JITOperatorVisitor::emitMHTBuildKernels(
         const BuildInfo& bi,
@@ -5260,7 +4772,6 @@ void JITOperatorVisitor::emitMHTBuildKernels(
     std::string counts_name    = "d_" + bi.dim_prefix + "_counts";
     std::string offsets_name   = "d_" + bi.dim_prefix + "_offsets";
     std::string write_pos_name = "d_" + bi.dim_prefix + "_write_pos";
-    std::string block_sums_name = "d_" + bi.dim_prefix + "_block_sums";
 
     if (!bi.pk_col.empty()) {
         markColumnNullability(ctx, catalog_, bi.pk_col);
@@ -5276,20 +4787,19 @@ void JITOperatorVisitor::emitMHTBuildKernels(
         markExpressionNullability(ctx, catalog_, build_filter->predicate.get());
     }
 
-    ctx.hash_tables.push_back({bi.ht_name,    "int", "3*" + bi.ht_size_expr});
-    ctx.hash_tables.push_back({counts_name,   "int", bi.ht_size_expr});
-    ctx.hash_tables.push_back({offsets_name,  "int", bi.ht_size_expr});
-    ctx.hash_tables.push_back({write_pos_name,"int", bi.ht_size_expr});
+    auto& steps = ctx.physical.plan.steps;
+    const auto slots = sizeAtom(bi.ht_size_expr);
+    steps.emplace_back(Require{both(less(0, slots), lessEqual(slots, INT32_MAX)), "MHT Int32 directory requires 1..INT32_MAX slots"});
+    steps.emplace_back(Require{lessEqual(variable(bi.size_macro), INT32_MAX), "MHT Int32 counters require at most INT32_MAX build rows"});
+    ctx.physical.scratch(steps, bi.ht_name, DB_TYPE_INT32, SizeExpr(3) * slots, true);
+    for (const auto& name : {counts_name, offsets_name, write_pos_name}) ctx.physical.scratch(steps, name, DB_TYPE_INT32, slots, true);
+    if (!bi.pk_col.empty()) ctx.external_null_columns.insert(nullBitmapSymbolFor(bi.pk_col));
 
     // ---- Pass 1: Count ----
     std::string kname1 = ctx.getNewBuildKernelName(bi.dim_prefix + "_cnt");
     ctx.startNewPipeline("MHT_Count_" + bi.dim_prefix);
     auto& c1 = ctx.current_pipeline->kernel_body;
 
-    c1 << "    q.submit([&](sycl::handler& h) {\n";
-    c1 << "        int num_tiles = (" << bi.size_macro << " + TILE_SIZE - 1) / TILE_SIZE;\n";
-    c1 << "        h.parallel_for<class " << kname1 << ">"
-       << "(sycl::nd_range<1>(num_tiles*BLOCK_THREADS, BLOCK_THREADS), [=](sycl::nd_item<1> it) {\n";
     c1 << "            int items[ITEMS_PER_THREAD]; int flags[ITEMS_PER_THREAD];\n";
     c1 << "            int tid = it.get_local_linear_id();\n";
     c1 << "            int tile_offset = it.get_group_linear_id() * TILE_SIZE;\n";
@@ -5309,89 +4819,18 @@ void JITOperatorVisitor::emitMHTBuildKernels(
     c1 << "            BlockBuildMHT_Count<int,BLOCK_THREADS,ITEMS_PER_THREAD>"
        << "(tid,items,flags," << counts_name << "," << bi.ht_size_expr
        << "," << bi.key_mins << ",num_tile_items);\n";
-    c1 << "        });\n    });\n\n";
+    ctx.physical.ndRange(steps, kname1, c1.str(), ceilDiv(variable(bi.size_macro), 512), 128);
 
-    // ---- 3-Step Global Prefix Sum (using exclusive_scan_over_group) ----
-    ctx.startNewPipeline("MHT_PfxSum_" + bi.dim_prefix);
-    auto& cs = ctx.current_pipeline->kernel_body;
-
-    cs << "    {\n";
-    cs << "        int num_ps_blocks = (" << bi.ht_size_expr << " + 255) / 256;\n";
-    cs << "        int num_ps_super_blocks = (num_ps_blocks + 255) / 256;\n";
-    cs << "        int* " << block_sums_name << " = sycl::malloc_device<int>(num_ps_blocks, q);\n";
-    cs << "        int* " << block_sums_name << "_super = sycl::malloc_device<int>(num_ps_super_blocks, q);\n";
-
-    // Level 0: scan counts[] into offsets[], write per-block sums.
-    cs << "        q.submit([&](sycl::handler& h) {\n";
-    cs << "            h.parallel_for<class MHTBlockScan_" << bi.dim_prefix << ">"
-       << "(sycl::nd_range<1>(num_ps_blocks*256,256),[=](sycl::nd_item<1> it){\n";
-    cs << "                int gid = static_cast<int>(it.get_global_linear_id());\n";
-    cs << "                int lid = static_cast<int>(it.get_local_linear_id());\n";
-    cs << "                int val = (gid < " << bi.ht_size_expr << ") ? " << counts_name << "[gid] : 0;\n";
-    cs << "                int scanned = sycl::exclusive_scan_over_group(it.get_group(), val, sycl::plus<int>{});\n";
-    cs << "                if (gid < " << bi.ht_size_expr << ") " << offsets_name << "[gid] = scanned;\n";
-    cs << "                if (lid == 255) " << block_sums_name << "[it.get_group_linear_id()] = scanned + val;\n";
-    cs << "            });\n        });\n";
-
-    // Level 1: scan block_sums[] in 256-entry groups and write super sums.
-    cs << "        q.submit([&](sycl::handler& h) {\n";
-    cs << "            h.parallel_for<class MHTBlockSumsScan_" << bi.dim_prefix << ">"
-       << "(sycl::nd_range<1>(num_ps_super_blocks*256,256),[=](sycl::nd_item<1> it){\n";
-    cs << "                int gid = static_cast<int>(it.get_global_linear_id());\n";
-    cs << "                int lid = static_cast<int>(it.get_local_linear_id());\n";
-    cs << "                int val = (gid < num_ps_blocks) ? " << block_sums_name << "[gid] : 0;\n";
-    cs << "                int scanned = sycl::exclusive_scan_over_group(it.get_group(), val, sycl::plus<int>{});\n";
-    cs << "                if (gid < num_ps_blocks) " << block_sums_name << "[gid] = scanned;\n";
-    cs << "                if (lid == 255) " << block_sums_name << "_super[it.get_group_linear_id()] = scanned + val;\n";
-    cs << "            });\n        });\n";
-
-    // Level 2: scan super sums. Supports up to 256^3 hash slots.
-    cs << "        q.submit([&](sycl::handler& h) {\n";
-    cs << "            h.parallel_for<class MHTSuperSumsScan_" << bi.dim_prefix << ">"
-       << "(sycl::nd_range<1>(256,256),[=](sycl::nd_item<1> it){\n";
-    cs << "                int gid = static_cast<int>(it.get_global_linear_id());\n";
-    cs << "                int val = (gid < num_ps_super_blocks) ? " << block_sums_name << "_super[gid] : 0;\n";
-    cs << "                int scanned = sycl::exclusive_scan_over_group(it.get_group(), val, sycl::plus<int>{});\n";
-    cs << "                if (gid < num_ps_super_blocks) " << block_sums_name << "_super[gid] = scanned;\n";
-    cs << "            });\n        });\n";
-
-    cs << "        q.submit([&](sycl::handler& h) {\n";
-    cs << "            h.parallel_for<class MHTAddSuperSums_" << bi.dim_prefix << ">"
-       << "(sycl::nd_range<1>(num_ps_super_blocks*256,256),[=](sycl::nd_item<1> it){\n";
-    cs << "                int gid = static_cast<int>(it.get_global_linear_id());\n";
-    cs << "                if (gid < num_ps_blocks) " << block_sums_name << "[gid] += " << block_sums_name << "_super[it.get_group_linear_id()];\n";
-    cs << "            });\n        });\n";
-    cs << "        q.submit([&](sycl::handler& h) {\n";
-    cs << "            h.parallel_for<class MHTAddSums_" << bi.dim_prefix << ">"
-       << "(sycl::nd_range<1>(num_ps_blocks*256,256),[=](sycl::nd_item<1> it){\n";
-    cs << "                int gid = static_cast<int>(it.get_global_linear_id());\n";
-    cs << "                if (gid < " << bi.ht_size_expr << ") " << offsets_name << "[gid] += " << block_sums_name << "[it.get_group_linear_id()];\n";
-    cs << "            });\n        });\n";
-
-    cs << "        int mht_last_off=0, mht_last_cnt=0;\n";
-    cs << "        q.memcpy(&mht_last_off," << offsets_name << "+" << bi.ht_size_expr << "-1,sizeof(int)).wait();\n";
-    cs << "        q.memcpy(&mht_last_cnt," << counts_name << "+" << bi.ht_size_expr << "-1,sizeof(int)).wait();\n";
-    cs << "        int payload_sz_" << bi.dim_prefix << " = mht_last_off + mht_last_cnt;\n";
-    cs << "        if (payload_sz_" << bi.dim_prefix << " == 0) payload_sz_" << bi.dim_prefix << " = 1;\n";
-    cs << "        const size_t mht_payload_bytes_" << bi.dim_prefix << " = static_cast<size_t>(payload_sz_" << bi.dim_prefix << ") * sizeof(int);\n";
-    cs << "        const size_t mht_total_mem_" << bi.dim_prefix << " = static_cast<size_t>(q.get_device().get_info<sycl::info::device::global_mem_size>());\n";
-    cs << "        if (ctx->loaded_device_bytes_ + mht_payload_bytes_" << bi.dim_prefix << " > mht_total_mem_" << bi.dim_prefix << ") {\n";
-    cs << "            throw std::runtime_error(\"Insufficient GPU memory for MHT payload allocation\");\n";
-    cs << "        }\n";
-    cs << "        payload_" << bi.dim_prefix << " = sycl::malloc_device<int>(payload_sz_" << bi.dim_prefix << ", q);\n";
-    cs << "        q.memset(" << write_pos_name << ", 0, " << bi.ht_size_expr << "*sizeof(int));\n";
-    cs << "        sycl::free(" << block_sums_name << ", q);\n";
-    cs << "        sycl::free(" << block_sums_name << "_super, q);\n";
-    cs << "    }\n\n";
+    // The prebuilt hierarchical scan returns only the checked total to host control.
+    steps.emplace_back(DevicePrefix{counts_name, offsets_name, slots, "mht_payload_size"});
+    steps.emplace_back(Require{lessEqual(variable("mht_payload_size"), INT32_MAX), "MHT payload exceeds Int32 offsets"});
+    ctx.physical.scratch(steps, "payload_" + bi.dim_prefix, DB_TYPE_INT32, maximum(variable("mht_payload_size"), 1));
+    steps.emplace_back(FillBuffer{write_pos_name, 0, slots, 0});
     // ---- Pass 2: Write ----
     std::string kname2 = ctx.getNewBuildKernelName(bi.dim_prefix + "_wrt");
     ctx.startNewPipeline("MHT_Write_" + bi.dim_prefix);
     auto& c2 = ctx.current_pipeline->kernel_body;
 
-    c2 << "    q.submit([&](sycl::handler& h) {\n";
-    c2 << "        int num_tiles = (" << bi.size_macro << " + TILE_SIZE - 1) / TILE_SIZE;\n";
-    c2 << "        h.parallel_for<class " << kname2 << ">"
-       << "(sycl::nd_range<1>(num_tiles*BLOCK_THREADS,BLOCK_THREADS),[=](sycl::nd_item<1> it){\n";
     c2 << "            int items[ITEMS_PER_THREAD]; int items2[ITEMS_PER_THREAD];\n";
     c2 << "            int flags[ITEMS_PER_THREAD];\n";
     c2 << "            int tid = it.get_local_linear_id();\n";
@@ -5420,7 +4859,7 @@ void JITOperatorVisitor::emitMHTBuildKernels(
        << "(tid,items,items2,flags," << bi.ht_name << "," << offsets_name << ","
        << write_pos_name << "," << counts_name << ",payload_" << bi.dim_prefix
        << "," << bi.ht_size_expr << "," << bi.key_mins << ",num_tile_items);\n";
-    c2 << "        });\n    });\n\n";
+    ctx.physical.ndRange(steps, kname2, c2.str(), ceilDiv(variable(bi.size_macro), 512), 128);
 }
 
 void JITOperatorVisitor::produceHashJoin(const HashJoinNode* node, JITContext& ctx) {
@@ -5471,6 +4910,9 @@ void JITOperatorVisitor::produceHashJoin(const HashJoinNode* node, JITContext& c
 
     // --- Compute BuildInfo ---
     BuildInfo bi = computeBuildInfo(dim_table, build_filter, node);
+    // Probe keys need validity even when they are not projected or filtered.
+    // Otherwise NULL's raw zero may match a legitimately occupied PHT zero key.
+    if (node->join_condition) markExpressionNullability(ctx,catalog_,node->join_condition.get());
 
     // --- Route to PHT or MHT ---
     if (!bi.use_mht) {
@@ -5601,16 +5043,16 @@ void JITOperatorVisitor::consumeHashJoinVector(const HashJoinNode* node, JITCont
                 if (bi.variant == 1) {
                     code << "            BlockProbeAndPHT_1<int, BLOCK_THREADS, ITEMS_PER_THREAD>"
                          << "(tid, " << fk_col << ", flags, " << bi.ht_name << ", "
-                         << bi.ht_size_expr << ", " << bi.key_mins << ", num_tile_items);\n";
+                         << bi.ht_size_expr << ", " << bi.key_mins << ", num_tile_items, " << bi.occupancy_name << ");\n";
                 } else if (projection_count_key_only_probe) {
                     code << "            BlockProbeAndPHT_2KeyOnly<int, BLOCK_THREADS, ITEMS_PER_THREAD>"
                          << "(tid, " << fk_col << ", flags, " << bi.ht_name << ", "
-                         << bi.ht_size_expr << ", " << bi.key_mins << ", num_tile_items);\n";
+                         << bi.ht_size_expr << ", " << bi.key_mins << ", num_tile_items, " << bi.occupancy_name << ");\n";
                 } else {
                     code << "            BlockProbeAndPHT_2<int, int, BLOCK_THREADS, ITEMS_PER_THREAD>"
                          << "(tid, " << fk_col << ", " << payload_reg << ", flags, "
                          << bi.ht_name << ", " << bi.ht_size_expr << ", "
-                         << bi.key_mins << ", num_tile_items);\n";
+                         << bi.key_mins << ", num_tile_items, " << bi.occupancy_name << ");\n";
                 }
 
                 if (node->parent_) {
@@ -5641,15 +5083,15 @@ void JITOperatorVisitor::consumeHashJoinVector(const HashJoinNode* node, JITCont
         if (bi.variant == 1) {
             code << "            BlockProbeAndPHT_1<int, BLOCK_THREADS, ITEMS_PER_THREAD>"
                  << "(tid, " << key_reg << ", flags, " << bi.ht_name << ", "
-                 << bi.ht_size_expr << ", " << bi.key_mins << ", num_tile_items);\n";
+                 << bi.ht_size_expr << ", " << bi.key_mins << ", num_tile_items, " << bi.occupancy_name << ");\n";
         } else if (projection_count_key_only_probe) {
             code << "            BlockProbeAndPHT_2KeyOnly<int, BLOCK_THREADS, ITEMS_PER_THREAD>"
                  << "(tid, " << key_reg << ", flags, " << bi.ht_name << ", "
-                 << bi.ht_size_expr << ", " << bi.key_mins << ", num_tile_items);\n";
+                 << bi.ht_size_expr << ", " << bi.key_mins << ", num_tile_items, " << bi.occupancy_name << ");\n";
         } else {
             code << "            BlockProbeAndPHT_2<int, int, BLOCK_THREADS, ITEMS_PER_THREAD>"
                  << "(tid, " << key_reg << ", " << payload_reg << ", flags, " << bi.ht_name << ", "
-                 << bi.ht_size_expr << ", " << bi.key_mins << ", num_tile_items);\n";
+                 << bi.ht_size_expr << ", " << bi.key_mins << ", num_tile_items, " << bi.occupancy_name << ");\n";
         }
         if (!keep_fk_reg) {
             ctx.col_to_reg.erase(fk);
@@ -5739,11 +5181,11 @@ void JITOperatorVisitor::consumeHashJoinItem(const HashJoinNode* node, JITContex
     // In item mode, we already have a scalar 'i' in scope.
     if (bi.variant == 1) {
         code << "                        if (ProbePHT_1(" << fk << "[i], "
-             << bi.ht_name << ", " << bi.ht_size_expr << ", " << bi.key_mins << ")) {\n";
+             << bi.ht_name << ", " << bi.ht_size_expr << ", " << bi.key_mins << ", " << bi.occupancy_name << ")) {\n";
     } else {
         code << "                        int ht_val = 0;\n";
         code << "                        if (ProbePHT_2(" << fk << "[i], ht_val, "
-             << bi.ht_name << ", " << bi.ht_size_expr << ", " << bi.key_mins << ")) {\n";
+             << bi.ht_name << ", " << bi.ht_size_expr << ", " << bi.key_mins << ", " << bi.occupancy_name << ")) {\n";
         if (!bi.val_col.empty())
             code << "                            " << bi.val_col << "[i] = ht_val;\n";
     }
@@ -5763,113 +5205,30 @@ void JITOperatorVisitor::consumeHashJoinItem(const HashJoinNode* node, JITContex
 // ============================================================================
 
 std::string JITOperatorVisitor::generateCode() const {
-    std::stringstream code;
+    return describePcudamodules(buildPhysicalPlan());
+}
 
-    code << "#include \"core/execution.h\"\n";
-    code << "#include <sycl/sycl.hpp>\n";
-    code << "#include <limits>\n";
-    code << "#include <stdexcept>\n";
-    code << "#include <vector>\n";
-    code << "#include <cstddef>\n";
-    code << "#include <cstdint>\n";
-    code << "#include <chrono>\n";
-    code << "#include \"crystal/load.h\"\n";
-    code << "#include \"crystal/pred.h\"\n";
-    code << "#include \"crystal/join.h\"\n";
-    code << "#include \"crystal/utils.h\"\n";
-    code << "#include \"core/inline_math.h\"\n\n";
-    code << "using namespace sycl;\n\n";
-    code << "constexpr int BLOCK_THREADS = 128;\n";
-    code << "constexpr int ITEMS_PER_THREAD = 4;\n";
-    code << "constexpr int TILE_SIZE = BLOCK_THREADS * ITEMS_PER_THREAD;\n\n";
-
-    // Forward-declare only kernel classes that are actually used as
-    // parallel_for<class ...> names.  Build_* pipeline labels are internal
-    // bookkeeping and must not leak into generated C++.
-    for (const auto& p : ctx_.pipelines) {
-        if (p.kernel_name.rfind("Scan_", 0) == 0) {
-            code << "class " << p.kernel_name << ";\n";
-        }
+PlannedQuery JITOperatorVisitor::buildPhysicalPlan() const {
+    auto builder = ctx_.physical;
+    for (const auto& table : catalog_.getTablesMetadata()) {
+        const auto symbol = sizeMacroFor(table.getName());
+        if (symbol != "0") builder.commonScalar(symbol, table.getSize());
+        builder.plan.steps.insert(builder.plan.steps.begin(), Require{lessEqual(table.getSize(), INT32_MAX), "legacy input row ids exceed Int32 indexing"});
     }
-    for (const auto& kname : ctx_.kernel_class_names) {
-        code << "class " << kname << ";\n";
+    builder.declareBuffer({"d_result", DB_TYPE_UINT64, BufferRole::Result, {}, 0, false});
+    builder.declareBuffer({"d_result_validity", DB_TYPE_UINT64, BufferRole::ResultValidity, {}, 0, false});
+    for (const auto& column : ctx_.external_columns) {
+        const auto rows = catalog_.getTableMetadata(getTableName(column.substr(2))).getSize();
+        builder.declareBuffer({column, DB_TYPE_INT32, BufferRole::External, column, 0, false, rows});
     }
-
-    code << "\nextern \"C\" void execute_query(db::ExecutionContext* ctx) {\n";
-    code << "    auto __crystal_generated_start = std::chrono::high_resolution_clock::now();\n";
-    code << "    sycl::queue& q = *(ctx->q_);\n";
-
-    for (const auto& col : ctx_.external_columns) {
-        code << "    int* " << col << " = ctx->getBuffer<int>(\"" << col << "\");\n";
+    for (const auto& bitmap : ctx_.external_null_columns) {
+        const auto column = "d_" + bitmap.substr(2);
+        const auto rows = catalog_.getTableMetadata(getTableName(bitmap.substr(2))).getSize();
+        builder.declareBuffer({bitmap, DB_TYPE_UINT64, BufferRole::NullBitmap, column, 0, true, rows / 64 + (rows % 64 != 0)});
     }
-    for (const auto& ncol : ctx_.external_null_columns) {
-        std::string data_name = ncol;
-        if (data_name.rfind("n_", 0) == 0) data_name = "d_" + data_name.substr(2);
-        code << "    uint64_t* " << ncol << " = ctx->getNullBitmap(\"" << data_name << "\");\n";
-    }
-
-    code << "    unsigned long long* d_result = ctx->getResultPointer();\n";
-    code << "    uint64_t* d_result_validity = ctx->getResultValidityPointer();\n";
-    for (const auto& pair : build_infos_) {
-        const auto& bi = pair.second;
-        if (bi.use_mht) {
-            code << "    int* payload_" << bi.dim_prefix << " = nullptr;\n";
-        }
-    }
-
-    for (const auto& ht : ctx_.hash_tables) {
-        if (ht.type == "int") {
-            code << "    int* " << ht.name << " = ctx->config_.reuse_scratch_buffers ? ctx->getScratchIntBuffer(\"" << ht.name << "\", static_cast<size_t>(" << ht.size_expr << ")) : sycl::malloc_device<int>(" << ht.size_expr << ", q);\n";
-        } else if (ht.type == "unsigned long long") {
-            code << "    unsigned long long* " << ht.name << " = ctx->config_.reuse_scratch_buffers ? ctx->getScratchUInt64Buffer(\"" << ht.name << "\", static_cast<size_t>(" << ht.size_expr << ")) : sycl::malloc_device<unsigned long long>(" << ht.size_expr << ", q);\n";
-        } else {
-            code << "    " << ht.type << "* " << ht.name
-                 << " = sycl::malloc_device<" << ht.type << ">(" 
-                 << ht.size_expr << ", q);\n";
-        }
-        code << "    q.memset(" << ht.name << ", 0, ("
-             << ht.size_expr << ") * sizeof(" << ht.type << "));\n";
-    }
-
-
-
-    code << "    q.memset(d_result, 0, " << ctx_.result_size_expr
-         << " * sizeof(unsigned long long));\n\n";
-
-    for (const auto& p : ctx_.pipelines) {
-        code << p.includes_and_globals.str();
-        code << p.kernel_body.str();
-    }
-
-    code << ctx_.post_execution_code.str();
-
-    code << "    q.wait();\n\n";
-    for (const auto& ht : ctx_.hash_tables) {
-        if (ht.type == "int" || ht.type == "unsigned long long") {
-            code << "    if (!ctx->config_.reuse_scratch_buffers) sycl::free(" << ht.name << ", q);\n";
-        } else {
-            code << "    sycl::free(" << ht.name << ", q);\n";
-        }
-    }
-
-
-
-    // Free MHT-only allocations (payload chunks)
-    for (const auto& pair : build_infos_) {
-        const auto& bi = pair.second;
-        if (bi.use_mht) {
-            code << "    if (payload_" << bi.dim_prefix << ") sycl::free(payload_" << bi.dim_prefix << ", q);\n";
-        }
-    }
-
-    code << "    auto __crystal_generated_end = std::chrono::high_resolution_clock::now();\n";
-    code << "    ctx->timing_.generated_execute_ms = std::chrono::duration<double, std::milli>(__crystal_generated_end - __crystal_generated_start).count();\n";
-    code << "    ctx->timing_.gpu_execute_ms = ctx->timing_.generated_execute_ms;\n";
-    code << "    ctx->timing_.jit_execute_ms = ctx->timing_.generated_execute_ms;\n";
-    code << "    ctx->tuple_size_ = " << ctx_.tuple_size << ";\n";
-    code << "}\n";
-
-    return code.str();
+    const auto elements = sizeAtom(ctx_.result_size_expr.empty() ? "1" : ctx_.result_size_expr);
+    builder.plan.steps.insert(builder.plan.steps.begin(), Require{lessEqual(elements, INT32_MAX), "legacy aggregate storage exceeds Int32 indexing"});
+    return builder.finish(static_cast<size_t>(ctx_.tuple_size), elements, ctx_.parameter_schema);
 }
 
 } // namespace db

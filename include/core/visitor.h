@@ -3,6 +3,8 @@
 #include "core/expressions.h"
 #include "core/operators.h"
 #include "core/memory.h"   // Catalog, TableMetadata, ColumnStatistics
+#include "core/physical_planner.h"
+#include "core/expression_codegen.h"
 
 #include <memory>
 #include <set>
@@ -13,14 +15,9 @@
 
 namespace db {
 
-// ============================================================================
-// Pipeline — one SYCL kernel submission block.
-// includes_and_globals: q.submit([&](handler& h) { ... launch parameters ... }
-// kernel_body:          the kernel lambda body (inside parallel_for)
-// ============================================================================
+/** @brief Fused device-register scope, not an execution or compilation unit. */
 struct Pipeline {
     std::string       kernel_name;
-    std::stringstream includes_and_globals;
     std::stringstream kernel_body;
 };
 
@@ -28,9 +25,11 @@ struct Pipeline {
 // JITContext — shared mutable state threaded through both visitors.
 // ============================================================================
 struct JITContext {
-    // ---- Multi-pipeline support ----
-    // Ordered list of kernels to submit sequentially.
-    // Build kernels come first, then the probe/select kernel.
+    /** @brief Types only: ordinary parameter values never enter GPU lowering. */
+    ParameterSchema parameter_schema;
+    /** @brief Explicit host operations and separately stored kernel bodies. */
+    PhysicalPlanBuilder physical;
+    // Temporary device-body scopes; physical.plan.steps owns execution order.
     std::vector<Pipeline> pipelines;
     Pipeline*             current_pipeline = nullptr;
 
@@ -44,6 +43,8 @@ struct JITContext {
     // column_name → register name in the probe kernel.
     std::unordered_map<std::string, std::string> col_to_reg;
     std::unordered_map<std::string, std::string> col_to_valid_reg;
+    /** @brief Written register declarations survive removal of transient column bindings. */
+    std::set<std::string> pipeline_validity_registers;
 
     // Catalog-derived nullability cache used by codegen to completely avoid
     // validity loads/checks for non-nullable columns in hot kernels.
@@ -62,42 +63,23 @@ struct JITContext {
 
     std::string current_items_col;
 
-    // Counter used to generate unique kernel class names.
-    int build_kernel_count = 0;
-
-    // Ordered list of kernel class names (for forward declarations).
-    std::vector<std::string> kernel_class_names;
-
-    // Hash table info accumulated during build phase generation
-    // (name → code to allocate/zero in the outer function).
-    struct HashTableInfo {
-        std::string name;        // "d_s_hash_table"
-        std::string type;        // "int"
-        std::string size_expr;   // "S_LEN" or "2*S_LEN"
-    };
-    std::vector<HashTableInfo> hash_tables;
-
     // Columns that must be fetched from ctx (EXTERNAL_INPUT):
     std::set<std::string> external_columns; // e.g. "d_lo_orderdate"
     std::set<std::string> external_null_columns; // nullable bitmap symbols, e.g. "n_lo_orderdate"
 
     // Result buffer size expression (set by AggregateNode/ProjectionNode visitor).
-    // For AVG/MIN this is the physical storage size; generated finalization
-    // code compacts it to the visible size before returning to the host.
-    std::string result_size_expr;   // e.g. "7*1000"
+    // For AVG/MIN this is physical storage; explicit plan finalization compacts it.
+    std::string result_size_expr;   // checked legacy size atom, e.g. "21000"
     int         tuple_size = 1;
     std::string visible_result_size_expr;
 
     // Exact projection materialization: the first scan pass counts surviving
-    // rows per tile; host prefix-scan computes exact offsets and result size;
+    // rows per tile; explicit GPU prefix-scan computes offsets and result size;
     // the second scan pass writes rows into the exact result buffer.
     bool projection_exact_materialization = false;
     std::string projection_row_count_expr;
     int projection_tuple_size = 0;
 
-    // Code emitted after all main pipelines, before q.wait(). Used for
-    // aggregate finalization/compaction kernels.
-    std::stringstream post_execution_code;
     std::set<std::string> emitted_auxiliary_kernels;
 
     // ORDER BY/LIMIT is applied after the child pipeline has materialized the
@@ -116,10 +98,7 @@ struct JITContext {
     }
 
     std::string getNewBuildKernelName(const std::string& prefix) {
-        ++build_kernel_count;
-        std::string name = "build_hashtable_" + prefix;
-        kernel_class_names.push_back(name);
-        return name;
+        return "build_hashtable_" + prefix;
     }
 };
 
@@ -154,6 +133,8 @@ public:
     void visit(const LiteralIntExpr&  node) override;
     void visit(const LiteralFloatExpr& node) override;
     void visit(const LiteralNullExpr& node) override;
+    /** @brief A leaf emits no statements; numeric value/validity are captured as independent ABI slots. */
+    void visit(const ParameterRefExpr& node) override;
     void visit(const BinaryExpr&      node) override;
     void visit(const CaseWhenExpr&    node) override;
     void visit(const StarExpr&        node) override;
@@ -182,7 +163,7 @@ private:
 
 // ============================================================================
 // JITOperatorVisitor — macro-level: walks the Operator Tree using the
-// Data-Centric Push Model and emits full SYCL kernel bodies into JITContext.
+// Data-Centric Push Model and emits fused PCUDA kernel bodies into JITContext.
 //
 // Entry point: visit(AggregateNode) → produce(root)
 //
@@ -239,6 +220,8 @@ public:
                  const std::vector<std::string>& active_vars);
 
     std::string generateCode() const;
+    /** @brief Return physical operations/contracts independently of C++ source emission. */
+    PlannedQuery buildPhysicalPlan() const;
 
 private:
     JITContext&    ctx_;
@@ -250,6 +233,8 @@ private:
 
     struct BuildInfo {
         std::string ht_name;       // "d_s_hash_table"
+        /** @brief Separate UInt32 PHT presence map; zero keys remain ordinary data. */
+        std::string occupancy_name;
         std::string ht_size_expr;  // "20000" or "2*20000"
         std::string key_mins;      // "0" or "1"
         uint8_t     variant;       // 1 = keys only (PHT_1), 2 = key-value pairs (PHT_2)
@@ -328,12 +313,12 @@ private:
     ProjectionPass projection_pass_ = ProjectionPass::None;
 
     // ---- Build kernel emitters ----
-    // PHT: emit one build kernel (with optional filter). Populates hash_tables.
+    // PHT: one fused build kernel with a separately planned scratch allocation.
     void emitPHTBuildKernel(const BuildInfo& bi,
                             const FilterNode* build_filter,
                             JITContext& ctx);
 
-    // MHT: emit Count + 3-step Prefix Sum + Write kernels. Populates hash_tables.
+    // MHT: Count + five distinct prefix-sum launches + Write, with explicit storage/copies.
     void emitMHTBuildKernels(const BuildInfo& bi,
                              const FilterNode* build_filter,
                              JITContext& ctx);

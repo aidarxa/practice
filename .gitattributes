@@ -1,0 +1,5 @@
+# This curated measurement archive is verified by manifest.json SHA-256 hashes.
+# Preserve its bytes, including CSV CRLF and native command separator spaces.
+debug/ssb-cold-q11-q21-q42/** -text
+debug/ssb-cold-q11-q21-q42/**/commands/*.command -whitespace
+debug/ssb-cold-q11-q21-q42/cold-breakdown.csv whitespace=cr-at-eol

@@ -1,0 +1,18 @@
+{
+  "version": 1,
+  "inputs": ["include/core/inline_math.h", "include/core/scan_layout.h", "include/core/size_expression.h", "include/crystal/load.h", "include/crystal/pred.h", "include/crystal/hash.h", "src/core/size_expression.cpp", "test/pcuda_stage4/test_primitives.cpp"],
+  "build": [["{cxx}", "-std=c++17", "-O0", "-g", "-UNDEBUG", "{flags}", "-I{root}/include", "{root}/test/pcuda_stage4/test_primitives.cpp", "{root}/src/core/size_expression.cpp", "-o", "{out}/checks"]],
+  "test": [["{out}/checks"]],
+  "objects": ["{out}/checks"],
+  "mutations": [
+    {"id":"hash-negative", "file":"include/crystal/hash.h", "before":"length - remainder", "after":"remainder"},
+    {"id":"hash-field", "file":"include/crystal/hash.h", "before":"slot * width + field", "after":"slot + width + field"},
+    {"id":"load-tail", "file":"include/crystal/load.h", "before":"lane<count?read(lane,i):T{}", "after":"lane<count?read(lane,i):T{1}"},
+    {"id":"row-width", "file":"include/crystal/load.h", "before":"static_cast<Row>(offset + lane)", "after":"static_cast<Row>(static_cast<unsigned>(offset + lane))"},
+    {"id":"validity-null", "file":"include/crystal/load.h", "before":"(row & 63)) & 1ULL) : 1", "after":"(row & 63)) & 1ULL) : 0"},
+    {"id":"mask-and", "file":"include/crystal/pred.h", "before":"return old && value", "after":"return old || value"},
+    {"id":"scan-rounded-blocks", "file":"include/core/scan_layout.h", "before":"items / block + (items % block != 0)", "after":"items / block"},
+    {"id":"scan-depth", "file":"include/core/scan_layout.h", "before":"if (blocks == 1) break;", "after":"if (blocks == 1 || layout.levels.size() == 3) break;"},
+    {"id":"scan-byte-overflow", "file":"include/core/scan_layout.h", "before":"checkedSizeMultiply(items, sizeof(unsigned long long));", "after":"(void)items;"}
+  ]
+}

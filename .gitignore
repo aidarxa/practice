@@ -1,12 +1,66 @@
+# Build trees and generated CMake/Ninja files.
 build/
+/build-*/
+/cmake-build-*/
+CMakeFiles/
+CMakeCache.txt
+CMakeUserPresets.json
+cmake_install.cmake
+CTestTestfile.cmake
+install_manifest.txt
+compile_commands.json
+Testing/
+build.ninja
+rules.ninja
+.ninja_deps
+.ninja_log
+
+# Compiled host/device code, PCH and coverage/profiling outputs.
+*.o
+*.obj
+*.a
+*.so
+*.so.*
+*.dylib
+*.dll
+*.exe
+*.pch
+*.gch
+*.bc
+*.ll
+*.hsaco
+*.cubin
+*.ptx
+*.spv
+*.fatbin
+*.profraw
+*.profdata
+*.gcda
+*.gcno
+db-pcuda-*/
+
+# Local Python/editor/configuration state.
+__pycache__/
+*.py[cod]
 .vscode/
-data/10/
 .cache
+/crystal.conf
+/crystal-sycl.conf
+
+# Downloaded dependencies, benchmark data and runtime-generated metadata.
+data/10/
 deps/
 sql-parser/*
 test/queries/result/
-todo.md
 olap_bench/bench/*
 olap_bench/meta/*
-bench/test/__pycache__
 bench/test/results
+/meta/catalog_cache.txt
+/sycl.csv
+
+# Local experiments; retain the small, curated source/plan evidence for 8-ANALYSIS.
+/debug/*
+!/debug/ssb-cold-q11-q21-q42/
+
+# Existing local roadmap policy; already tracked files remain versioned.
+todo.md

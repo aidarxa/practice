@@ -65,3 +65,4 @@ int main() {
     std::cout << "All nullable synthetic tests passed!\n";
     return 0;
 }
+#include "assertions_enabled.h"

@@ -1,0 +1,21 @@
+{
+  "version": 1,
+  "inputs": ["include/core", "src/core/pcuda_runtime.cpp", "src/core/pcuda_compat.h", "src/core/memory_guard.cpp", "src/core/size_expression.cpp", "test/pcuda_stage3"],
+  "build": [["{cxx}", "-std=c++17", "-O0", "-g", "{flags}", "-I{root}/include", "{root}/test/pcuda_stage3/test_runtime.cpp", "{root}/test/pcuda_stage3/fake_pcuda.cpp", "{root}/src/core/pcuda_runtime.cpp", "{root}/src/core/memory_guard.cpp", "{root}/src/core/size_expression.cpp", "-o", "{out}/runtime-checks"]],
+  "test": [["{out}/runtime-checks"]],
+  "objects": ["{out}/runtime-checks"],
+  "mutations": [
+    {"id":"guard-boundary", "file":"src/core/memory_guard.cpp", "before":"required > budget", "after":"required >= budget"},
+    {"id":"guard-additional", "file":"src/core/memory_guard.cpp", "before":"checkedSizeAdd(resident, additional)", "after":"checkedSizeAdd(resident, 0)"},
+    {"id":"guard-disabled-overflow", "file":"src/core/memory_guard.cpp", "before":"const auto required = checkedSizeAdd(resident, additional);", "after":"if (!policy.memory_guard_enabled) return; const auto required = checkedSizeAdd(resident, additional);"},
+    {"id":"large-exact-capacity", "file":"src/core/memory_guard.cpp", "before":" : requested;", "after":" : checkedSizeAdd(requested, requested / 2);"},
+    {"id":"resident-release", "file":"src/core/pcuda_runtime.cpp", "before":"resident -= bytes;", "after":"resident -= 0;"},
+    {"id":"resident-pinned-budget", "file":"src/core/pcuda_runtime.cpp", "before":"checkDeviceMemoryRequest(properties_.totalGlobalMem, checkedSizeAdd(device_bytes_, pinned_bytes_), bytes, policy_);", "after":"checkDeviceMemoryRequest(properties_.totalGlobalMem, pinned_bytes_, bytes, policy_);"},
+    {"id":"reuse-capacity", "file":"include/core/device_buffer.h", "before":"if (requested <= capacity()) return;", "after":"if (requested < capacity()) return;"},
+    {"id":"range-offset", "file":"include/core/device_buffer.h", "before":"data() + offset, staging.bytes());\n        runtime_->wait();\n        std::memcpy", "after":"data(), staging.bytes());\n        runtime_->wait();\n        std::memcpy"},
+    {"id":"download-completion", "file":"include/core/device_buffer.h", "before":"runtime_->wait();\n        std::memcpy(host.data()", "after":"/* no completion */\n        std::memcpy(host.data()"},
+    {"id":"null-api-result", "file":"src/core/pcuda_runtime.cpp", "before":"if (!pointer) throw std::runtime_error(\"allocate PCUDA memory returned null\");", "after":"if (false) throw std::runtime_error(\"allocate PCUDA memory returned null\");"},
+    {"id":"fp64-check", "file":"src/core/pcuda_runtime.cpp", "before":"if (fp64 && !properties_.pcudaHasFp64)", "after":"if (false)"},
+    {"id":"launch-volume", "file":"src/core/pcuda_runtime.cpp", "before":"threads > static_cast<uint64_t>(properties_.maxThreadsPerBlock)", "after":"false"}
+  ]
+}

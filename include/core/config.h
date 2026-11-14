@@ -9,6 +9,19 @@ struct CrystalConfig {
     std::string include_dir;
     std::string deps_include_dir;
 
+    /** @brief Prebuilt compiler/flags/PCH/header manifest; no SQL-path PCH generation is allowed. */
+    std::string pcuda_manifest;
+    /** @brief Parent of private session artifacts; empty uses the platform temporary directory. */
+    std::string jit_artifact_dir;
+    std::size_t jit_jobs = 4;
+    bool jit_keep_artifacts = false;
+    bool jit_traces = false;
+    /** @brief Research-only S1/execution overlap; disabled by default and uses a non-additive timing model. */
+    bool jit_overlap_experiment = false;
+
+    /** @brief Empty selects the first enumerated GPU; otherwise require one case-insensitive name match. */
+    std::string device_name;
+
     bool dump_generated_code = false;
     bool extended_timing = false;
     bool memory_guard_enabled = true;

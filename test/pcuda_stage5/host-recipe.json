@@ -1,0 +1,21 @@
+{
+  "version": 1,
+  "inputs": ["include/core", "src/core/content_hash.cpp", "src/core/code_symbols.cpp", "src/core/module_codegen.cpp", "src/core/module_cache.cpp", "src/core/module_compiler.cpp", "src/core/module_build.cpp", "src/core/config.cpp", "src/core/size_expression.cpp", "test/pcuda_stage5/test_modules.cpp"],
+  "build": [["{cxx}", "-std=c++17", "-O0", "-g", "-UNDEBUG", "{flags}", "-I{root}/include", "-DDB_TEST_SOURCE_DIR=\"{root}\"", "{root}/test/pcuda_stage5/test_modules.cpp", "{root}/src/core/content_hash.cpp", "{root}/src/core/code_symbols.cpp", "{root}/src/core/module_codegen.cpp", "{root}/src/core/module_cache.cpp", "{root}/src/core/module_compiler.cpp", "{root}/src/core/module_build.cpp", "{root}/src/core/config.cpp", "{root}/src/core/size_expression.cpp", "-ldl", "-pthread", "-o", "{out}/checks"]],
+  "test": [["{out}/checks"]],
+  "objects": ["{out}/checks"],
+  "mutations": [
+    {"id":"cache-bound", "file":"src/core/module_cache.cpp", "before":"reserved[family(recipe)]>=8", "after":"reserved[family(recipe)]>=7"},
+    {"id":"identity", "file":"src/core/module_cache.cpp", "before":"!actual || identity != actual", "after":"!actual"},
+    {"id":"abi", "file":"src/core/module_cache.cpp", "before":"descriptor->abi_version!=DB_MODULE_ABI_V2_VERSION", "after":"false"},
+    {"id":"schema", "file":"src/core/module_cache.cpp", "before":"!compatibleArgumentSchema(expected[i],module.arguments[i])", "after":"false"},
+    {"id":"schema-symmetric", "file":"src/core/module_cache.cpp", "before":"!compatibleArgumentSchema(module.arguments[i],expected[i])", "after":"false"},
+    {"id":"toolchain-key", "file":"src/core/module_codegen.cpp", "before":"canonical(contract, body, true, tagged) + toolchain", "after":"canonical(contract, body, true, tagged)"},
+    {"id":"shape-key", "file":"src/core/module_codegen.cpp", "before":"<< body.threads << ','", "after":"<< 1 << ','"},
+    {"id":"pch-fingerprint", "file":"src/core/module_compiler.cpp", "before":"fileContentHash(path) != text.substr(0, separator)", "after":"false"},
+    {"id":"required-flag", "file":"src/core/module_compiler.cpp", "before":"if (std::find(flags.begin(), flags.end(), flag) == flags.end())", "after":"if (false)"},
+    {"id":"numeric-precision", "file":"include/core/tagged_numeric.h", "before":"return static_cast<T>(value.i64);", "after":"return static_cast<T>(static_cast<double>(value.i64));"},
+    {"id":"hash-state", "file":"src/core/content_hash.cpp", "before":"state_[i] += work[i]", "after":"state_[i] ^= work[i]"},
+    {"id":"identifier-boundary", "file":"src/core/code_symbols.cpp", "before":"while(i<text.size() && part(text[i])) ++i;", "after":"while(false) ++i;"}
+  ]
+}

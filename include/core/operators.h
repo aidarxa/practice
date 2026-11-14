@@ -1,6 +1,8 @@
 #pragma once
 
 #include "expressions.h"
+#include "core/expression_codegen.h"
+#include "core/size_expression.h"
 #include "memory.h"
 #include "../crystal/utils.h"
 
@@ -16,40 +18,6 @@
 
 namespace db {
 
-
-inline void collectCaseIntegerOutputs(const ExprNode* expr,
-                                      std::vector<int64_t>& values,
-                                      bool& may_be_null) {
-    if (!expr) {
-        may_be_null = true;
-        return;
-    }
-    if (expr->getType() == ExprType::LITERAL_INT) {
-        values.push_back(static_cast<const LiteralIntExpr*>(expr)->value);
-        return;
-    }
-    if (expr->getType() == ExprType::LITERAL_NULL) {
-        may_be_null = true;
-        return;
-    }
-    if (expr->getType() == ExprType::CASE_WHEN) {
-        const auto* c = static_cast<const CaseWhenExpr*>(expr);
-        collectCaseIntegerOutputs(c->then_expr.get(), values, may_be_null);
-        collectCaseIntegerOutputs(c->else_expr.get(), values, may_be_null);
-        return;
-    }
-    throw std::runtime_error("GROUP BY CASE currently requires integer THEN/ELSE result expressions");
-}
-
-inline uint64_t integerCaseCardinality(const ExprNode* expr, bool include_null_bucket) {
-    std::vector<int64_t> values;
-    bool may_be_null = false;
-    collectCaseIntegerOutputs(expr, values, may_be_null);
-    if (values.empty()) return may_be_null ? 1ULL : 0ULL;
-    const auto [min_it, max_it] = std::minmax_element(values.begin(), values.end());
-    const uint64_t range = static_cast<uint64_t>(*max_it - *min_it + 1);
-    return range + ((include_null_bucket && may_be_null) ? 1ULL : 0ULL);
-}
 
 // ============================================================================
 // 1. OperatorType
@@ -196,14 +164,14 @@ public:
                 };
                 collect(children_[0].get());
                 for (const auto* scan : scans) {
-                    tuple_size += catalog.getTableMetadata(scan->table_name).getColumnCount();
+                    tuple_size = checkedSizeAdd(tuple_size, catalog.getTableMetadata(scan->table_name).getColumnCount());
                 }
             } else {
-                ++tuple_size;
+                tuple_size = checkedSizeAdd(tuple_size, 1);
             }
         }
         if (tuple_size == 0) tuple_size = 1;
-        return row_count * tuple_size;
+        return checkedSizeMultiply(row_count, tuple_size);
     }
 };
 
@@ -218,8 +186,26 @@ struct SortKeyDef {
 class SortLimitNode final : public OperatorNode {
 public:
     std::vector<SortKeyDef> sort_keys;
-    bool has_limit = false;
-    std::size_t limit = 0;
+    /** @brief Absent LIMIT, a translated integer, or a prepared parameter reference. */
+    std::unique_ptr<ExprNode> limit_expr;
+
+    bool hasLimit() const { return limit_expr != nullptr; }
+
+    /**
+     * @brief Read a checked legacy LIMIT after parameter binding.
+     * @throws std::runtime_error If a prepared parameter reaches legacy codegen,
+     * or LIMIT is NULL, negative, non-integral, or not representable as size_t.
+     */
+    std::size_t literalLimit() const {
+        if (!limit_expr || limit_expr->getType() != ExprType::LITERAL_INT) {
+            throw std::runtime_error("LIMIT requires a bound non-negative integer");
+        }
+        const int64_t value = static_cast<const LiteralIntExpr&>(*limit_expr).value;
+        if (value < 0 || static_cast<uint64_t>(value) > std::numeric_limits<std::size_t>::max()) {
+            throw std::runtime_error("LIMIT is outside the supported size range");
+        }
+        return static_cast<std::size_t>(value);
+    }
 
     SortLimitNode() = default;
 
@@ -293,6 +279,13 @@ class AggregateNode final : public OperatorNode {
 public:
     std::vector<std::unique_ptr<ExprNode>> group_by_exprs; // выражения GROUP BY
     std::vector<AggregateDef>              aggregates;     // список агрегаций
+    /**
+     * @brief Resolved SELECT references to group-first visible storage slots.
+     * @details Preserves SQL output identity/order before parameter extraction.
+     * The temporary legacy backend still materializes group-first storage;
+     * future physical planning can use this mapping without rematching values.
+     */
+    std::vector<std::size_t>               select_output_slots;
     std::unique_ptr<ExprNode>              having_predicate; // normalized post-aggregate predicate over visible slots
     std::vector<std::string>               output_aliases;   // visible output aliases, group cols first, aggregates after
 
@@ -324,10 +317,11 @@ public:
         return slots == 0 ? 1 : slots;
     }
 
-    // Вычисляет точный размер буфера результатов (в элементах unsigned long long).
-    // Для групповой агрегации: cardinality(group1) * cardinality(group2) * ... * tuple_size
-    // Для скалярной агрегации: 1
-    // Фолбэк (нет статистики): table.getSize() для данной колонки
+    /** @brief Checked structural storage bound, not the number of surviving SQL rows.
+     * @details Catalog key domains and CASE leaf counts determine the bound. CASE
+     * values, filter selectivity and LIMIT never enter it. Dense output capacity is
+     * determined by runtime count/scan or a bounded small-group materializer.
+     */
     uint64_t calculateResultSize(const Catalog& catalog) const {
         if (group_by_exprs.empty()) {
             return storageTupleSize();
@@ -342,6 +336,7 @@ public:
                 // Определяем таблицу по первому символу имени колонки (как в crystal/utils.h)
                 std::string table_name = getTableName(col_name);
 
+                bool nullable = false;
                 try {
                     const auto& meta = catalog.getTableMetadata(table_name);
                     if (meta.hasColumnStats(col_name)) {
@@ -350,22 +345,20 @@ public:
                         // Фолбэк: используем размер таблицы как верхнюю оценку
                         cardinality = meta.getSize();
                     }
-                    if (meta.isColumnNullable(col_name)) {
-                        // One extra GROUP BY bucket for SQL NULL.
-                        ++cardinality;
-                    }
+                    nullable = meta.isColumnNullable(col_name);
                 } catch (...) {
                     // Таблица не найдена — минимальный фолбэк
                     cardinality = 1;
                 }
+                if (nullable) cardinality = checkedSizeAdd(cardinality,1);
             } else if (g->getType() == ExprType::CASE_WHEN) {
-                cardinality = integerCaseCardinality(g.get(), true);
+                cardinality = caseLeafCount(g.get());
                 if (cardinality == 0) cardinality = 1;
             }
-            total_groups *= cardinality;
+            total_groups = checkedSizeMultiply(total_groups, cardinality);
         }
 
-        return total_groups * storageTupleSize();
+        return checkedSizeMultiply(total_groups, storageTupleSize());
     }
 };
 

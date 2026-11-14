@@ -1,0 +1,19 @@
+{
+  "version": 1,
+  "inputs": ["include", "src", "deps", "test", "CMakeLists.txt", "cmake", "tools/pcuda_pch_manifest.py"],
+  "build": [
+    ["cmake", "-S", "{root}", "-B", "{out}/engine", "-DCMAKE_BUILD_TYPE=Release", "-DCMAKE_CXX_COMPILER={cxx}"],
+    ["cmake", "--build", "{out}/engine", "--target", "test_manual_ssb_gpu", "-j4"]
+  ],
+  "test": [["{out}/engine/test_manual_ssb_gpu"]],
+  "mutations": [
+    {"id":"manual-reset-sums", "file":"test/queries/example/support/runner.cpp", "before":"sums_.zero();", "after":"(void)0;"},
+    {"id":"manual-reset-presence", "file":"test/queries/example/support/runner.cpp", "before":"presence_.zero();", "after":"(void)0;"},
+    {"id":"manual-reset-occupancy", "file":"test/queries/example/support/runner.cpp", "before":"table.occupied.zero();", "after":"(void)0;"},
+    {"id":"manual-zero-presence", "file":"test/queries/example/support/runner.cpp", "before":"atomicCAS(presence + group, 0ULL, 1ULL);", "after":"if (value != 0) atomicCAS(presence + group, 0ULL, 1ULL);"},
+    {"id":"manual-negative-profit", "file":"test/queries/example/support/runner.cpp", "before":"- (spec.profit ? static_cast<int64_t>(input.cost.values[row]) : 0)", "after":"+ (spec.profit ? static_cast<int64_t>(input.cost.values[row]) : 0)"},
+    {"id":"manual-filter", "file":"test/queries/example/support/runner.cpp", "before":"if (input.filter.values && !input.predicate.matches(input.filter.values[row])) return;", "after":"if (false) return;"},
+    {"id":"manual-tail", "file":"test/queries/example/support/runner.cpp", "before":"if (row < rows) operation(row);", "after":"if (row + 1 < rows) operation(row);"},
+    {"id":"manual-key-zero", "file":"test/queries/example/support/runner.cpp", "before":"input.table.minimum, input.table.occupied);", "after":"input.table.minimum, nullptr);"}
+  ]
+}

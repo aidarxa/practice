@@ -1,0 +1,28 @@
+{
+  "version": 1,
+  "inputs": ["include", "src/core", "src/storage", "deps", "test/pcuda_stage7_text/test_host.cpp", "test/pcuda_stage7_text/test_values.cpp", "test/pcuda_stage7_text/test_frontend.cpp"],
+  "build": [["{cxx}", "-std=c++17", "-O0", "-g", "-UNDEBUG", "-DTEXT_COMBINED_TEST", "{flags}", "-I{root}/include", "-I{root}/deps/include", "{root}/test/pcuda_stage7_text/test_host.cpp", "{root}/test/pcuda_stage7_text/test_values.cpp", "{root}/test/pcuda_stage7_text/test_frontend.cpp", "{root}/src/storage/text_column.cpp", "{root}/src/core/translator.cpp", "{root}/src/core/query_template.cpp", "{root}/src/core/parameter_value.cpp", "{root}/src/core/expression_codegen.cpp", "{root}/src/core/result_layout.cpp", "{root}/src/core/size_expression.cpp", "-L{root}/deps/lib", "-Wl,-rpath,{root}/deps/lib", "-lsqlparser", "-o", "{out}/checks"]],
+  "test": [["{out}/checks", "{out}/fixed-text.bin"]],
+  "objects": ["{out}/checks"],
+  "mutations": [
+    {"id":"byte-order", "file":"include/core/text.h", "before":"if (left.data[i] < right.data[i]) return -1;", "after":"if (left.data[i] < right.data[i]) return 1;"},
+    {"id":"prefix-equal", "file":"include/core/text.h", "before":"return left.bytes < right.bytes ? -1 : left.bytes > right.bytes ? 1 : 0;", "after":"return 0;"},
+    {"id":"utf8-overlong", "file":"src/storage/text_column.cpp", "before":"first >= 0xc2", "after":"first >= 0xc0"},
+    {"id":"utf8-scalar-range", "file":"src/storage/text_column.cpp", "before":"case 0xf4: return second < 0x90;", "after":"case 0xf4: return true;"},
+    {"id":"logical-nul", "file":"src/storage/text_column.cpp", "before":"if (value[at] == 0)", "after":"if (false)"},
+    {"id":"fixed-text-tail", "file":"src/storage/text_column.cpp", "before":"std::find(record.begin(), record.end(), '\\0')", "after":"record.end()"},
+    {"id":"null-payload-interpreted", "file":"src/storage/text_column.cpp", "before":"if (valid) {", "after":"if (true) {"},
+    {"id":"whole-file-size", "file":"src/storage/text_column.cpp", "before":"columnFileBytes(path, rows, storage.width);", "after":"(void)0;"},
+    {"id":"bitmap-extent", "file":"src/storage/text_column.cpp", "before":"if (!validity.empty() && validity.size() != rows / 64 + (rows % 64 != 0))", "after":"if (false)"},
+    {"id":"parameter-unvalidated", "file":"src/core/parameter_value.cpp", "before":"validateText(value);", "after":"(void)0;"},
+    {"id":"implicit-text-number", "file":"src/core/parameter_value.cpp", "before":"if (left == ParameterType::Text || right == ParameterType::Text)", "after":"if (false)"},
+    {"id":"text-null-type", "file":"src/core/parameter_value.cpp", "before":"case ParameterType::Text: return ParameterValue(std::optional<std::string>{});", "after":"case ParameterType::Text: return ParameterValue(std::monostate{});"},
+    {"id":"null-text-payload", "file":"include/core/module_contract_v2.h", "before":"if (!value.valid) return !text.data && !text.bytes;", "after":"if (!value.valid) return true;"},
+    {"id":"numeric-upper-payload", "file":"include/core/module_contract_v2.h", "before":"if (upper) return false;", "after":"if (false) return false;"},
+    {"id":"legacy-abi-accepted", "file":"include/core/module_contract_v2.h", "before":"descriptor.abi_version != DB_MODULE_ABI_V2_VERSION || call.abi_version != DB_MODULE_ABI_V2_VERSION", "after":"false"},
+    {"id":"text-boolean", "file":"src/core/query_template.cpp", "before":"if (expressionType(expression, schema_, results) == ParameterType::Text)", "after":"if (false)"},
+    {"id":"quoted-empty-text", "file":"include/cli/text_format.h", "before":"result += '\"';", "after":"(void)0;"},
+    {"id":"v2-integer-loses-precision", "file":"include/core/tagged_numeric.h", "before":"else result.value.i64=argument.value.i64;", "after":"else result.value.i64=static_cast<int64_t>(static_cast<double>(argument.value.i64));"},
+    {"id":"v2-float-payload-lost", "file":"include/core/tagged_numeric.h", "before":"result.value.f64=argument.value.f64;", "after":"result.value.f64=0;"}
+  ]
+}

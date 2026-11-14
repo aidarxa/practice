@@ -1,0 +1,9 @@
+{
+  "version": 1,
+  "inputs": ["include", "src/core", "deps", "test/pcuda_stage5/test_parameter_plan.cpp", "test/test_execution_plan.cpp"],
+  "build": [
+    ["{cxx}", "-std=c++17", "-O0", "-g", "-UNDEBUG", "{flags}", "-I{root}/include", "-I{root}/deps/include", "{root}/test/pcuda_stage5/test_parameter_plan.cpp", "{root}/src/core/translator.cpp", "{root}/src/core/query_template.cpp", "{root}/src/core/optimizer_rules.cpp", "{root}/src/core/visitor.cpp", "{root}/src/core/parameter_value.cpp", "{root}/src/core/expression_codegen.cpp", "{root}/src/core/size_expression.cpp", "{root}/src/core/physical_planner.cpp", "{root}/src/core/execution_plan.cpp", "{root}/src/core/module_codegen.cpp", "{root}/src/core/content_hash.cpp", "{root}/src/core/code_symbols.cpp", "-L{root}/deps/lib", "-Wl,-rpath,{root}/deps/lib", "-lsqlparser", "-o", "{out}/parameter-checks"]
+  ],
+  "test": [["{out}/parameter-checks"]],
+  "objects": ["{out}/parameter-checks"]
+}

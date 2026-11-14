@@ -5,6 +5,7 @@
 // Не зависит от SYCL или optimizer.h.
 
 #include "core/translator.h"
+#include "assertions_enabled.h"
 
 #include <SQLParser.h>
 #include <cassert>
@@ -490,8 +491,8 @@ static void test_translator_aliases_and_having() {
     assert(root->getType() == OperatorType::SORT_LIMIT);
 
     auto* sort = static_cast<SortLimitNode*>(root.get());
-    assert(sort->has_limit);
-    assert(sort->limit == 5);
+    assert(sort->hasLimit());
+    assert(sort->literalLimit() == 5);
     assert(sort->sort_keys.size() == 1);
     assert(sort->sort_keys[0].column_index == 1);
     assert(sort->sort_keys[0].descending);
@@ -539,8 +540,8 @@ static void test_translator_projection_alias_order_by() {
     assert(root->getType() == OperatorType::SORT_LIMIT);
 
     auto* sort = static_cast<SortLimitNode*>(root.get());
-    assert(sort->has_limit);
-    assert(sort->limit == 3);
+    assert(sort->hasLimit());
+    assert(sort->literalLimit() == 3);
     assert(sort->sort_keys.size() == 1);
     assert(sort->sort_keys[0].column_index == 0);
     assert(!sort->sort_keys[0].descending);
@@ -590,8 +591,8 @@ static void test_translator_case_when_scalar() {
     assert(root->getType() == OperatorType::SORT_LIMIT);
 
     auto* sort = static_cast<SortLimitNode*>(root.get());
-    assert(sort->has_limit);
-    assert(sort->limit == 2);
+    assert(sort->hasLimit());
+    assert(sort->literalLimit() == 2);
     assert(sort->sort_keys.size() == 1);
     assert(sort->sort_keys[0].column_index == 1);
     assert(sort->sort_keys[0].descending);
@@ -614,7 +615,78 @@ static void test_translator_case_when_scalar() {
 }
 
 // ============================================================================
+/** @brief ORDER BY positions address SELECT expressions, not physical aggregate slots. */
+static void test_aggregate_order_ordinal_resolves_select_identity() {
+    std::cout << "Test 14: aggregate ORDER BY ordinal resolves SELECT identity... ";
+    hsql::SQLParserResult result;
+    auto* ast = parseSQL(
+        "SELECT SUM(lo_revenue), lo_quantity FROM lineorder "
+        "GROUP BY lo_quantity ORDER BY 1 DESC", result);
+    if (!ast) throw std::runtime_error("Ordinal regression SQL did not parse");
+    QueryTranslator translator;
+    auto root = translator.translate(ast);
+    const auto& sort = static_cast<const SortLimitNode&>(*root);
+    if (sort.sort_keys.size() != 1 || sort.sort_keys[0].column_index != 1) {
+        throw std::runtime_error("ORDER BY 1 must reference SUM, not the first GROUP BY slot");
+    }
+    std::cout << "PASSED\n";
+}
+
+/** @brief Table aliases and canonical qualifiers identify the same SELECT expression. */
+static void test_order_expression_resolves_table_aliases() {
+    std::cout << "Test 15: ORDER BY expression resolves table aliases... ";
+    hsql::SQLParserResult result;
+    auto* ast = parseSQL(
+        "SELECT lo.lo_quantity + 1 FROM lineorder lo "
+        "ORDER BY lineorder.lo_quantity + 1", result);
+    if (!ast) throw std::runtime_error("Alias regression SQL did not parse");
+    QueryTranslator translator;
+    auto root = translator.translate(ast);
+    const auto& sort = static_cast<const SortLimitNode&>(*root);
+    if (sort.sort_keys.size() != 1 || sort.sort_keys[0].column_index != 0) {
+        throw std::runtime_error("ORDER BY must preserve resolved expression identity");
+    }
+    std::cout << "PASSED\n";
+}
+
+/** @brief FixedText resolves as Text, never as a numeric storage view. */
+static void test_text_storage_boundary() {
+    TableMetadata date("DDATE", db::ssbColumnNames("DDATE"), 2557, false);
+    date.setColumnStorage("d_date", db::ssbColumn("d_date").storage);
+    Catalog catalog;
+    catalog.pushTableMetadata(date);
+    hsql::SQLParserResult parsed;
+    const auto* ast = parseSQL("SELECT d_date FROM ddate", parsed);
+    assert(ast);
+    auto prepared = QueryTranslator{}.prepare(ast, catalog);
+    const auto& projection = static_cast<const ProjectionNode&>(*prepared.query.plan);
+    const auto& column = static_cast<const ColumnRefExpr&>(*projection.select_exprs.at(0));
+    assert(column.value_type == ParameterType::Text);
+}
+
+/** @brief ORDER BY positions remain structural while independent equal Text values remain separate slots. */
+static void test_prepared_text_order_and_slots() {
+    Catalog catalog;
+    TableMetadata customer("CUSTOMER", {"c_custkey", "c_name"}, 8, false);
+    customer.setColumnStorage("c_name", {PhysicalEncoding::FixedText, 25});
+    catalog.pushTableMetadata(customer);
+    const auto prepare = [&](unsigned order) {
+        hsql::SQLParserResult parsed;
+        const auto* ast = parseSQL("SELECT c_name,'same' FROM customer WHERE c_name='same' ORDER BY " + std::to_string(order) + " LIMIT 1", parsed);
+        assert(ast);
+        return QueryTranslator{}.prepare(ast, catalog);
+    };
+    auto first = prepare(1), second = prepare(2);
+    assert(first.query.structureKey() != second.query.structureKey());
+    size_t equal_text_slots = 0;
+    for (const auto& value : first.parameters)
+        if (value.type() == ParameterType::Text && value.asText() == "same") ++equal_text_slots;
+    assert(equal_text_slots == 2);
+}
+
 int main() {
+    test_prepared_text_order_and_slots();
+    test_text_storage_boundary();
     std::cout << "=== test_translator.cpp ===\n\n";
 
     test_expr_tree_manual();
@@ -630,6 +702,8 @@ int main() {
     test_translator_aliases_and_having();
     test_translator_projection_alias_order_by();
     test_translator_case_when_scalar();
+    test_aggregate_order_ordinal_resolves_select_identity();
+    test_order_expression_resolves_table_aliases();
 
     std::cout << "\nAll tests passed!\n";
     return 0;

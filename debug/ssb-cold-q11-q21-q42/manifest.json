@@ -1,0 +1,532 @@
+{
+  "files": [
+    {
+      "source": "test/queries/sql/q11.sql",
+      "destination": "q11/query.sql",
+      "sha256": "0f9a01919385844d9967e9110d624dca93f7dd56980b69d1f0a49ad87d25b482",
+      "bytes": 186,
+      "purpose": "Original SQL used in the measured series"
+    },
+    {
+      "source": "build/pcuda-stage8/run-8xun1k4x/optimization-analysis-q5akas53/q11/plan.txt",
+      "destination": "q11/execution-plan.txt",
+      "sha256": "f74ca14089ffcadd3fb069fbc4b4811d05f93aeaa123a9667dbc494e409b44f8",
+      "bytes": 4643,
+      "purpose": "Independently reconstructed physical plan with exact matching module identities"
+    },
+    {
+      "source": "build/pcuda-stage8/run-8xun1k4x/ssb-series-y58itcgc/0-q11-plain/db-pcuda-dlaIHa/0/build.sh",
+      "destination": "q11/commands/build.historical.sh",
+      "sha256": "ec84cc6b7d426afa5ed63b423edf74c14f2998441a7c5ffe9c297c0ea68788f0",
+      "bytes": 14542,
+      "purpose": "Actual historical parallel compile/link script; paths still reference raw artifacts"
+    },
+    {
+      "source": "build/pcuda-stage8/run-8xun1k4x/ssb-series-y58itcgc/0-q11-plain/crystal.conf",
+      "destination": "q11/commands/crystal.conf",
+      "sha256": "05f5c31d03421f1c2cd01fccbe3dd6dc946e38767369773d11000268cb819786",
+      "bytes": 276,
+      "purpose": "Measured configuration with jit_jobs=4"
+    },
+    {
+      "source": "build/pcuda-stage8/run-8xun1k4x/ssb-series-y58itcgc/0-q11-plain/db-pcuda-dlaIHa/0/4170886016dae97984e214ac1a7e674360871b1cf29c1a2368aaafd0bad14493.cpp",
+      "destination": "q11/generated/AggregateDenseCount.cpp",
+      "sha256": "a27ac889a9a991c2d61e2da52f4f46446b3d99e4eda984c6119daa3b58849683",
+      "bytes": 2870,
+      "purpose": "Byte-identical C++ source actually compiled for one native PCUDA module"
+    },
+    {
+      "source": "build/pcuda-stage8/run-8xun1k4x/ssb-series-y58itcgc/0-q11-plain/db-pcuda-dlaIHa/0/4170886016dae97984e214ac1a7e674360871b1cf29c1a2368aaafd0bad14493.compile.command",
+      "destination": "q11/commands/AggregateDenseCount.compile.command",
+      "sha256": "b8f558bc7fcee544f717e3ed91b92a4c9b9dedc073223289f2847433621b68b5",
+      "bytes": 762,
+      "purpose": "Actual native command or wall/user/system timer"
+    },
+    {
+      "source": "build/pcuda-stage8/run-8xun1k4x/ssb-series-y58itcgc/0-q11-plain/db-pcuda-dlaIHa/0/4170886016dae97984e214ac1a7e674360871b1cf29c1a2368aaafd0bad14493.link.command",
+      "destination": "q11/commands/AggregateDenseCount.link.command",
+      "sha256": "2207ffa46336b26d3e6f5f7bb3382795141d5737c3d28c7875b11d05a0b05827",
+      "bytes": 544,
+      "purpose": "Actual native command or wall/user/system timer"
+    },
+    {
+      "source": "build/pcuda-stage8/run-8xun1k4x/ssb-series-y58itcgc/0-q11-plain/db-pcuda-dlaIHa/0/4170886016dae97984e214ac1a7e674360871b1cf29c1a2368aaafd0bad14493.compile.time",
+      "destination": "q11/commands/AggregateDenseCount.compile.time",
+      "sha256": "c0f3e41235530399fa8b3e80b5c2da57a7f3e8e38d4156b565616d0d784830ff",
+      "bytes": 27,
+      "purpose": "Actual native command or wall/user/system timer"
+    },
+    {
+      "source": "build/pcuda-stage8/run-8xun1k4x/ssb-series-y58itcgc/0-q11-plain/db-pcuda-dlaIHa/0/4170886016dae97984e214ac1a7e674360871b1cf29c1a2368aaafd0bad14493.link.time",
+      "destination": "q11/commands/AggregateDenseCount.link.time",
+      "sha256": "4b3202a811f94a4e22657a30d63307f0d50a1dbe06f8ead91ac27705dd229f53",
+      "bytes": 27,
+      "purpose": "Actual native command or wall/user/system timer"
+    },
+    {
+      "source": "build/pcuda-stage8/run-8xun1k4x/ssb-series-y58itcgc/0-q11-plain/db-pcuda-dlaIHa/0/de118fdb12c2620fa72fa403c834c2ce9e0a5f565dcfa5c7ac5b8254fa07f9b6.cpp",
+      "destination": "q11/generated/AggregateDenseWrite.cpp",
+      "sha256": "9181cbdda6c3116c61d4ce9b75386fbc1b9e709d47b81d1cad1033d6faab343b",
+      "bytes": 3569,
+      "purpose": "Byte-identical C++ source actually compiled for one native PCUDA module"
+    },
+    {
+      "source": "build/pcuda-stage8/run-8xun1k4x/ssb-series-y58itcgc/0-q11-plain/db-pcuda-dlaIHa/0/de118fdb12c2620fa72fa403c834c2ce9e0a5f565dcfa5c7ac5b8254fa07f9b6.compile.command",
+      "destination": "q11/commands/AggregateDenseWrite.compile.command",
+      "sha256": "1455698bdc04942730e9e11216106872cb2b88167662e90894ad3327defb579b",
+      "bytes": 762,
+      "purpose": "Actual native command or wall/user/system timer"
+    },
+    {
+      "source": "build/pcuda-stage8/run-8xun1k4x/ssb-series-y58itcgc/0-q11-plain/db-pcuda-dlaIHa/0/de118fdb12c2620fa72fa403c834c2ce9e0a5f565dcfa5c7ac5b8254fa07f9b6.link.command",
+      "destination": "q11/commands/AggregateDenseWrite.link.command",
+      "sha256": "8f43658ea265758c18d4f5c8a605e4d291b425936bf74c28e546a346ea5535f9",
+      "bytes": 544,
+      "purpose": "Actual native command or wall/user/system timer"
+    },
+    {
+      "source": "build/pcuda-stage8/run-8xun1k4x/ssb-series-y58itcgc/0-q11-plain/db-pcuda-dlaIHa/0/de118fdb12c2620fa72fa403c834c2ce9e0a5f565dcfa5c7ac5b8254fa07f9b6.compile.time",
+      "destination": "q11/commands/AggregateDenseWrite.compile.time",
+      "sha256": "fd90ff8ba9a6e1c1b2a46dea2313b9ba5ad19bb25e1532ef57e8d6e274fbe835",
+      "bytes": 27,
+      "purpose": "Actual native command or wall/user/system timer"
+    },
+    {
+      "source": "build/pcuda-stage8/run-8xun1k4x/ssb-series-y58itcgc/0-q11-plain/db-pcuda-dlaIHa/0/de118fdb12c2620fa72fa403c834c2ce9e0a5f565dcfa5c7ac5b8254fa07f9b6.link.time",
+      "destination": "q11/commands/AggregateDenseWrite.link.time",
+      "sha256": "126e142a859333d924d1dd59225c6009f951f7384e48d3dde2173666c864bbfd",
+      "bytes": 27,
+      "purpose": "Actual native command or wall/user/system timer"
+    },
+    {
+      "source": "build/pcuda-stage8/run-8xun1k4x/ssb-series-y58itcgc/0-q11-plain/db-pcuda-dlaIHa/0/57da16690c7c9871a93ef1241a1685147f8738a97bfe6b45e2e210441cd2776b.cpp",
+      "destination": "q11/generated/Scan_LINEORDER.cpp",
+      "sha256": "72d19cdce2eebace3fe3c216116a21211f3720d6d9ba9af7054572abc222f980",
+      "bytes": 7068,
+      "purpose": "Byte-identical C++ source actually compiled for one native PCUDA module"
+    },
+    {
+      "source": "build/pcuda-stage8/run-8xun1k4x/ssb-series-y58itcgc/0-q11-plain/db-pcuda-dlaIHa/0/57da16690c7c9871a93ef1241a1685147f8738a97bfe6b45e2e210441cd2776b.compile.command",
+      "destination": "q11/commands/Scan_LINEORDER.compile.command",
+      "sha256": "88e4aa26b6d6eeca367400839ae769f9c9c66f99212577869410e7051f1aef1a",
+      "bytes": 762,
+      "purpose": "Actual native command or wall/user/system timer"
+    },
+    {
+      "source": "build/pcuda-stage8/run-8xun1k4x/ssb-series-y58itcgc/0-q11-plain/db-pcuda-dlaIHa/0/57da16690c7c9871a93ef1241a1685147f8738a97bfe6b45e2e210441cd2776b.link.command",
+      "destination": "q11/commands/Scan_LINEORDER.link.command",
+      "sha256": "3094ed0a7d158bae9ede4aa99f5fc57f683d0073e897f3f587b2044659fca25f",
+      "bytes": 544,
+      "purpose": "Actual native command or wall/user/system timer"
+    },
+    {
+      "source": "build/pcuda-stage8/run-8xun1k4x/ssb-series-y58itcgc/0-q11-plain/db-pcuda-dlaIHa/0/57da16690c7c9871a93ef1241a1685147f8738a97bfe6b45e2e210441cd2776b.compile.time",
+      "destination": "q11/commands/Scan_LINEORDER.compile.time",
+      "sha256": "abc774191bf18a4cd0278d83653600fca3ec8f7bafdf82ee262751ba1f2a1b99",
+      "bytes": 27,
+      "purpose": "Actual native command or wall/user/system timer"
+    },
+    {
+      "source": "build/pcuda-stage8/run-8xun1k4x/ssb-series-y58itcgc/0-q11-plain/db-pcuda-dlaIHa/0/57da16690c7c9871a93ef1241a1685147f8738a97bfe6b45e2e210441cd2776b.link.time",
+      "destination": "q11/commands/Scan_LINEORDER.link.time",
+      "sha256": "36ac5906ed558988d9715dc36b70c054648ebff504e17132d1c18f307199d821",
+      "bytes": 27,
+      "purpose": "Actual native command or wall/user/system timer"
+    },
+    {
+      "source": "test/queries/sql/q21.sql",
+      "destination": "q21/query.sql",
+      "sha256": "a9f09682d21f43ffc398759c3aa5f47b77b4f05d8fdd3ef41ac5330b0584d8ea",
+      "bytes": 220,
+      "purpose": "Original SQL used in the measured series"
+    },
+    {
+      "source": "build/pcuda-stage8/run-8xun1k4x/optimization-analysis-q5akas53/q21/plan.txt",
+      "destination": "q21/execution-plan.txt",
+      "sha256": "1375a4c6981d812fbb69a7c4596b31c22dcbf6cdb27ff4105cf24743457639ee",
+      "bytes": 5903,
+      "purpose": "Independently reconstructed physical plan with exact matching module identities"
+    },
+    {
+      "source": "build/pcuda-stage8/run-8xun1k4x/ssb-series-y58itcgc/0-q21-plain/db-pcuda-zMVtjr/0/build.sh",
+      "destination": "q21/commands/build.historical.sh",
+      "sha256": "3dd1cb4de9a1a86756b05a1922383d09918a5a58810d83d8cbe7b0afe3096903",
+      "bytes": 18430,
+      "purpose": "Actual historical parallel compile/link script; paths still reference raw artifacts"
+    },
+    {
+      "source": "build/pcuda-stage8/run-8xun1k4x/ssb-series-y58itcgc/0-q21-plain/crystal.conf",
+      "destination": "q21/commands/crystal.conf",
+      "sha256": "963da0fc208559beac7aa214f294d52fe91b0f429df94c28bd43009e4e06a24b",
+      "bytes": 276,
+      "purpose": "Measured configuration with jit_jobs=4"
+    },
+    {
+      "source": "build/pcuda-stage8/run-8xun1k4x/ssb-series-y58itcgc/0-q21-plain/db-pcuda-zMVtjr/0/0bf0b2da66c668832e2af5da6cb76186e9892198ff5ec18ee138137df38c6639.cpp",
+      "destination": "q21/generated/build_hashtable_d.cpp",
+      "sha256": "0c697b71f80a92e67195f3b009470323a30c79023844a050f60aebb12f91523a",
+      "bytes": 3461,
+      "purpose": "Byte-identical C++ source actually compiled for one native PCUDA module"
+    },
+    {
+      "source": "build/pcuda-stage8/run-8xun1k4x/ssb-series-y58itcgc/0-q21-plain/db-pcuda-zMVtjr/0/0bf0b2da66c668832e2af5da6cb76186e9892198ff5ec18ee138137df38c6639.compile.command",
+      "destination": "q21/commands/build_hashtable_d.compile.command",
+      "sha256": "44517259b3f520414bf0bfb3625b484f193ecd635c2b6ad56a8f9e7c495900f4",
+      "bytes": 762,
+      "purpose": "Actual native command or wall/user/system timer"
+    },
+    {
+      "source": "build/pcuda-stage8/run-8xun1k4x/ssb-series-y58itcgc/0-q21-plain/db-pcuda-zMVtjr/0/0bf0b2da66c668832e2af5da6cb76186e9892198ff5ec18ee138137df38c6639.link.command",
+      "destination": "q21/commands/build_hashtable_d.link.command",
+      "sha256": "aeddecd717e6bc7a93cdd95a38bc2c2c5332643a4fe38e346bdc0a350cd06b26",
+      "bytes": 544,
+      "purpose": "Actual native command or wall/user/system timer"
+    },
+    {
+      "source": "build/pcuda-stage8/run-8xun1k4x/ssb-series-y58itcgc/0-q21-plain/db-pcuda-zMVtjr/0/0bf0b2da66c668832e2af5da6cb76186e9892198ff5ec18ee138137df38c6639.compile.time",
+      "destination": "q21/commands/build_hashtable_d.compile.time",
+      "sha256": "88d136b90226a5bb1b64916a64142e0facf3f68a44ea72b8c0b3bdf9785b29e4",
+      "bytes": 27,
+      "purpose": "Actual native command or wall/user/system timer"
+    },
+    {
+      "source": "build/pcuda-stage8/run-8xun1k4x/ssb-series-y58itcgc/0-q21-plain/db-pcuda-zMVtjr/0/0bf0b2da66c668832e2af5da6cb76186e9892198ff5ec18ee138137df38c6639.link.time",
+      "destination": "q21/commands/build_hashtable_d.link.time",
+      "sha256": "4967a1faa2770a4794c7536f5bcb41001a3a83d082a95d48f0d1a37423b40ac0",
+      "bytes": 27,
+      "purpose": "Actual native command or wall/user/system timer"
+    },
+    {
+      "source": "build/pcuda-stage8/run-8xun1k4x/ssb-series-y58itcgc/0-q21-plain/db-pcuda-zMVtjr/0/9d6ad927889e16e23d995bc201fe6e3db691b86f27ce399f87744302be534e34.cpp",
+      "destination": "q21/generated/build_hashtable_s.cpp",
+      "sha256": "f606d578ce3c0795c249e4057bf8def9c3421d3fc3ac6a987cdb4d2cd0bc7114",
+      "bytes": 3705,
+      "purpose": "Byte-identical C++ source actually compiled for one native PCUDA module"
+    },
+    {
+      "source": "build/pcuda-stage8/run-8xun1k4x/ssb-series-y58itcgc/0-q21-plain/db-pcuda-zMVtjr/0/9d6ad927889e16e23d995bc201fe6e3db691b86f27ce399f87744302be534e34.compile.command",
+      "destination": "q21/commands/build_hashtable_s.compile.command",
+      "sha256": "ccaf44ea9a47f3504213d0771a8f25d6f69dfb8419bcfd17597a822a2f5df4c6",
+      "bytes": 762,
+      "purpose": "Actual native command or wall/user/system timer"
+    },
+    {
+      "source": "build/pcuda-stage8/run-8xun1k4x/ssb-series-y58itcgc/0-q21-plain/db-pcuda-zMVtjr/0/9d6ad927889e16e23d995bc201fe6e3db691b86f27ce399f87744302be534e34.link.command",
+      "destination": "q21/commands/build_hashtable_s.link.command",
+      "sha256": "cb4e646b0c79f7cf36b636ef62214fc78bd8c0210c95af63d58895745df635f1",
+      "bytes": 544,
+      "purpose": "Actual native command or wall/user/system timer"
+    },
+    {
+      "source": "build/pcuda-stage8/run-8xun1k4x/ssb-series-y58itcgc/0-q21-plain/db-pcuda-zMVtjr/0/9d6ad927889e16e23d995bc201fe6e3db691b86f27ce399f87744302be534e34.compile.time",
+      "destination": "q21/commands/build_hashtable_s.compile.time",
+      "sha256": "0357bef70eadbf166e343e944fb335e25c4ebfced3035308cfcad712582ba8a9",
+      "bytes": 27,
+      "purpose": "Actual native command or wall/user/system timer"
+    },
+    {
+      "source": "build/pcuda-stage8/run-8xun1k4x/ssb-series-y58itcgc/0-q21-plain/db-pcuda-zMVtjr/0/9d6ad927889e16e23d995bc201fe6e3db691b86f27ce399f87744302be534e34.link.time",
+      "destination": "q21/commands/build_hashtable_s.link.time",
+      "sha256": "17b379591ce3780168d7330afa1557b6449e7fce179ee9d8c0937074ed6a5e09",
+      "bytes": 27,
+      "purpose": "Actual native command or wall/user/system timer"
+    },
+    {
+      "source": "build/pcuda-stage8/run-8xun1k4x/ssb-series-y58itcgc/0-q21-plain/db-pcuda-zMVtjr/0/170f70d6c009f9b6bd0b0b23e7d198f3d5a5dcc330d7b33fcde18746fd39f725.cpp",
+      "destination": "q21/generated/build_hashtable_p.cpp",
+      "sha256": "3b7fc089c5ed661874868cc90581954d745e42eb1c588ab8f6652f0137bb4677",
+      "bytes": 3950,
+      "purpose": "Byte-identical C++ source actually compiled for one native PCUDA module"
+    },
+    {
+      "source": "build/pcuda-stage8/run-8xun1k4x/ssb-series-y58itcgc/0-q21-plain/db-pcuda-zMVtjr/0/170f70d6c009f9b6bd0b0b23e7d198f3d5a5dcc330d7b33fcde18746fd39f725.compile.command",
+      "destination": "q21/commands/build_hashtable_p.compile.command",
+      "sha256": "42c3216bbd07733d351899cb7d91953ca559e8c59c64d097f9c016ce326720e6",
+      "bytes": 762,
+      "purpose": "Actual native command or wall/user/system timer"
+    },
+    {
+      "source": "build/pcuda-stage8/run-8xun1k4x/ssb-series-y58itcgc/0-q21-plain/db-pcuda-zMVtjr/0/170f70d6c009f9b6bd0b0b23e7d198f3d5a5dcc330d7b33fcde18746fd39f725.link.command",
+      "destination": "q21/commands/build_hashtable_p.link.command",
+      "sha256": "85a48032bac76ba6fcd2bec6e794ea0cdaebbea5f869360026f801c2792c1aaf",
+      "bytes": 544,
+      "purpose": "Actual native command or wall/user/system timer"
+    },
+    {
+      "source": "build/pcuda-stage8/run-8xun1k4x/ssb-series-y58itcgc/0-q21-plain/db-pcuda-zMVtjr/0/170f70d6c009f9b6bd0b0b23e7d198f3d5a5dcc330d7b33fcde18746fd39f725.compile.time",
+      "destination": "q21/commands/build_hashtable_p.compile.time",
+      "sha256": "0caf8f603e64909258d54988424c71a33f5d67208706a31a540fd7016eafd58f",
+      "bytes": 27,
+      "purpose": "Actual native command or wall/user/system timer"
+    },
+    {
+      "source": "build/pcuda-stage8/run-8xun1k4x/ssb-series-y58itcgc/0-q21-plain/db-pcuda-zMVtjr/0/170f70d6c009f9b6bd0b0b23e7d198f3d5a5dcc330d7b33fcde18746fd39f725.link.time",
+      "destination": "q21/commands/build_hashtable_p.link.time",
+      "sha256": "02eef28fae448703b9e3f81d221eb0e84e55d89d24125c3b6a3fc6b0b4630a8c",
+      "bytes": 27,
+      "purpose": "Actual native command or wall/user/system timer"
+    },
+    {
+      "source": "build/pcuda-stage8/run-8xun1k4x/ssb-series-y58itcgc/0-q21-plain/db-pcuda-zMVtjr/0/7e8a72d250a7bf38e65c64cf97c1cda348c27555352c5280b9c3eb96c43a4e80.cpp",
+      "destination": "q21/generated/Scan_LINEORDER.cpp",
+      "sha256": "439510d47a79658d77d78cf5743bd7d73976e3b8be6f99c8747df416047e4fef",
+      "bytes": 5437,
+      "purpose": "Byte-identical C++ source actually compiled for one native PCUDA module"
+    },
+    {
+      "source": "build/pcuda-stage8/run-8xun1k4x/ssb-series-y58itcgc/0-q21-plain/db-pcuda-zMVtjr/0/7e8a72d250a7bf38e65c64cf97c1cda348c27555352c5280b9c3eb96c43a4e80.compile.command",
+      "destination": "q21/commands/Scan_LINEORDER.compile.command",
+      "sha256": "ac38c7cd1de254172b4702aeef19076dbf48558439dc0545be0df2f34b0d6a00",
+      "bytes": 762,
+      "purpose": "Actual native command or wall/user/system timer"
+    },
+    {
+      "source": "build/pcuda-stage8/run-8xun1k4x/ssb-series-y58itcgc/0-q21-plain/db-pcuda-zMVtjr/0/7e8a72d250a7bf38e65c64cf97c1cda348c27555352c5280b9c3eb96c43a4e80.link.command",
+      "destination": "q21/commands/Scan_LINEORDER.link.command",
+      "sha256": "12ddc884be015699914a7d3bbed2b89ca05bb253a2a5399c98bec9467d6d2998",
+      "bytes": 544,
+      "purpose": "Actual native command or wall/user/system timer"
+    },
+    {
+      "source": "build/pcuda-stage8/run-8xun1k4x/ssb-series-y58itcgc/0-q21-plain/db-pcuda-zMVtjr/0/7e8a72d250a7bf38e65c64cf97c1cda348c27555352c5280b9c3eb96c43a4e80.compile.time",
+      "destination": "q21/commands/Scan_LINEORDER.compile.time",
+      "sha256": "5cce8de2e4596273b7b47819495e5a49e6d921ae6292a3004f0855f9e2a35d65",
+      "bytes": 27,
+      "purpose": "Actual native command or wall/user/system timer"
+    },
+    {
+      "source": "build/pcuda-stage8/run-8xun1k4x/ssb-series-y58itcgc/0-q21-plain/db-pcuda-zMVtjr/0/7e8a72d250a7bf38e65c64cf97c1cda348c27555352c5280b9c3eb96c43a4e80.link.time",
+      "destination": "q21/commands/Scan_LINEORDER.link.time",
+      "sha256": "cd28575a4e45e7653e83577f88b7ab34698badbe69f80f3507265922315a110f",
+      "bytes": 27,
+      "purpose": "Actual native command or wall/user/system timer"
+    },
+    {
+      "source": "test/queries/sql/q42.sql",
+      "destination": "q42/query.sql",
+      "sha256": "baeb23b7ba1a9fb77f0e65b04f335202766b69ba01f24e228928f38924ad07c6",
+      "bytes": 369,
+      "purpose": "Original SQL used in the measured series"
+    },
+    {
+      "source": "build/pcuda-stage8/run-8xun1k4x/optimization-analysis-q5akas53/q42/plan.txt",
+      "destination": "q42/execution-plan.txt",
+      "sha256": "b35f8d64613f5b15b0c79c2cbdd9e4454fbf1959ff38a556a4ff757c63d83098",
+      "bytes": 8347,
+      "purpose": "Independently reconstructed physical plan with exact matching module identities"
+    },
+    {
+      "source": "build/pcuda-stage8/run-8xun1k4x/ssb-series-y58itcgc/0-q42-plain/db-pcuda-f9OSzF/0/build.sh",
+      "destination": "q42/commands/build.historical.sh",
+      "sha256": "b60f096e4c01075cefe3587e568c5ec4d8008c77696aefa00a068a784628c61e",
+      "bytes": 22415,
+      "purpose": "Actual historical parallel compile/link script; paths still reference raw artifacts"
+    },
+    {
+      "source": "build/pcuda-stage8/run-8xun1k4x/ssb-series-y58itcgc/0-q42-plain/crystal.conf",
+      "destination": "q42/commands/crystal.conf",
+      "sha256": "abc04c6e0570d6cb8a3a495835a12f672ab32eaca434d286be47f6ea4165c94a",
+      "bytes": 276,
+      "purpose": "Measured configuration with jit_jobs=4"
+    },
+    {
+      "source": "build/pcuda-stage8/run-8xun1k4x/ssb-series-y58itcgc/0-q42-plain/db-pcuda-f9OSzF/0/9d10ea732fcfa0f10e9ce02bcae271444a34b753cf9f0382b967a743d77ad496.cpp",
+      "destination": "q42/generated/build_hashtable_d.cpp",
+      "sha256": "4fbfda2b37a95dd854470efd841fa71f067b74479fb7ffca3dd188232cb9328e",
+      "bytes": 4471,
+      "purpose": "Byte-identical C++ source actually compiled for one native PCUDA module"
+    },
+    {
+      "source": "build/pcuda-stage8/run-8xun1k4x/ssb-series-y58itcgc/0-q42-plain/db-pcuda-f9OSzF/0/9d10ea732fcfa0f10e9ce02bcae271444a34b753cf9f0382b967a743d77ad496.compile.command",
+      "destination": "q42/commands/build_hashtable_d.compile.command",
+      "sha256": "9cc2f939e47a4883e779abcb0d3816c33018c8c4299b33f5e819065b1701525a",
+      "bytes": 762,
+      "purpose": "Actual native command or wall/user/system timer"
+    },
+    {
+      "source": "build/pcuda-stage8/run-8xun1k4x/ssb-series-y58itcgc/0-q42-plain/db-pcuda-f9OSzF/0/9d10ea732fcfa0f10e9ce02bcae271444a34b753cf9f0382b967a743d77ad496.link.command",
+      "destination": "q42/commands/build_hashtable_d.link.command",
+      "sha256": "c92a4e05d8da298865279a04c9b88acc104d91e3ef7e3283fedbcec8cbae6b40",
+      "bytes": 544,
+      "purpose": "Actual native command or wall/user/system timer"
+    },
+    {
+      "source": "build/pcuda-stage8/run-8xun1k4x/ssb-series-y58itcgc/0-q42-plain/db-pcuda-f9OSzF/0/9d10ea732fcfa0f10e9ce02bcae271444a34b753cf9f0382b967a743d77ad496.compile.time",
+      "destination": "q42/commands/build_hashtable_d.compile.time",
+      "sha256": "95c65b1733ec1f77333f5a9d6dc6fdeaeea0b68998964143ba4bb51d6d6718ae",
+      "bytes": 27,
+      "purpose": "Actual native command or wall/user/system timer"
+    },
+    {
+      "source": "build/pcuda-stage8/run-8xun1k4x/ssb-series-y58itcgc/0-q42-plain/db-pcuda-f9OSzF/0/9d10ea732fcfa0f10e9ce02bcae271444a34b753cf9f0382b967a743d77ad496.link.time",
+      "destination": "q42/commands/build_hashtable_d.link.time",
+      "sha256": "2ab923d62b324ccf28bfb745c45b8cd73982d43a344542072dbbc56bd9ab4f5b",
+      "bytes": 27,
+      "purpose": "Actual native command or wall/user/system timer"
+    },
+    {
+      "source": "build/pcuda-stage8/run-8xun1k4x/ssb-series-y58itcgc/0-q42-plain/db-pcuda-f9OSzF/0/079a1b346bbcfd05db23cd8e9402a3632d3d346486ae88f245e5eb22ff8e5ad9.cpp",
+      "destination": "q42/generated/build_hashtable_p.cpp",
+      "sha256": "0ec4a5934afedf45eed9110a0d4b5037bda372623a9378e037a137a7d18ca793",
+      "bytes": 4544,
+      "purpose": "Byte-identical C++ source actually compiled for one native PCUDA module"
+    },
+    {
+      "source": "build/pcuda-stage8/run-8xun1k4x/ssb-series-y58itcgc/0-q42-plain/db-pcuda-f9OSzF/0/079a1b346bbcfd05db23cd8e9402a3632d3d346486ae88f245e5eb22ff8e5ad9.compile.command",
+      "destination": "q42/commands/build_hashtable_p.compile.command",
+      "sha256": "bc63132cb486371393daf425fd201bd9bf240ec8f863b149944fe35ebf4c9a0b",
+      "bytes": 762,
+      "purpose": "Actual native command or wall/user/system timer"
+    },
+    {
+      "source": "build/pcuda-stage8/run-8xun1k4x/ssb-series-y58itcgc/0-q42-plain/db-pcuda-f9OSzF/0/079a1b346bbcfd05db23cd8e9402a3632d3d346486ae88f245e5eb22ff8e5ad9.link.command",
+      "destination": "q42/commands/build_hashtable_p.link.command",
+      "sha256": "552b8f888990f5534443dd58ef28d205a2442cb46d1c5ae30bdacad348814309",
+      "bytes": 544,
+      "purpose": "Actual native command or wall/user/system timer"
+    },
+    {
+      "source": "build/pcuda-stage8/run-8xun1k4x/ssb-series-y58itcgc/0-q42-plain/db-pcuda-f9OSzF/0/079a1b346bbcfd05db23cd8e9402a3632d3d346486ae88f245e5eb22ff8e5ad9.compile.time",
+      "destination": "q42/commands/build_hashtable_p.compile.time",
+      "sha256": "b26546c28c68b875438e597dae3489a66bef38e5e5c9d458be3150c4e5166320",
+      "bytes": 27,
+      "purpose": "Actual native command or wall/user/system timer"
+    },
+    {
+      "source": "build/pcuda-stage8/run-8xun1k4x/ssb-series-y58itcgc/0-q42-plain/db-pcuda-f9OSzF/0/079a1b346bbcfd05db23cd8e9402a3632d3d346486ae88f245e5eb22ff8e5ad9.link.time",
+      "destination": "q42/commands/build_hashtable_p.link.time",
+      "sha256": "3e1fa5a1ccd890366afd75aa988e09e7f6684c3d96eaff47d615068da7452f46",
+      "bytes": 27,
+      "purpose": "Actual native command or wall/user/system timer"
+    },
+    {
+      "source": "build/pcuda-stage8/run-8xun1k4x/ssb-series-y58itcgc/0-q42-plain/db-pcuda-f9OSzF/0/170f70d6c009f9b6bd0b0b23e7d198f3d5a5dcc330d7b33fcde18746fd39f725.cpp",
+      "destination": "q42/generated/build_hashtable_s.cpp",
+      "sha256": "24876e5875432936f93dc8e537f72df42924971d1dfb04fbb76471064d0bb0ec",
+      "bytes": 3962,
+      "purpose": "Byte-identical C++ source actually compiled for one native PCUDA module"
+    },
+    {
+      "source": "build/pcuda-stage8/run-8xun1k4x/ssb-series-y58itcgc/0-q42-plain/db-pcuda-f9OSzF/0/170f70d6c009f9b6bd0b0b23e7d198f3d5a5dcc330d7b33fcde18746fd39f725.compile.command",
+      "destination": "q42/commands/build_hashtable_s.compile.command",
+      "sha256": "007982730843f1550906d4a591994919fea9867024d65e5573c4d43884dc4c7e",
+      "bytes": 762,
+      "purpose": "Actual native command or wall/user/system timer"
+    },
+    {
+      "source": "build/pcuda-stage8/run-8xun1k4x/ssb-series-y58itcgc/0-q42-plain/db-pcuda-f9OSzF/0/170f70d6c009f9b6bd0b0b23e7d198f3d5a5dcc330d7b33fcde18746fd39f725.link.command",
+      "destination": "q42/commands/build_hashtable_s.link.command",
+      "sha256": "0297e3aec9299050ff05d2578fd2c131d4a587dacc747a773a4b6a2d05e5ee4e",
+      "bytes": 544,
+      "purpose": "Actual native command or wall/user/system timer"
+    },
+    {
+      "source": "build/pcuda-stage8/run-8xun1k4x/ssb-series-y58itcgc/0-q42-plain/db-pcuda-f9OSzF/0/170f70d6c009f9b6bd0b0b23e7d198f3d5a5dcc330d7b33fcde18746fd39f725.compile.time",
+      "destination": "q42/commands/build_hashtable_s.compile.time",
+      "sha256": "2bd7ec6ebd68f065d5d025471ccbff282cf03175f776154ae5a0683075ebfe42",
+      "bytes": 27,
+      "purpose": "Actual native command or wall/user/system timer"
+    },
+    {
+      "source": "build/pcuda-stage8/run-8xun1k4x/ssb-series-y58itcgc/0-q42-plain/db-pcuda-f9OSzF/0/170f70d6c009f9b6bd0b0b23e7d198f3d5a5dcc330d7b33fcde18746fd39f725.link.time",
+      "destination": "q42/commands/build_hashtable_s.link.time",
+      "sha256": "ff70144ab1559ee9aa4b2be0fecf3dfb83632d2f1c9a97e5d64d16ca7bb2665b",
+      "bytes": 27,
+      "purpose": "Actual native command or wall/user/system timer"
+    },
+    {
+      "source": "build/pcuda-stage8/run-8xun1k4x/ssb-series-y58itcgc/0-q42-plain/db-pcuda-f9OSzF/0/4038d8e91eedc4472c16adae24c20e193ba06a1fbeceaff8671703f83d175935.cpp",
+      "destination": "q42/generated/build_hashtable_c.cpp",
+      "sha256": "251b2e5774ef8f41ccd35f06778f78f63e43f67cf80dd76cc2e1d7e7b4b1f8ed",
+      "bytes": 3705,
+      "purpose": "Byte-identical C++ source actually compiled for one native PCUDA module"
+    },
+    {
+      "source": "build/pcuda-stage8/run-8xun1k4x/ssb-series-y58itcgc/0-q42-plain/db-pcuda-f9OSzF/0/4038d8e91eedc4472c16adae24c20e193ba06a1fbeceaff8671703f83d175935.compile.command",
+      "destination": "q42/commands/build_hashtable_c.compile.command",
+      "sha256": "742f24b029755a4dc51c1e6db62d86f2bd9154b697402ae7ac62fb12d0523a05",
+      "bytes": 762,
+      "purpose": "Actual native command or wall/user/system timer"
+    },
+    {
+      "source": "build/pcuda-stage8/run-8xun1k4x/ssb-series-y58itcgc/0-q42-plain/db-pcuda-f9OSzF/0/4038d8e91eedc4472c16adae24c20e193ba06a1fbeceaff8671703f83d175935.link.command",
+      "destination": "q42/commands/build_hashtable_c.link.command",
+      "sha256": "c0cf093f5f69ae3f1c0e131577ef8f129f757689ee520fa72b823f9fb48eb823",
+      "bytes": 544,
+      "purpose": "Actual native command or wall/user/system timer"
+    },
+    {
+      "source": "build/pcuda-stage8/run-8xun1k4x/ssb-series-y58itcgc/0-q42-plain/db-pcuda-f9OSzF/0/4038d8e91eedc4472c16adae24c20e193ba06a1fbeceaff8671703f83d175935.compile.time",
+      "destination": "q42/commands/build_hashtable_c.compile.time",
+      "sha256": "833a66c36f88c711941f8766a478eed2f8242b052ed325bdf9dc621555071cf0",
+      "bytes": 27,
+      "purpose": "Actual native command or wall/user/system timer"
+    },
+    {
+      "source": "build/pcuda-stage8/run-8xun1k4x/ssb-series-y58itcgc/0-q42-plain/db-pcuda-f9OSzF/0/4038d8e91eedc4472c16adae24c20e193ba06a1fbeceaff8671703f83d175935.link.time",
+      "destination": "q42/commands/build_hashtable_c.link.time",
+      "sha256": "1366f15707ec07f664e7b18f6a197a0e1d7a387bd367c9fe31f022aecabe87f0",
+      "bytes": 27,
+      "purpose": "Actual native command or wall/user/system timer"
+    },
+    {
+      "source": "build/pcuda-stage8/run-8xun1k4x/ssb-series-y58itcgc/0-q42-plain/db-pcuda-f9OSzF/0/5741091f9bc77b36d8e7297ce26c07643a60234897151b4e0c0698e156b6d2d0.cpp",
+      "destination": "q42/generated/Scan_LINEORDER.cpp",
+      "sha256": "4feb2a64a2a0e237b99a6cf68d92145defad425d6445b09d8f43d729e1d4098e",
+      "bytes": 6501,
+      "purpose": "Byte-identical C++ source actually compiled for one native PCUDA module"
+    },
+    {
+      "source": "build/pcuda-stage8/run-8xun1k4x/ssb-series-y58itcgc/0-q42-plain/db-pcuda-f9OSzF/0/5741091f9bc77b36d8e7297ce26c07643a60234897151b4e0c0698e156b6d2d0.compile.command",
+      "destination": "q42/commands/Scan_LINEORDER.compile.command",
+      "sha256": "b78fcbb2692bd19b7f9c1349fd341bd240c1a522e8425b815d4dd04ce25ed32a",
+      "bytes": 762,
+      "purpose": "Actual native command or wall/user/system timer"
+    },
+    {
+      "source": "build/pcuda-stage8/run-8xun1k4x/ssb-series-y58itcgc/0-q42-plain/db-pcuda-f9OSzF/0/5741091f9bc77b36d8e7297ce26c07643a60234897151b4e0c0698e156b6d2d0.link.command",
+      "destination": "q42/commands/Scan_LINEORDER.link.command",
+      "sha256": "d88204d3a03e8f87917e3ea16a756bd51031d7242d7e933335df2732d90bdde0",
+      "bytes": 544,
+      "purpose": "Actual native command or wall/user/system timer"
+    },
+    {
+      "source": "build/pcuda-stage8/run-8xun1k4x/ssb-series-y58itcgc/0-q42-plain/db-pcuda-f9OSzF/0/5741091f9bc77b36d8e7297ce26c07643a60234897151b4e0c0698e156b6d2d0.compile.time",
+      "destination": "q42/commands/Scan_LINEORDER.compile.time",
+      "sha256": "8800d2249880545ba9d3c47ec2fd2f857a8340b9fd50332393c8267e995f22ba",
+      "bytes": 27,
+      "purpose": "Actual native command or wall/user/system timer"
+    },
+    {
+      "source": "build/pcuda-stage8/run-8xun1k4x/ssb-series-y58itcgc/0-q42-plain/db-pcuda-f9OSzF/0/5741091f9bc77b36d8e7297ce26c07643a60234897151b4e0c0698e156b6d2d0.link.time",
+      "destination": "q42/commands/Scan_LINEORDER.link.time",
+      "sha256": "bf481ed7f0b54db25a246edf1ed104fee2865e6b43832e10910e788c79c0f71e",
+      "bytes": 27,
+      "purpose": "Actual native command or wall/user/system timer"
+    },
+    {
+      "source": "src/core/pcuda_scan.cpp",
+      "destination": "shared/src/core/pcuda_scan.cpp",
+      "sha256": "2bf5efadd14cb520ccd3cd8abf39512a4e45ec04dc2e4993cdb65f89dada2027",
+      "bytes": 4714,
+      "purpose": "Project source snapshot, not SQL-generated; prefix/compaction services or common JIT preamble"
+    },
+    {
+      "source": "src/core/pcuda_services.cpp",
+      "destination": "shared/src/core/pcuda_services.cpp",
+      "sha256": "a14c34835a07356727301a1f7f4f938f65e1fb940062528d6f6f162747c059c3",
+      "bytes": 1871,
+      "purpose": "Project source snapshot, not SQL-generated; prefix/compaction services or common JIT preamble"
+    },
+    {
+      "source": "include/jit_headers.h",
+      "destination": "shared/include/jit_headers.h",
+      "sha256": "23cf488b345adf0dd00e2a323604b0792f75a2a16752854d2f093e61cb1f21ed",
+      "bytes": 363,
+      "purpose": "Project source snapshot, not SQL-generated; prefix/compaction services or common JIT preamble"
+    }
+  ],
+  "exported_generated_modules": 12,
+  "source_session": "session 0, plain, ssb-series-y58itcgc",
+  "source_integrity": "Every copy byte-compared and SHA-256 recorded; existing sources/raw not modified"
+}

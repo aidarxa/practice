@@ -1,0 +1,21 @@
+{
+  "version": 1,
+  "inputs": ["include/core", "include/cli/startup_timing.h", "src/cli/startup_timing.cpp", "src/core/content_hash.cpp", "src/core/code_symbols.cpp", "src/core/module_codegen.cpp", "src/core/module_cache.cpp", "src/core/module_compiler.cpp", "src/core/module_build.cpp", "src/core/config.cpp", "src/core/size_expression.cpp", "test/assertions_enabled.h", "test/pcuda_stage5/test_modules.cpp", "test/pcuda_stage8/test_timing.cpp", "test/pcuda_stage8/test_host.cpp"],
+  "build": [["{cxx}", "-std=c++17", "-O0", "-g", "-UNDEBUG", "-DDB_ACCEPTANCE_COMBINED_TEST", "{flags}", "-I{root}/include", "-DDB_TEST_SOURCE_DIR=\"{root}\"", "{root}/test/pcuda_stage8/test_host.cpp", "{root}/test/pcuda_stage8/test_timing.cpp", "{root}/test/pcuda_stage5/test_modules.cpp", "{root}/src/cli/startup_timing.cpp", "{root}/src/core/content_hash.cpp", "{root}/src/core/code_symbols.cpp", "{root}/src/core/module_codegen.cpp", "{root}/src/core/module_cache.cpp", "{root}/src/core/module_compiler.cpp", "{root}/src/core/module_build.cpp", "{root}/src/core/config.cpp", "{root}/src/core/size_expression.cpp", "-ldl", "-pthread", "-o", "{out}/checks"]],
+  "test": [["{out}/checks"]],
+  "objects": ["{out}/checks"],
+  "mutations": [
+    {"id":"sources-marker-absent", "file":"src/core/module_cache.cpp", "before":"preparation.selectAll();\n    if (sources_ready) sources_ready();\n    if (!preparation.pending.empty())", "after":"preparation.selectAll();\n    if (false) sources_ready();\n    if (!preparation.pending.empty())"},
+    {"id":"sources-marker-after-build", "file":"src/core/module_cache.cpp", "before":"if (sources_ready) sources_ready();\n    if (!preparation.pending.empty()) preparation.publish(preparation.build());", "after":"if (!preparation.pending.empty()) preparation.publish(preparation.build());\n    if (sources_ready) sources_ready();"},
+    {"id":"marker-wrong-byte", "file":"src/cli/startup_timing.cpp", "before":"write(fd, \"R\", 1)", "after":"write(fd, \"X\", 1)"},
+    {"id":"descriptor-stdio", "file":"src/cli/startup_timing.cpp", "before":"fd <= STDERR_FILENO", "after":"fd < STDERR_FILENO"},
+    {"id":"descriptor-garbage", "file":"src/cli/startup_timing.cpp", "before":"parsed.ptr != end", "after":"false"},
+    {"id":"descriptor-inherited-by-compiler", "file":"src/cli/startup_timing.cpp", "before":"flags | FD_CLOEXEC", "after":"flags"},
+    {"id":"result-before-data", "file":"src/cli/startup_timing.cpp", "before":"if (phase_ != Phase::Query)", "after":"if (false)"},
+    {"id":"first-result-repeat", "file":"src/cli/startup_timing.cpp", "before":"if (phase_ == Phase::Complete) return false;", "after":"if (phase_ == Phase::Complete) return true;"},
+    {"id":"cache-identity", "file":"src/core/module_cache.cpp", "before":"!actual || identity != actual", "after":"!actual"},
+    {"id":"cache-abi", "file":"src/core/module_cache.cpp", "before":"descriptor->abi_version!=DB_MODULE_ABI_V2_VERSION", "after":"false"},
+    {"id":"cache-schema", "file":"src/core/module_cache.cpp", "before":"!compatibleArgumentSchema(expected[i],module.arguments[i])", "after":"false"},
+    {"id":"cache-bound", "file":"src/core/module_cache.cpp", "before":"reserved[family(recipe)]>=8", "after":"reserved[family(recipe)]>=7"}
+  ]
+}

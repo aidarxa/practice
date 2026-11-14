@@ -32,3 +32,4 @@ int main() {
     std::cout << "SQL three-valued logic model tests passed\n";
     return 0;
 }
+#include "assertions_enabled.h"

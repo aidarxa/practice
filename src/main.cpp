@@ -5,10 +5,13 @@
 
 int main() {
     try {
+        db::cli::StartupTiming startup;
         auto db = std::make_shared<db::DatabaseInstance>();
+        startup.databaseReady();
         db->loadData();
+        startup.dataReady();
 
-        db::cli::TerminalApp app(db);
+        db::cli::TerminalApp app(db, &startup);
         app.run();
     } catch (const std::exception& e) {
         std::cerr << "Fatal error: " << e.what() << "\n";

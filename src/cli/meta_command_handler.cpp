@@ -174,7 +174,7 @@ bool MetaCommandHandler::handle(const std::string& command, SessionContext& ctx)
 
 void MetaCommandHandler::printHelp() {
     std::cout <<
-        "Crystal-SYCL interactive console\n"
+        "Crystal-PCUDA interactive console\n"
         "\n"
         "Meta-commands:\n"
         "  help              Show this help message\n"

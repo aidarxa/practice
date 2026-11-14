@@ -1,0 +1,21 @@
+{
+  "version": 1,
+  "inputs": ["include/core", "src/core/content_hash.cpp", "src/core/code_symbols.cpp", "src/core/module_codegen.cpp", "src/core/module_cache.cpp", "src/core/module_compiler.cpp", "src/core/module_build.cpp", "src/core/config.cpp", "src/core/size_expression.cpp", "test/pcuda_stage5/test_modules.cpp"],
+  "build": [["{cxx}", "-std=c++17", "-O0", "-g", "-UNDEBUG", "{flags}", "-I{root}/include", "-DDB_TEST_SOURCE_DIR=\"{root}\"", "{root}/test/pcuda_stage5/test_modules.cpp", "{root}/src/core/content_hash.cpp", "{root}/src/core/code_symbols.cpp", "{root}/src/core/module_codegen.cpp", "{root}/src/core/module_cache.cpp", "{root}/src/core/module_compiler.cpp", "{root}/src/core/module_build.cpp", "{root}/src/core/config.cpp", "{root}/src/core/size_expression.cpp", "-ldl", "-pthread", "-o", "{out}/checks"]],
+  "test": [["{out}/checks"]],
+  "objects": ["{out}/checks"],
+  "mutations": [
+    {"id":"readiness-after-all-built", "file":"src/core/module_cache.cpp", "before":"execute([&](size_t index){return ready(index,build,staged);});\n        build.finish();", "after":"build.finish();\n        execute([&](size_t index){return ready(index,build,staged);});"},
+    {"id":"early-cache-publication", "file":"src/core/module_cache.cpp", "before":"module=std::make_shared<LoadedKernelModule>(binary,found->recipe.identity,counters,found->recipe.schema);", "after":"module=std::make_shared<LoadedKernelModule>(binary,found->recipe.identity,counters,found->recipe.schema);cache.modules_.emplace(key,module);"},
+    {"id":"typed-reservation-leak", "file":"src/core/module_cache.cpp", "before":"void overlap(size_t jobs,const std::function<void(const KernelLookup&)>& execute) {", "after":"void overlap(size_t jobs,const std::function<void(const KernelLookup&)>& execute) {cache.typed_=reserved;"},
+    {"id":"bad-wave-count", "file":"src/core/module_build.cpp", "before":"if (binaries.size()!=count)", "after":"if (false)"},
+    {"id":"lost-worker-error", "file":"src/core/module_build.cpp", "before":"if (impl_->failure) std::rethrow_exception(impl_->failure);", "after":"if (false) std::rethrow_exception(impl_->failure);"},
+    {"id":"lost-counter-merge", "file":"src/core/module_build.cpp", "before":"mergeCounters(counters,events);", "after":"mergeCounters(counters,ModuleCounters{});"},
+    {"id":"lost-timing-merge", "file":"src/core/module_build.cpp", "before":"mergeTiming(timing,observations);", "after":"mergeTiming(timing,ModuleBuildTiming{});"},
+    {"id":"wave-index-shift", "file":"src/core/module_build.cpp", "before":"return impl_->ready.at(index).get();", "after":"return impl_->ready.at(index+1).get();"},
+    {"id":"missing-post-execute-validation", "file":"src/core/module_cache.cpp", "before":"for (size_t index=0;index<keys.size();++index) ready(index,build,staged);", "after":"for (size_t index=keys.size();index<keys.size();++index) ready(index,build,staged);"},
+    {"id":"completion-not-retained", "file":"src/core/module_cache.cpp", "before":"completions_.emplace(identity,std::move(drain));", "after":"if (false) completions_.emplace(identity,std::move(drain));"},
+    {"id":"cache-typed-bound", "file":"src/core/module_cache.cpp", "before":"reserved[family(recipe)]>=8", "after":"reserved[family(recipe)]>=7"},
+    {"id":"loaded-abi", "file":"src/core/module_cache.cpp", "before":"descriptor->abi_version!=DB_MODULE_ABI_V2_VERSION", "after":"false"}
+  ]
+}

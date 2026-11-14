@@ -1,0 +1,21 @@
+{
+  "version": 1,
+  "inputs": ["include", "src", "deps", "test", "CMakeLists.txt", "cmake", "tools/pcuda_pch_manifest.py"],
+  "build": [
+    ["cmake", "-S", "{root}", "-B", "{out}/engine", "-DCMAKE_BUILD_TYPE=Release", "-DCMAKE_CXX_COMPILER={cxx}"],
+    ["cmake", "--build", "{out}/engine", "--target", "test_pcuda_runtime_parameters", "-j4"]
+  ],
+  "test": [["{out}/engine/test_pcuda_runtime_parameters", "{out}/gpu"]],
+  "mutations": [
+    {"id":"fractional-atomic", "file":"src/core/aggregate_codegen.cpp", "before":"\",static_cast<\" + type + \">(\" + value + \"));\\n\"", "after":"\",static_cast<\" + type + \">(static_cast<long long>(\" + value + \")));\\n\""},
+    {"id":"case-equality", "file":"src/core/expression_codegen.cpp", "before":"call(\"safe_eq\", selected, leaf)", "after":"\"false\""},
+    {"id":"group-presence", "file":"src/core/visitor.cpp", "before":"out << \"                    bool present = d_aggregate_presence[g] != 0ULL;\\n\";", "after":"out << \"                    bool present = false;\\n\";"},
+    {"id":"avg-signed-state", "file":"src/core/aggregate_codegen.cpp", "before":"return \"db::aggregateValue<\" + type + \">(\" + raw + \")\";", "after":"return raw;"},
+    {"id":"runtime-limit", "file":"src/core/visitor.cpp", "before":"minimum(variable(\"sort_input_rows\"), limitSize(node))", "after":"variable(\"sort_input_rows\")"},
+    {"id":"atomic-minimum", "file":"include/core/device_atomics.h", "before":"AggregateMerge<T, op>{}(aggregateValue<T>(observed), value)", "after":"AggregateMerge<T, AggregateOp::Sum>{}(aggregateValue<T>(observed), value)"},
+    {"id":"case-common-type", "file":"src/core/expression_codegen.cpp", "before":"if (schema.empty()) return value;", "after":"if (true) return value;"},
+    {"id":"count-validity", "file":"src/core/visitor.cpp", "before":"if (static_cast<size_t>(slot) >= groups && node->aggregates.at(static_cast<size_t>(slot) - groups).isCount()) return \"1\";", "after":"if (static_cast<size_t>(slot) >= groups && node->aggregates.at(static_cast<size_t>(slot) - groups).isCount()) return \"0\";"},
+    {"id":"count-native-promotion", "file":"include/core/inline_math.h", "before":"struct NumericCommon<A, B, true> { using type = TaggedNumeric; };", "after":"struct NumericCommon<A, B, true> { using type = uint64_t; };"},
+    {"id":"count-tagged-promotion", "file":"include/core/tagged_numeric.h", "before":"return numericInteger<op>(a, b);", "after":"return numericOperation<op>(static_cast<uint64_t>(a), static_cast<uint64_t>(b));"}
+  ]
+}

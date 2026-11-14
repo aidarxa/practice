@@ -1,0 +1,26 @@
+PROJECT_NAME = "SQL physical execution and module ABI v1"
+OUTPUT_DIRECTORY = build/pcuda-stage2/doxygen
+INPUT = include/core/module_abi.h \
+        include/core/module_contract.h \
+        include/core/parameter_value.h \
+        include/core/size_expression.h \
+        include/core/execution_plan.h \
+        include/core/physical_planner.h \
+        include/core/legacy_plan_runtime.h \
+        src/core/parameter_value.cpp \
+        src/core/size_expression.cpp \
+        src/core/execution_plan.cpp \
+        src/core/physical_planner.cpp \
+        src/core/legacy_kernel_codegen.cpp \
+        src/core/legacy_plan_runtime.cpp
+FILE_PATTERNS = *.h *.cpp
+EXTRACT_ALL = YES
+EXTRACT_PRIVATE = YES
+GENERATE_HTML = YES
+GENERATE_LATEX = NO
+QUIET = YES
+WARNINGS = YES
+WARN_IF_UNDOCUMENTED = NO
+WARN_AS_ERROR = YES
+SEARCH_INCLUDES = NO
+PREDEFINED = __cplusplus=201703L

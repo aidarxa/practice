@@ -1,4 +1,4 @@
-# Crystal-SYCL runtime configuration.
+# Crystal-PCUDA runtime configuration (legacy config filenames remain accepted).
 # Search order: $CRYSTAL_CONFIG, ./crystal.conf, ./crystal-sycl.conf,
 # ~/.config/crystal-sycl/config.conf.
 # Environment variables CRYSTAL_INCLUDE_DIR and CRYSTAL_DEPS_INCLUDE_DIR override
@@ -7,9 +7,30 @@
 CRYSTAL_INCLUDE_DIR = ./include
 CRYSTAL_DEPS_INCLUDE_DIR = ./deps/include
 
+# Empty: manifest prepared by this CMake build. CRYSTAL_PCUDA_MANIFEST overrides it.
+# Configure compiler/flags with CRYSTAL_PCUDA_COMPILER/FLAGS/LINK_FLAGS in CMake.
+# Changed PCH/compiler/headers cause a diagnostic: rebuild target pcuda_jit_pch.
+pcuda_manifest = ""
+jit_jobs = 4
+jit_artifact_dir = ""
+jit_keep_artifacts = off
+jit_traces = off
+# Opt-in research only, not the default acceptance path. Uses pcuda-modules-overlap-exp-v1;
+# build/load/execution intervals overlap and component sums are intentionally unavailable.
+# CRYSTAL_JIT_OVERLAP_EXPERIMENT explicitly overrides this research setting for regression clients.
+jit_overlap_experiment = off
+
+# Empty: first enumerated GPU, without assuming backend/platform indices.
+# Otherwise require exactly one case-insensitive GPU name substring match.
+# CRYSTAL_DEVICE_NAME overrides this setting. CPU fallback is never implicit.
+device_name = ""
+
 # CLI defaults
 dump_generated_code = off
 extended_timing = off
+# Includes direct SQL-to-PCUDA-source time and first-result startup/data-load observations.
+# These overlap existing query components; they must not be added to component sums.
+# jit_traces is diagnostic: use separate rotated plain/traced series for comparisons.
 output_limit = 1000
 
 # Memory guard defaults

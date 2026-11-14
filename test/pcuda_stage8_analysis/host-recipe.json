@@ -1,0 +1,21 @@
+{
+  "version": 1,
+  "inputs": ["test/pcuda_stage8_analysis/probe_log.h", "test/pcuda_stage8_analysis/probe_log.cpp", "test/pcuda_stage8_analysis/probe_symbols.h", "test/pcuda_stage8_analysis/test_probe_log.cpp", "test/pcuda_stage8_analysis/test_probe_symbols.cpp", "test/pcuda_stage8_analysis/probe_fixture.cpp", "include/cli/text_format.h"],
+  "build": [
+    ["{cxx}", "-std=c++17", "-O0", "-g", "{flags}", "-I{root}/include", "{root}/test/pcuda_stage8_analysis/probe_log.cpp", "{root}/test/pcuda_stage8_analysis/test_probe_log.cpp", "-pthread", "-o", "{out}/log_checks"],
+    ["{cxx}", "-std=c++17", "-shared", "-fPIC", "{flags}", "{root}/test/pcuda_stage8_analysis/probe_fixture.cpp", "-o", "{out}/fixture.so"],
+    ["{cxx}", "-std=c++17", "-O0", "-g", "{flags}", "{root}/test/pcuda_stage8_analysis/test_probe_symbols.cpp", "-ldl", "-o", "{out}/symbol_checks"]
+  ],
+  "test": [["env", "CRYSTAL_S2_EVENTS={out}/events.json", "{out}/log_checks"], ["{out}/symbol_checks", "{out}/fixture.so"]],
+  "objects": ["{out}/log_checks", "{out}/symbol_checks", "{out}/fixture.so"],
+  "mutations": [
+    {"id":"capacity-boundary", "file":"test/pcuda_stage8_analysis/probe_log.cpp", "before":"events_.size()>=limit_", "after":"events_.size()>limit_"},
+    {"id":"drop-count", "file":"test/pcuda_stage8_analysis/probe_log.cpp", "before":"{increment(dropped_);return;}", "after":"{return;}"},
+    {"id":"compile-ids", "file":"test/pcuda_stage8_analysis/probe_log.cpp", "before":"increment(compilation_);", "after":"compilation_=1;"},
+    {"id":"scope-parent", "file":"test/pcuda_stage8_analysis/probe_log.cpp", "before":"current_compilation=previous_;", "after":"current_compilation=0;"},
+    {"id":"span-status", "file":"test/pcuda_stage8_analysis/probe_log.cpp", "before":"event_.status=status;", "after":"event_.status=0;"},
+    {"id":"original-must-exist", "file":"test/pcuda_stage8_analysis/probe_symbols.h", "before":"if (!symbol) {std::fprintf", "after":"if (false) {std::fprintf"},
+    {"id":"noload-only", "file":"test/pcuda_stage8_analysis/probe_symbols.h", "before":"RTLD_NOW|RTLD_NOLOAD", "after":"RTLD_NOW"},
+    {"id":"no-scope-promotion", "file":"test/pcuda_stage8_analysis/probe_symbols.h", "before":"RTLD_NOW|RTLD_NOLOAD", "after":"RTLD_NOW|RTLD_NOLOAD|RTLD_GLOBAL"}
+  ]
+}

@@ -160,7 +160,8 @@ static bool isSingleHashJoinEquality(const ExprNode* expr) {
         return false;
     }
 
-    return looksLikeHashKeyColumn(left->column_name) ||
+    return (left->value_type == ParameterType::Text && right->value_type == ParameterType::Text) ||
+           looksLikeHashKeyColumn(left->column_name) ||
            looksLikeHashKeyColumn(right->column_name);
 }
 
@@ -284,6 +285,7 @@ void PredicatePushdownRule::tryPushdown(std::unique_ptr<OperatorNode>& node) {
         auto lf = std::make_unique<FilterNode>(buildAndChain(left_preds));
         lf->addChild(std::move(left_child));
         left_child = std::move(lf);
+        left_child->parent_ = join;
         // Re-apply pushdown to the newly created FilterNode
         applyRecursive(left_child);
     }
@@ -292,6 +294,7 @@ void PredicatePushdownRule::tryPushdown(std::unique_ptr<OperatorNode>& node) {
         auto rf = std::make_unique<FilterNode>(buildAndChain(right_preds));
         rf->addChild(std::move(right_child));
         right_child = std::move(rf);
+        right_child->parent_ = join;
         // Re-apply pushdown to the newly created FilterNode
         applyRecursive(right_child);
     }
@@ -299,7 +302,11 @@ void PredicatePushdownRule::tryPushdown(std::unique_ptr<OperatorNode>& node) {
     // ---- Remove or update the current FilterNode ----
     if (remaining_preds.empty()) {
         // All predicates pushed → remove the FilterNode entirely
-        node = std::move(child_ref);
+        // Detach before destroying the Filter that owns child_ref. The surviving
+        // subtree keeps the Filter's former parent, not a dangling back-pointer.
+        auto replacement = std::move(child_ref);
+        replacement->parent_ = filter->parent_;
+        node = std::move(replacement);
     } else {
         // Some predicates remain here
         filter->predicate = buildAndChain(remaining_preds);

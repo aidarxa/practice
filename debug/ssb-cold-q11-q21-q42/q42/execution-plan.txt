@@ -1,0 +1,244 @@
+[Aggregate]
+  GROUP BY:
+    [ColumnRef] DDATE.d_year
+    [ColumnRef] SUPPLIER.s_nation
+    [ColumnRef] PART.p_category
+  AGGREGATIONS:
+    SUM(
+      [BinaryExpr] -
+        [ColumnRef] LINEORDER.lo_revenue
+        [ColumnRef] LINEORDER.lo_supplycost
+    )
+  [HashJoin] on:
+    [BinaryExpr] =
+      [ColumnRef] LINEORDER.lo_orderdate
+      [ColumnRef] DDATE.d_datekey
+    [Filter]
+      [BinaryExpr] OR
+        [BinaryExpr] =
+          [ColumnRef] DDATE.d_year
+          [ParameterRef] $2
+        [BinaryExpr] =
+          [ColumnRef] DDATE.d_year
+          [ParameterRef] $3
+      [TableScan] DDATE
+    [HashJoin] on:
+      [BinaryExpr] =
+        [ColumnRef] LINEORDER.lo_partkey
+        [ColumnRef] PART.p_partkey
+      [Filter]
+        [BinaryExpr] OR
+          [BinaryExpr] =
+            [ColumnRef] PART.p_mfgr
+            [ParameterRef] $4
+          [BinaryExpr] =
+            [ColumnRef] PART.p_mfgr
+            [ParameterRef] $5
+        [TableScan] PART
+      [HashJoin] on:
+        [BinaryExpr] =
+          [ColumnRef] LINEORDER.lo_suppkey
+          [ColumnRef] SUPPLIER.s_suppkey
+        [Filter]
+          [BinaryExpr] =
+            [ColumnRef] SUPPLIER.s_region
+            [ParameterRef] $1
+          [TableScan] SUPPLIER
+        [HashJoin] on:
+          [BinaryExpr] =
+            [ColumnRef] LINEORDER.lo_custkey
+            [ColumnRef] CUSTOMER.c_custkey
+          [Filter]
+            [BinaryExpr] =
+              [ColumnRef] CUSTOMER.c_region
+              [ParameterRef] $0
+            [TableScan] CUSTOMER
+          [TableScan] LINEORDER
+kernel 0 build_hashtable_d
+  argument d_d_hash_table kind=1 type=1 access=3
+  argument d_d_hash_table_occupied kind=1 type=1 access=3
+  argument d_d_datekey kind=1 type=1 access=1
+  argument d_d_year kind=1 type=1 access=1
+  argument rows_DDATE kind=2 type=2 access=1
+  argument db_parameter_2 kind=3 type=3 access=1
+  argument db_parameter_3 kind=3 type=3 access=1
+kernel 1 build_hashtable_p
+  argument d_p_hash_table kind=1 type=1 access=3
+  argument d_p_hash_table_occupied kind=1 type=1 access=3
+  argument d_p_category kind=1 type=1 access=1
+  argument d_p_mfgr kind=1 type=1 access=1
+  argument d_p_partkey kind=1 type=1 access=1
+  argument rows_PART kind=2 type=2 access=1
+  argument db_parameter_4 kind=3 type=3 access=1
+  argument db_parameter_5 kind=3 type=3 access=1
+kernel 2 build_hashtable_s
+  argument d_s_hash_table kind=1 type=1 access=3
+  argument d_s_hash_table_occupied kind=1 type=1 access=3
+  argument d_s_nation kind=1 type=1 access=1
+  argument d_s_region kind=1 type=1 access=1
+  argument d_s_suppkey kind=1 type=1 access=1
+  argument rows_SUPPLIER kind=2 type=2 access=1
+  argument db_parameter_1 kind=3 type=3 access=1
+kernel 3 build_hashtable_c
+  argument d_c_hash_table kind=1 type=1 access=3
+  argument d_c_hash_table_occupied kind=1 type=1 access=3
+  argument d_c_custkey kind=1 type=1 access=1
+  argument d_c_region kind=1 type=1 access=1
+  argument rows_CUSTOMER kind=2 type=2 access=1
+  argument db_parameter_0 kind=3 type=3 access=1
+kernel 4 Scan_LINEORDER
+  argument d_d_hash_table kind=1 type=1 access=3
+  argument d_d_hash_table_occupied kind=1 type=1 access=3
+  argument d_p_hash_table kind=1 type=1 access=3
+  argument d_p_hash_table_occupied kind=1 type=1 access=3
+  argument d_s_hash_table kind=1 type=1 access=3
+  argument d_s_hash_table_occupied kind=1 type=1 access=3
+  argument d_c_hash_table kind=1 type=1 access=3
+  argument d_c_hash_table_occupied kind=1 type=1 access=3
+  argument d_result kind=1 type=2 access=3
+  argument d_lo_custkey kind=1 type=1 access=1
+  argument d_lo_orderdate kind=1 type=1 access=1
+  argument d_lo_partkey kind=1 type=1 access=1
+  argument d_lo_revenue kind=1 type=1 access=1
+  argument d_lo_suppkey kind=1 type=1 access=1
+  argument d_lo_supplycost kind=1 type=1 access=1
+  argument rows_CUSTOMER kind=2 type=2 access=1
+  argument rows_LINEORDER kind=2 type=2 access=1
+  argument rows_PART kind=2 type=2 access=1
+  argument rows_SUPPLIER kind=2 type=2 access=1
+set
+set
+set
+set
+set
+fill
+fill
+require
+require
+require
+require
+require
+require
+require
+ensure
+fill
+require
+ensure
+fill
+launch kernel=0 grid=op6($rows_DDATE,512) block=128
+require
+ensure
+fill
+require
+ensure
+fill
+launch kernel=1 grid=op6($rows_PART,512) block=128
+require
+ensure
+fill
+require
+ensure
+fill
+launch kernel=2 grid=op6($rows_SUPPLIER,512) block=128
+require
+ensure
+fill
+require
+ensure
+fill
+launch kernel=3 grid=op6($rows_CUSTOMER,512) block=128
+require
+launch kernel=4 grid=op6($rows_LINEORDER,512) block=128
+publish
+
+EXTENTS
+set rows_CUSTOMER 300000 = 300000
+set rows_DDATE 2557 = 2557
+set rows_LINEORDER 59986217 = 59986217
+set rows_PART 800000 = 800000
+set rows_SUPPLIER 20000 = 20000
+fill d_result count 17500 = 17500 byte 0
+fill d_result_validity count op8(op6(17500,64),1) = 274 byte 0
+operation 12
+operation 12
+operation 12
+operation 12
+operation 12
+operation 12
+operation 12
+ensure d_d_hash_table count op4(2,61131) = 122262
+fill d_d_hash_table count op8(op4(2,61131),1) = 122262 byte 0
+operation 12
+ensure d_d_hash_table_occupied count 61131 = 61131
+fill d_d_hash_table_occupied count op8(61131,1) = 61131 byte 0
+launch 0 grid op6($rows_DDATE,512) = 5 block 128
+operation 12
+ensure d_p_hash_table count op4(2,$rows_PART) = 1600000
+fill d_p_hash_table count op8(op4(2,$rows_PART),1) = 1600000 byte 0
+operation 12
+ensure d_p_hash_table_occupied count $rows_PART = 800000
+fill d_p_hash_table_occupied count op8($rows_PART,1) = 800000 byte 0
+launch 1 grid op6($rows_PART,512) = 1563 block 128
+operation 12
+ensure d_s_hash_table count op4(2,$rows_SUPPLIER) = 40000
+fill d_s_hash_table count op8(op4(2,$rows_SUPPLIER),1) = 40000 byte 0
+operation 12
+ensure d_s_hash_table_occupied count $rows_SUPPLIER = 20000
+fill d_s_hash_table_occupied count op8($rows_SUPPLIER,1) = 20000 byte 0
+launch 2 grid op6($rows_SUPPLIER,512) = 40 block 128
+operation 12
+ensure d_c_hash_table count op4(2,$rows_CUSTOMER) = 600000
+fill d_c_hash_table count op8(op4(2,$rows_CUSTOMER),1) = 600000 byte 0
+operation 12
+ensure d_c_hash_table_occupied count $rows_CUSTOMER = 300000
+fill d_c_hash_table_occupied count op8($rows_CUSTOMER,1) = 300000 byte 0
+launch 3 grid op6($rows_CUSTOMER,512) = 586 block 128
+operation 12
+launch 4 grid op6($rows_LINEORDER,512) = 117161 block 128
+publish values 17500 = 17500 dense 0
+MODULE 0 build_hashtable_d 9d10ea732fcfa0f10e9ce02bcae271444a34b753cf9f0382b967a743d77ad496 4471 shared 0
+BUFFER d_d_hash_table d_d_hash_table
+BUFFER d_d_hash_table_occupied d_d_hash_table_occupied
+BUFFER d_d_datekey d_d_datekey
+BUFFER d_d_year d_d_year
+SCALAR rows_DDATE $rows_DDATE
+MODULE 1 build_hashtable_p 079a1b346bbcfd05db23cd8e9402a3632d3d346486ae88f245e5eb22ff8e5ad9 4544 shared 0
+BUFFER d_p_hash_table d_p_hash_table
+BUFFER d_p_hash_table_occupied d_p_hash_table_occupied
+BUFFER d_p_category d_p_category
+BUFFER d_p_mfgr d_p_mfgr
+BUFFER d_p_partkey d_p_partkey
+SCALAR rows_PART $rows_PART
+MODULE 2 build_hashtable_s 170f70d6c009f9b6bd0b0b23e7d198f3d5a5dcc330d7b33fcde18746fd39f725 3962 shared 0
+BUFFER d_s_hash_table d_s_hash_table
+BUFFER d_s_hash_table_occupied d_s_hash_table_occupied
+BUFFER d_s_nation d_s_nation
+BUFFER d_s_region d_s_region
+BUFFER d_s_suppkey d_s_suppkey
+SCALAR rows_SUPPLIER $rows_SUPPLIER
+MODULE 3 build_hashtable_c 4038d8e91eedc4472c16adae24c20e193ba06a1fbeceaff8671703f83d175935 3705 shared 0
+BUFFER d_c_hash_table d_c_hash_table
+BUFFER d_c_hash_table_occupied d_c_hash_table_occupied
+BUFFER d_c_custkey d_c_custkey
+BUFFER d_c_region d_c_region
+SCALAR rows_CUSTOMER $rows_CUSTOMER
+MODULE 4 Scan_LINEORDER 5741091f9bc77b36d8e7297ce26c07643a60234897151b4e0c0698e156b6d2d0 6501 shared 0
+BUFFER d_d_hash_table d_d_hash_table
+BUFFER d_d_hash_table_occupied d_d_hash_table_occupied
+BUFFER d_p_hash_table d_p_hash_table
+BUFFER d_p_hash_table_occupied d_p_hash_table_occupied
+BUFFER d_s_hash_table d_s_hash_table
+BUFFER d_s_hash_table_occupied d_s_hash_table_occupied
+BUFFER d_c_hash_table d_c_hash_table
+BUFFER d_c_hash_table_occupied d_c_hash_table_occupied
+BUFFER d_result d_result
+BUFFER d_lo_custkey d_lo_custkey
+BUFFER d_lo_orderdate d_lo_orderdate
+BUFFER d_lo_partkey d_lo_partkey
+BUFFER d_lo_revenue d_lo_revenue
+BUFFER d_lo_suppkey d_lo_suppkey
+BUFFER d_lo_supplycost d_lo_supplycost
+SCALAR rows_CUSTOMER $rows_CUSTOMER
+SCALAR rows_LINEORDER $rows_LINEORDER
+SCALAR rows_PART $rows_PART
+SCALAR rows_SUPPLIER $rows_SUPPLIER

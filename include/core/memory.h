@@ -5,11 +5,13 @@
 #include <unordered_map>
 #include <utility>
 #include <vector>
+#include "storage/column.h"
 
 enum class LogicalType : uint8_t {
     Int64,
     UInt64,
     Float64,
+    Text, ///< UTF-8 bytes, binary ordering; physical padding does not define CHAR semantics.
 };
 
 struct ColumnStatistics {
@@ -30,40 +32,10 @@ public:
       : name_(name), column_names_(column_names), size_(size),
         is_fact_table_(is_fact_table) {}
 
-  TableMetadata(const TableMetadata &other) {
-    name_ = other.name_;
-    column_names_ = other.column_names_;
-    size_ = other.size_;
-    is_fact_table_ = other.is_fact_table_;
-    column_stats_ = other.column_stats_;
-  };
-  TableMetadata(TableMetadata &&other) {
-    name_ = std::move(other.name_);
-    column_names_ = std::move(other.column_names_);
-    size_ = std::move(other.size_);
-    is_fact_table_ = std::move(other.is_fact_table_);
-    column_stats_ = std::move(other.column_stats_);
-  }
-  TableMetadata &operator=(const TableMetadata &rhs) {
-    if (this != &rhs) {
-      name_ = rhs.name_;
-      column_names_ = rhs.column_names_;
-      size_ = rhs.size_;
-      is_fact_table_ = rhs.is_fact_table_;
-      column_stats_ = rhs.column_stats_;
-    }
-    return *this;
-  }
-  TableMetadata &operator=(TableMetadata &&rhs) {
-    if (this != &rhs) {
-      name_ = std::move(rhs.name_);
-      column_names_ = std::move(rhs.column_names_);
-      size_ = std::move(rhs.size_);
-      is_fact_table_ = std::move(rhs.is_fact_table_);
-      column_stats_ = std::move(rhs.column_stats_);
-    }
-    return *this;
-  }
+  TableMetadata(const TableMetadata&) = default;
+  TableMetadata(TableMetadata&&) = default;
+  TableMetadata& operator=(const TableMetadata&) = default;
+  TableMetadata& operator=(TableMetadata&&) = default;
   ~TableMetadata() = default;
 
   inline const std::string &getName() const { return name_; }
@@ -73,6 +45,18 @@ public:
   inline uint64_t getSize() const { return size_; }
   inline uint64_t getColumnCount() const { return column_names_.size(); }
   inline bool isFactTable() const { return is_fact_table_; }
+
+  /** @brief Fixtures default to Int32; real storage supplies its explicit encoding. */
+  void setColumnStorage(const std::string& column, db::ColumnStorage storage) { column_storage_[column] = storage; }
+  db::ColumnStorage getColumnStorage(const std::string& column) const {
+    const auto found = column_storage_.find(column);
+    return found == column_storage_.end() ? db::ColumnStorage{} : found->second;
+  }
+  /** @brief Reject text before numeric lowering, including aliases and aggregate arguments. */
+  void requireNumericColumn(const std::string& column) const {
+    if (!getColumnStorage(column).isNumeric())
+      throw std::runtime_error("Text column " + name_ + "." + column + " requires extension 7-TEXT; no raw Int32 or dictionary view");
+  }
 
   inline void setColumnStats(const std::string &col,
                              const ColumnStatistics &stats) {
@@ -137,6 +121,7 @@ private:
   uint64_t size_;
   bool is_fact_table_;
   std::unordered_map<std::string, ColumnStatistics> column_stats_;
+  std::unordered_map<std::string, db::ColumnStorage> column_storage_;
 };
 
 class Catalog {

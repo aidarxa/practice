@@ -1,13 +1,21 @@
 #pragma once
+/** @file @brief Host-only SSB numeric/validity loading; device headers stay separate. */
+#include "storage/ssb_schema.h"
+#include "storage/column_loader.h"
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
+#include <limits>
 #include <stdexcept>
 #include <string>
+#include <type_traits>
 #include <utility>
 #include <vector>
-#define BASE_PATH "/home/aidar/practice/data/" // edit base path to data
+#ifndef BASE_PATH
+#define BASE_PATH "data/"
+#endif
 #define SF 10
 #if SF == 10
 #define DATA_DIR BASE_PATH "10/"
@@ -25,15 +33,6 @@
 #define D_LEN 2556
 #endif
 
-
-inline int index_of(std::string *arr, int len, std::string val) {
-  for (int i = 0; i < len; i++)
-    if (arr[i] == val)
-      return i;
-
-  return -1;
-}
-
 inline std::string getTableName(std::string col_name) {
   if (col_name.empty()) return "";
   if(col_name[0] == 'l') return "LINEORDER";
@@ -45,58 +44,11 @@ inline std::string getTableName(std::string col_name) {
 }
 
 inline std::string lookup(std::string col_name) {
-  std::string lineorder[] = {
-      "lo_orderkey", "lo_linenumber",    "lo_custkey",       "lo_partkey",
-      "lo_suppkey",  "lo_orderdate",     "lo_orderpriority", "lo_shippriority",
-      "lo_quantity", "lo_extendedprice", "lo_ordtotalprice", "lo_discount",
-      "lo_revenue",  "lo_supplycost",    "lo_tax",           "lo_commitdate",
-      "lo_shipmode"};
-  std::string part[] = {"p_partkey",  "p_name",   "p_mfgr",
-                        "p_category", "p_brand1", "p_color",
-                        "p_type",     "p_size",   "p_container"};
-  std::string supplier[] = {"s_suppkey", "s_name",   "s_address", "s_city",
-                            "s_nation",  "s_region", "s_phone"};
-  std::string customer[] = {"c_custkey", "c_name",      "c_address",
-                            "c_city",    "c_nation",    "c_region",
-                            "c_phone",   "c_mktsegment"};
-  std::string date[] = {"d_datekey",
-                        "d_date",
-                        "d_dayofweek",
-                        "d_month",
-                        "d_year",
-                        "d_yearmonthnum",
-                        "d_yearmonth",
-                        "d_daynuminweek",
-                        "d_daynuminmonth",
-                        "d_daynuminyear",
-                        "d_sellingseason",
-                        "d_lastdayinweekfl",
-                        "d_lastdayinmonthfl",
-                        "d_holidayfl",
-                        "d_weekdayfl"};
-
-  if (col_name[0] == 'l') {
-    int index = index_of(lineorder, 17, col_name);
-    return "LINEORDER" + std::to_string(index);
-  } else if (col_name[0] == 's') {
-    int index = index_of(supplier, 7, col_name);
-    return "SUPPLIER" + std::to_string(index);
-  } else if (col_name[0] == 'c') {
-    int index = index_of(customer, 8, col_name);
-    return "CUSTOMER" + std::to_string(index);
-  } else if (col_name[0] == 'p') {
-    int index = index_of(part, 9, col_name);
-    return "PART" + std::to_string(index);
-  } else if (col_name[0] == 'd') {
-    int index = index_of(date, 15, col_name);
-    return "DDATE" + std::to_string(index);
-  }
-
-  return "";
+  return db::ssbColumn(col_name).fileName();
 }
 
 inline std::size_t nullBitmapWordCount(std::size_t num_entries) {
-  return (num_entries + 63U) / 64U;
+  return num_entries / 64U + (num_entries % 64U != 0);
 }
 
 inline uint64_t nullBitmapLastWordMask(std::size_t num_entries) {
@@ -147,9 +99,9 @@ enum class NullBitmapFileKind {
 };
 
 inline std::vector<std::pair<std::string, NullBitmapFileKind>> nullBitmapCandidateFiles(
-    const std::string& col_name) {
-  const std::string physical = std::string(DATA_DIR) + lookup(col_name);
-  const std::string logical = std::string(DATA_DIR) + col_name;
+    const std::string& col_name, const std::filesystem::path& directory = DATA_DIR) {
+  const std::string physical = (directory / lookup(col_name)).string();
+  const std::string logical = (directory / col_name).string();
 
   std::vector<std::pair<std::string, NullBitmapFileKind>> candidates;
   auto add_all = [&](const std::string& base) {
@@ -173,8 +125,8 @@ inline std::vector<std::pair<std::string, NullBitmapFileKind>> nullBitmapCandida
   return candidates;
 }
 
-inline bool hasNullBitmapFile(const std::string& col_name) {
-  for (const auto& [path, kind] : nullBitmapCandidateFiles(col_name)) {
+inline bool hasNullBitmapFile(const std::string& col_name, const std::filesystem::path& directory = DATA_DIR) {
+  for (const auto& [path, kind] : nullBitmapCandidateFiles(col_name, directory)) {
     (void)kind;
     if (std::filesystem::exists(std::filesystem::path(path))) {
       return true;
@@ -239,16 +191,13 @@ inline std::vector<uint64_t> loadValidityBitmapIfExists(const std::string& col_n
 }
 
 
+/** @brief Resolve the physical name and strictly decode numeric rows, including ASCII flags.
+ * @details The old raw-prefix helper is isolated in the historical stage-3 test.
+ * Engine and manual queries use this strict entry, never its raw view.
+ */
 template <typename T>
-inline std::vector<T> loadColumn(std::string col_name, int num_entries) {
-  std::vector<T> ret(num_entries);
-
-  std::string filename = DATA_DIR + lookup(col_name);
-  std::ifstream colData(filename.c_str(), std::ios::in | std::ios::binary);
-  if (!colData) {
-    throw std::runtime_error("Cannot open file: " + filename);
-  }
-
-  colData.read((char *)ret.data(), num_entries * sizeof(T));
-  return ret;
+inline std::vector<T> loadColumn(std::string col_name, std::size_t num_entries) {
+  static_assert(std::is_same<T, int32_t>::value, "SSB numeric storage decodes to Int32");
+  const auto& column = db::ssbColumn(col_name);
+  return db::loadNumericColumn(std::filesystem::path(DATA_DIR) / column.fileName(), num_entries, column.storage);
 }

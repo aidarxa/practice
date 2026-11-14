@@ -1,9 +1,12 @@
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <stdexcept>
 #include <string>
+#include "core/parameter_value.h"
 
 namespace db {
 
@@ -32,6 +35,8 @@ enum class ExprType {
     OP_IS_NOT_NULL,// IS NOT NULL
     CASE_WHEN,     // searched CASE WHEN condition THEN value ELSE value END
     STAR,          // * in SELECT * or aggregate arguments
+    PARAMETER_REF, ///< Request-local slot; its type and value live outside the expression.
+    LITERAL_TEXT, ///< Validated during extraction; bytes never specialize a module.
 };
 
 // ============================================================================
@@ -42,6 +47,8 @@ class ColumnRefExpr;
 class LiteralIntExpr;
 class LiteralFloatExpr;
 class LiteralNullExpr;
+class LiteralTextExpr;
+class ParameterRefExpr;
 class BinaryExpr;
 class StarExpr;
 class CaseWhenExpr;
@@ -68,6 +75,7 @@ class ColumnRefExpr final : public ExprNode {
 public:
     std::string table_name;   // может быть пустым
     std::string column_name;  // всегда заполнено
+    ParameterType value_type = ParameterType::Int64; ///< Resolved catalog type, independent of current data.
 
     explicit ColumnRefExpr(std::string column, std::string table = "")
         : table_name(std::move(table)), column_name(std::move(column)) {}
@@ -77,54 +85,93 @@ public:
     void accept(ExprVisitor& visitor) const override;
 
     std::unique_ptr<ExprNode> clone() const override {
-        return std::make_unique<ColumnRefExpr>(column_name, table_name);
+        return std::make_unique<ColumnRefExpr>(*this);
     }
 };
 
+/**
+ * @brief Literal provenance before parameter extraction.
+ * @details An origin identifies one AST occurrence, never a value. Copies made
+ * while normalizing simple CASE retain it; unrelated equal literals do not share
+ * it. Origins are local to a translation and are absent from template keys.
+ */
+class LiteralExprNode : public ExprNode {
+public:
+    std::optional<std::size_t> origin;
+
+protected:
+    explicit LiteralExprNode(std::optional<std::size_t> source = {}) : origin(source) {}
+};
+
 // Целочисленный литерал
-class LiteralIntExpr final : public ExprNode {
+class LiteralIntExpr final : public LiteralExprNode {
 public:
     int64_t value;
 
-    explicit LiteralIntExpr(int64_t v) : value(v) {}
+    explicit LiteralIntExpr(int64_t v, std::optional<std::size_t> source = {})
+        : LiteralExprNode(source), value(v) {}
 
     ExprType getType() const override { return ExprType::LITERAL_INT; }
 
     void accept(ExprVisitor& visitor) const override;
 
     std::unique_ptr<ExprNode> clone() const override {
-        return std::make_unique<LiteralIntExpr>(value);
+        return std::make_unique<LiteralIntExpr>(*this);
     }
 };
 
 // Вещественный литерал (пока не генерируется Translator-ом, но нужен для полноты)
-class LiteralFloatExpr final : public ExprNode {
+class LiteralFloatExpr final : public LiteralExprNode {
 public:
     double value;
 
-    explicit LiteralFloatExpr(double v) : value(v) {}
+    explicit LiteralFloatExpr(double v, std::optional<std::size_t> source = {})
+        : LiteralExprNode(source), value(v) {}
 
     ExprType getType() const override { return ExprType::LITERAL_FLOAT; }
 
     void accept(ExprVisitor& visitor) const override;
 
     std::unique_ptr<ExprNode> clone() const override {
-        return std::make_unique<LiteralFloatExpr>(value);
+        return std::make_unique<LiteralFloatExpr>(*this);
     }
 };
 
 
 // SQL NULL literal. Value codegen emits 0, validity codegen emits false.
-class LiteralNullExpr final : public ExprNode {
+class LiteralTextExpr final : public LiteralExprNode {
 public:
-    LiteralNullExpr() = default;
+    std::string value;
+    explicit LiteralTextExpr(std::string text, std::optional<std::size_t> source = {})
+        : LiteralExprNode(source), value(std::move(text)) {}
+    ExprType getType() const override { return ExprType::LITERAL_TEXT; }
+    void accept(ExprVisitor& visitor) const override;
+    std::unique_ptr<ExprNode> clone() const override { return std::make_unique<LiteralTextExpr>(*this); }
+};
+
+class LiteralNullExpr final : public LiteralExprNode {
+public:
+    explicit LiteralNullExpr(std::optional<std::size_t> source = {}) : LiteralExprNode(source) {}
 
     ExprType getType() const override { return ExprType::LITERAL_NULL; }
 
     void accept(ExprVisitor& visitor) const override;
 
     std::unique_ptr<ExprNode> clone() const override {
-        return std::make_unique<LiteralNullExpr>();
+        return std::make_unique<LiteralNullExpr>(*this);
+    }
+};
+
+/** @brief A stable parameter identity preserved by expression cloning and pushdown. */
+class ParameterRefExpr final : public ExprNode {
+public:
+    const std::size_t slot;
+
+    explicit ParameterRefExpr(std::size_t index) : slot(index) {}
+    ExprType getType() const override { return ExprType::PARAMETER_REF; }
+    void accept(ExprVisitor& visitor) const override;
+    std::unique_ptr<ExprNode> clone() const override {
+        return std::make_unique<ParameterRefExpr>(slot);
     }
 };
 
@@ -212,6 +259,8 @@ public:
     virtual void visit(const LiteralIntExpr& node)  = 0;
     virtual void visit(const LiteralFloatExpr& node)= 0;
     virtual void visit(const LiteralNullExpr& node) = 0;
+    virtual void visit(const LiteralTextExpr&) { throw std::runtime_error("Unextracted Text literal"); }
+    virtual void visit(const ParameterRefExpr& node) = 0;
     virtual void visit(const BinaryExpr& node)      = 0;
     virtual void visit(const CaseWhenExpr& node)    = 0;
     virtual void visit(const StarExpr& node)        = 0;
@@ -230,6 +279,8 @@ public:
     void visit(const LiteralIntExpr& node) override;
     void visit(const LiteralFloatExpr& node) override;
     void visit(const LiteralNullExpr& node) override;
+    void visit(const LiteralTextExpr& node) override;
+    void visit(const ParameterRefExpr& node) override;
     void visit(const BinaryExpr& node) override;
     void visit(const CaseWhenExpr& node) override;
     void visit(const StarExpr& node) override;

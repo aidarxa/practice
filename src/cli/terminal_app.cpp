@@ -1,4 +1,6 @@
 #include "cli/terminal_app.h"
+#include "cli/text_format.h"
+#include "cli/sql_input.h"
 #include "cli/meta_command_handler.h"
 
 #include <linenoise.h>
@@ -35,11 +37,6 @@ std::string trim(const std::string& s) {
     if (begin == std::string::npos) return "";
     auto end = s.find_last_not_of(" \t\r\n");
     return s.substr(begin, end - begin + 1);
-}
-
-/// Проверяет, содержит ли строка символ ';' (завершение SQL-запроса).
-bool containsSemicolon(const std::string& s) {
-    return s.find(';') != std::string::npos;
 }
 
 static bool resultCellIsValid(const db::QueryResult& result, size_t value_idx) {
@@ -103,6 +100,10 @@ std::string formatResultCell(const db::QueryResult& result, size_t row, size_t c
     const bool valid = resultColumnCellIsValid(result, row, col);
     if (!valid) return "NULL";
     const auto type = (col < result.columns.size()) ? result.columns[col].type : db::LogicalType::UInt64;
+    if (type == db::LogicalType::Text) {
+        const auto local = materializedRowIndex(result, row);
+        return db::cli::quoteText(result.column_text.at(col).at(local));
+    }
     std::ostringstream oss;
     if (type == db::LogicalType::Float64) {
         const size_t local_row = materializedRowIndex(result, row);
@@ -126,8 +127,8 @@ std::string formatResultCell(const db::QueryResult& result, size_t row, size_t c
 
 } // anonymous namespace
 
-TerminalApp::TerminalApp(std::shared_ptr<db::DatabaseInstance> db)
-    : db_(std::move(db)) {
+TerminalApp::TerminalApp(std::shared_ptr<db::DatabaseInstance> db, StartupTiming* startup)
+    : db_(std::move(db)), startup_(startup) {
     if (db_) ctx_.applyConfig(db_->config());
 }
 
@@ -136,7 +137,7 @@ void TerminalApp::run() {
     linenoiseSetMultiLine(1);
     linenoiseHistorySetMaxLen(256);
 
-    std::cout << "Crystal-SYCL interactive console. Type \"help\" for help.\n\n";
+    std::cout << "Crystal-PCUDA interactive console. Type \"help\" for help.\n\n";
 
     while (true) {
         char* raw = linenoise("crystal> ");
@@ -146,7 +147,8 @@ void TerminalApp::run() {
             break;
         }
 
-        std::string line = trim(std::string(raw));
+        const std::string input(raw);
+        std::string line = trim(input);
         linenoiseFree(raw);
 
         if (line.empty()) {
@@ -163,9 +165,9 @@ void TerminalApp::run() {
         }
 
         // --- SQL-запрос: накапливаем строки до ';' ---
-        std::string buffer = line;
+        std::string buffer = input;
 
-        while (!containsSemicolon(buffer)) {
+        while (!hasSqlTerminator(buffer)) {
             raw = linenoise("      -> ");
             if (raw == nullptr) {
                 // EOF в середине ввода — отменяем неполный запрос
@@ -174,12 +176,10 @@ void TerminalApp::run() {
                 break;
             }
 
-            std::string continuation = trim(std::string(raw));
+            const std::string continuation(raw);
             linenoiseFree(raw);
 
-            if (!continuation.empty()) {
-                buffer += "\n" + continuation;
-            }
+            buffer += "\n" + continuation;
         }
 
         if (buffer.empty()) {
@@ -217,6 +217,7 @@ void TerminalApp::executeQuery(const std::string& sql) {
             fetch_options.limit_enabled = ctx_.output_row_limit_enabled;
             fetch_options.row_limit = ctx_.output_row_limit;
             auto query_result = db_->executeQuery(sql, fetch_options);
+            const bool first_result = startup_ && startup_->resultReady();
             const std::vector<unsigned long long>& result = query_result.data;
             size_t tuple_size = query_result.tuple_size;
             const auto& columns = query_result.columns;
@@ -293,9 +294,32 @@ void TerminalApp::executeQuery(const std::string& sql) {
             }
             printTimingLine("Generated execute time", query_result.timing.generated_execute_ms);
             if (ctx_.extended_timing) {
+                std::cout << "Timing model: " << query_result.timing.model << '\n';
+                printTimingLine("SQL to PCUDA time", query_result.timing.sql_to_pcuda_ms);
+                if (first_result) {
+                    const auto& startup = startup_->stats();
+                    printTimingLine("Startup time", startup.startup_ms);
+                    printTimingLine("Data loading time", startup.data_load_ms);
+                    printTimingLine("Main to first result time", startup.main_to_first_result_ms);
+                }
                 printTimingLine("Prepare time", query_result.timing.prepare_ms);
                 printTimingLine("Code generation time", query_result.timing.codegen_ms);
                 printTimingLine("ACPP compilation time", query_result.timing.compile_ms);
+                const auto& build=query_result.timing.module_build;
+                for (const auto& wave:build.waves)
+                    std::cout << "Module wave: first=" << wave.first << " count=" << wave.count
+                              << " begin_ns=" << wave.begin_ns << " end_ns=" << wave.end_ns << '\n';
+                printTimingLine("Native compile wall sum",build.compile_wall_ms);
+                printTimingLine("Native compile user sum",build.compile_user_ms);
+                printTimingLine("Native compile system sum",build.compile_system_ms);
+                printTimingLine("Native link wall sum",build.link_wall_ms);
+                printTimingLine("Native link user sum",build.link_user_ms);
+                printTimingLine("Native link system sum",build.link_system_ms);
+                printTimingLine("Module build elapsed",build.build_elapsed_ms);
+                const auto& events=query_result.timing.module_events;
+                std::cout << "Module events: plan_codegen=" << events.plan_codegen << " module_codegen=" << events.module_codegen
+                          << " compiler=" << events.compiler << " linker=" << events.linker << " hits=" << events.hits
+                          << " misses=" << events.misses << " loads=" << events.loads << " symbols=" << events.symbols << '\n';
                 printTimingLine("Library load time", query_result.timing.library_load_ms);
                 printTimingLine("Result materialization/fetch time", query_result.timing.host_fetch_ms);
                 printTimingLine("Engine processing time", query_result.timing.engine_ms);

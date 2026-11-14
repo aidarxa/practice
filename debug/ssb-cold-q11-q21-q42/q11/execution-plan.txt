@@ -1,0 +1,137 @@
+[Aggregate]
+  AGGREGATIONS:
+    SUM(
+      [BinaryExpr] *
+        [ColumnRef] LINEORDER.lo_extendedprice
+        [ColumnRef] LINEORDER.lo_discount
+    )
+  [Filter]
+    [BinaryExpr] AND
+      [BinaryExpr] AND
+        [BinaryExpr] AND
+          [BinaryExpr] AND
+            [BinaryExpr] >=
+              [ColumnRef] LINEORDER.lo_orderdate
+              [ParameterRef] $0
+            [BinaryExpr] <=
+              [ColumnRef] LINEORDER.lo_orderdate
+              [ParameterRef] $1
+          [BinaryExpr] >=
+            [ColumnRef] LINEORDER.lo_discount
+            [ParameterRef] $2
+        [BinaryExpr] <=
+          [ColumnRef] LINEORDER.lo_discount
+          [ParameterRef] $3
+      [BinaryExpr] <
+        [ColumnRef] LINEORDER.lo_quantity
+        [ParameterRef] $4
+    [TableScan] LINEORDER
+kernel 0 AggregateDenseCount
+  argument d_aggregate_counts kind=1 type=2 access=3
+  argument aggregate_group_count kind=2 type=2 access=1
+  argument aggregate_tuple_size kind=2 type=2 access=1
+  argument db_range_items kind=2 type=2 access=1
+kernel 1 AggregateDenseWrite
+  argument d_aggregate_counts kind=1 type=2 access=3
+  argument d_aggregate_offsets kind=1 type=2 access=3
+  argument d_result_col_0 kind=1 type=3 access=3
+  argument d_result_validity_col_0 kind=1 type=2 access=3
+  argument d_result kind=1 type=2 access=3
+  argument d_result_validity kind=1 type=2 access=3
+  argument aggregate_group_count kind=2 type=2 access=1
+  argument aggregate_tuple_size kind=2 type=2 access=1
+  argument db_range_items kind=2 type=2 access=1
+kernel 2 Scan_LINEORDER
+  argument d_result kind=1 type=2 access=3
+  argument d_result_validity kind=1 type=2 access=3
+  argument d_lo_discount kind=1 type=1 access=1
+  argument d_lo_extendedprice kind=1 type=1 access=1
+  argument d_lo_orderdate kind=1 type=1 access=1
+  argument d_lo_quantity kind=1 type=1 access=1
+  argument rows_LINEORDER kind=2 type=2 access=1
+  argument db_parameter_0 kind=3 type=3 access=1
+  argument db_parameter_1 kind=3 type=3 access=1
+  argument db_parameter_2 kind=3 type=3 access=1
+  argument db_parameter_3 kind=3 type=3 access=1
+  argument db_parameter_4 kind=3 type=3 access=1
+set
+set
+set
+set
+set
+fill
+fill
+require
+require
+require
+require
+require
+require
+require
+launch kernel=2 grid=op6($rows_LINEORDER,512) block=128
+set
+set
+ensure
+fill
+ensure
+fill
+set
+launch kernel=0 grid=op6(1,128) block=128
+device-prefix
+ensure-columns
+publish
+set
+launch kernel=1 grid=op6(1,128) block=128
+
+EXTENTS
+set rows_CUSTOMER 300000 = 300000
+set rows_DDATE 2557 = 2557
+set rows_LINEORDER 59986217 = 59986217
+set rows_PART 800000 = 800000
+set rows_SUPPLIER 20000 = 20000
+fill d_result count 1 = 1 byte 0
+fill d_result_validity count op8(op6(1,64),1) = 1 byte 0
+operation 12
+operation 12
+operation 12
+operation 12
+operation 12
+operation 12
+operation 12
+launch 2 grid op6($rows_LINEORDER,512) = 117161 block 128
+set aggregate_group_count 1 = 1
+set aggregate_tuple_size 1 = 1
+ensure d_aggregate_counts count op8(1,1) = 1
+fill d_aggregate_counts count op8(op8(1,1),1) = 1 byte 0
+ensure d_aggregate_offsets count op8(1,1) = 1
+fill d_aggregate_offsets count op8(op8(1,1),1) = 1 byte 0
+set range_items_AggregateDenseCount 1 = 1
+launch 0 grid op6(1,128) = 1 block 128
+device-prefix d_aggregate_counts count 1 = 1
+ensure-columns 1 rows $aggregate_row_count = runtime
+publish values op4(op8($aggregate_row_count,1),1) = runtime dense 1
+set range_items_AggregateDenseWrite 1 = 1
+launch 1 grid op6(1,128) = 1 block 128
+MODULE 0 AggregateDenseCount 4170886016dae97984e214ac1a7e674360871b1cf29c1a2368aaafd0bad14493 2870 shared 0
+BUFFER d_aggregate_counts d_aggregate_counts
+SCALAR aggregate_group_count $aggregate_group_count
+SCALAR aggregate_tuple_size $aggregate_tuple_size
+SCALAR db_range_items $range_items_AggregateDenseCount
+MODULE 1 AggregateDenseWrite de118fdb12c2620fa72fa403c834c2ce9e0a5f565dcfa5c7ac5b8254fa07f9b6 3569 shared 0
+BUFFER d_aggregate_counts d_aggregate_counts
+BUFFER d_aggregate_offsets d_aggregate_offsets
+BUFFER d_result_col_0 d_result_col_0
+BUFFER d_result_validity_col_0 d_result_validity_col_0
+BUFFER d_result d_result
+BUFFER d_result_validity d_result_validity
+SCALAR aggregate_group_count $aggregate_group_count
+SCALAR aggregate_tuple_size $aggregate_tuple_size
+SCALAR db_range_items $range_items_AggregateDenseWrite
+MODULE 2 Scan_LINEORDER 57da16690c7c9871a93ef1241a1685147f8738a97bfe6b45e2e210441cd2776b 7068 shared 2048
+BUFFER d_result d_result
+BUFFER d_result_validity d_result_validity
+BUFFER d_lo_discount d_lo_discount
+BUFFER d_lo_extendedprice d_lo_extendedprice
+BUFFER d_lo_orderdate d_lo_orderdate
+BUFFER d_lo_quantity d_lo_quantity
+SCALAR rows_LINEORDER $rows_LINEORDER

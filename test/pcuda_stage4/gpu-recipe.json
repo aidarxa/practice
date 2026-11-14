@@ -1,0 +1,17 @@
+{
+  "version": 1,
+  "inputs": ["include/core", "include/crystal", "src/core/pcuda_runtime.cpp", "src/core/pcuda_compat.cpp", "src/core/pcuda_compat.h", "src/core/pcuda_scan.cpp", "src/core/memory_guard.cpp", "src/core/size_expression.cpp", "test/pcuda_stage4/test_gpu_primitives.cpp"],
+  "build": [["{cxx}", "--acpp-targets=generic", "--acpp-pcuda", "-std=c++17", "-O0", "-UNDEBUG", "{flags}", "-I{root}/include", "{root}/test/pcuda_stage4/test_gpu_primitives.cpp", "{root}/src/core/pcuda_scan.cpp", "{root}/src/core/pcuda_runtime.cpp", "{root}/src/core/pcuda_compat.cpp", "{root}/src/core/memory_guard.cpp", "{root}/src/core/size_expression.cpp", "-o", "{out}/checks"]],
+  "test": [["env", "ACPP_APPDB_DIR={out}/device-cache", "ACPP_ADAPTIVITY_LEVEL=1", "{out}/checks"]],
+  "objects": ["{out}/checks"],
+  "mutations": [
+    {"id":"pht-zero-presence", "file":"include/crystal/join.h", "before":"occupied ? occupied[slot]!=0 : key!=0", "after":"key!=0"},
+    {"id":"pht-payload", "file":"include/crystal/join.h", "before":"table[base+1]=value;", "after":"table[base+1]=key;"},
+    {"id":"mht-position", "file":"include/crystal/join.h", "before":"const int position=atomicAdd(write_pos+slot,1);", "after":"atomicAdd(write_pos+slot,1); const int position=0;"},
+    {"id":"reduce-odd-block", "file":"include/crystal/collectives.h", "before":"const auto half = (active+1)/2;", "after":"const auto half = active/2;"},
+    {"id":"scan-inclusive", "file":"include/crystal/collectives.h", "before":"const T result = tid ? scratch[tid-1] : identity;", "after":"const T result = scratch[tid];"},
+    {"id":"scan-parent-offsets", "file":"src/core/pcuda_scan.cpp", "before":"addLevel(*runtime_,target,scratch+layout_.levels[child].offset,overflow_.data(),layout_.levels[child],block);", "after":"(void)target;"},
+    {"id":"scan-overflow-status", "file":"src/core/pcuda_scan.cpp", "before":"if (*error) throw std::overflow_error(\"PCUDA exclusive scan count overflow\");", "after":"if (false) throw std::overflow_error(\"PCUDA exclusive scan count overflow\");"},
+    {"id":"bitmap-bit", "file":"include/core/device_atomics.h", "before":"1ULL << (bit & 63)", "after":"1ULL << ((bit + 1) & 63)"}
+  ]
+}

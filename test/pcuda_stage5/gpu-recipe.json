@@ -1,0 +1,19 @@
+{
+  "version": 1,
+  "inputs": ["include", "src", "deps", "test", "CMakeLists.txt", "cmake", "tools/pcuda_pch_manifest.py"],
+  "build": [
+    ["cmake", "-S", "{root}", "-B", "{out}/engine", "-DCMAKE_BUILD_TYPE=Release", "-DCMAKE_CXX_COMPILER={cxx}"],
+    ["cmake", "--build", "{out}/engine", "--target", "test_pcuda_sql_modules", "-j4"]
+  ],
+  "test": [["{out}/engine/test_pcuda_sql_modules", "{out}/gpu"]],
+  "mutations": [
+    {"id":"case-equality", "file":"src/core/expression_codegen.cpp", "before":"call(\"safe_eq\", selected, leaf)", "after":"\"false\""},
+    {"id":"parameter-value", "file":"src/core/module_codegen.cpp", "before":"\"_valid ? \" << access", "after":"\"_valid ? 1 + \" << access"},
+    {"id":"parameter-validity", "file":"src/core/module_codegen.cpp", "before":"\".valid != 0;\\n\"", "after":"\".valid == 0;\\n\""},
+    {"id":"runtime-limit", "file":"src/core/visitor.cpp", "before":"minimum(variable(\"sort_input_rows\"), limitSize(node))", "after":"variable(\"sort_input_rows\")"},
+    {"id":"local-reduction", "file":"src/core/visitor.cpp", "before":"\" = crystal::blockReduce<unsigned long long>(local_\"", "after":"\" = 1 + crystal::blockReduce<unsigned long long>(local_\""},
+    {"id":"typed-bound", "file":"src/core/module_cache.cpp", "before":"reserved[family(recipe)]>=8", "after":"reserved[family(recipe)]>=7"},
+    {"id":"prefix-overflow", "file":"src/core/pcuda_plan_services.cpp", "before":"if(total>INT32_MAX)", "after":"if(total>=INT32_MAX)"},
+    {"id":"prefix-narrow", "file":"src/core/pcuda_plan_services.cpp", "before":"destination[i]=static_cast<int>(source[i]);", "after":"destination[i]=static_cast<int>(source[i])+1;"}
+  ]
+}

@@ -27,7 +27,8 @@ public:
 // ============================================================================
 
 /// Returns the set of all table_name strings referenced by ColumnRefExpr leaves.
-/// Entries with empty table_name are ignored (unqualified columns).
+/// Legacy unqualified columns use the SSB naming convention; prepared columns are resolved.
+/// Parameter references contribute no table names and retain their slot identities.
 std::set<std::string> extractTableNames(const ExprNode* expr);
 
 /// Returns the set of all table_name strings from every TableScanNode
@@ -77,7 +78,11 @@ public:
     /// Constructor registers all built-in rules (PredicatePushdownRule).
     Optimizer();
 
-    /// Optimise the plan in place and return the (potentially new) root.
+    /**
+     * @brief Optimize structure only and preserve expression/parameter identity.
+     * @details The optimizer receives no bindings. Ordinary parameter values or
+     * validity cannot drive folding, predicate routing or algorithm selection.
+     */
     std::unique_ptr<OperatorNode> optimize(std::unique_ptr<OperatorNode> plan);
 };
 

@@ -8,13 +8,20 @@
 #include <unordered_map>
 #include <vector>
 #include <stdexcept>
-#include <sycl/sycl.hpp>
 
 #include "core/memory.h"
 #include "core/device_buffer.h"
 #include "core/config.h"
+#include "core/execution_plan.h"
+#include "core/module_cache.h"
+#include "core/text.h"
+#include "core/text_storage.h"
 
 namespace db {
+
+class LegacyQueue;
+class PlanPrefixService;
+class TextFetch;
 
 using ::LogicalType;
 
@@ -26,6 +33,18 @@ struct ResultColumnDesc {
 
 
 struct QueryTimingStats {
+    /** @brief Execution scheduling changes interval relationships, never the direct summary boundary. */
+    const char* model = "pcuda-modules-v1";
+    /** @brief Stage-5 native command sums, direct build elapsed and actual per-query event deltas. */
+    ModuleBuildTiming module_build;
+    ModuleCounters module_events;
+    /**
+     * @brief Direct SQL parse-to-ready-PCUDA-source elapsed, including resolve/parameters,
+     * plan/schema/cache lookup, missing-plan optimization/lowering and module wrapper emission.
+     * @details Stops before compiler/file/build-script work, loading or runtime/GPU allocations.
+     * Ready plans stop at plan lookup. This overlaps prepare/codegen: never add it to components.
+     */
+    double sql_to_pcuda_ms = 0.0;
     // Query preparation before code generation or cached-library execution:
     // SQL parsing, logical/physical preparation, result-shape inference,
     // memory preflight, result-buffer preparation, cache-key build and lookup.
@@ -33,9 +52,9 @@ struct QueryTimingStats {
     double codegen_ms = 0.0;
     double compile_ms = 0.0;
     double library_load_ms = 0.0;
-    // Time measured for generated execute_query() as a whole: host-side queue
-    // submissions, temporary allocation/init, generated kernels, required
-    // q.wait(), service copies, and generated-kernel temporary cleanup.
+    // Stage 2 measures the host plan interpreter, including submissions,
+    // runtime allocation/init, kernels, required waits and service copies.
+    // The legacy field name is retained; no whole-query execute_query remains.
     double generated_execute_ms = 0.0;
     // Backward-compatible alias for old reports. This is not pure GPU-kernel
     // time; reporting keeps it equal to generated_execute_ms.
@@ -83,6 +102,7 @@ struct QueryResult {
     std::vector<std::vector<std::int64_t>> column_i64;
     std::vector<std::vector<std::uint64_t>> column_u64;
     std::vector<std::vector<double>> column_f64;
+    std::vector<std::vector<std::string>> column_text; ///< Owned UTF-8 values, never device addresses or IDs.
     std::vector<std::vector<uint64_t>> column_validity_bitmap;
     bool has_columnar_result = false;
 
@@ -116,35 +136,64 @@ struct ResultColumnDeviceBuffer {
     std::unique_ptr<DynamicDeviceBuffer<std::int64_t>> i64;
     std::unique_ptr<DynamicDeviceBuffer<std::uint64_t>> u64;
     std::unique_ptr<DynamicDeviceBuffer<double>> f64;
+    std::unique_ptr<DynamicDeviceBuffer<TextView>> text;
     std::unique_ptr<DynamicDeviceBuffer<uint64_t>> validity;
 
-    void ensure(sycl::queue& q, LogicalType requested_type, size_t row_count) {
-        type = requested_type;
-        const size_t value_capacity = row_count == 0 ? 1 : row_count;
-        const size_t validity_words = ((row_count + 63ULL) / 64ULL) == 0 ? 1 : ((row_count + 63ULL) / 64ULL);
+    /** @brief A column owns one logical payload; obsolete types are not an unbounded side cache. */
+    void retainType(LogicalType requested_type) {
+        if (requested_type!=LogicalType::Text) text.reset();
+        if (requested_type!=LogicalType::Int64) i64.reset();
+        if (requested_type!=LogicalType::Float64) f64.reset();
+        if (requested_type!=LogicalType::UInt64) u64.reset();
+        type=requested_type;
+    }
 
-        if (type == LogicalType::Int64) {
-            if (!i64) i64 = std::make_unique<DynamicDeviceBuffer<std::int64_t>>(q, 0);
+    void ensure(const std::shared_ptr<DeviceRuntime>& runtime, LogicalType requested_type, size_t row_count) {
+        retainType(requested_type);
+        const size_t value_capacity = row_count == 0 ? 1 : row_count;
+        const size_t words = row_count / 64 + (row_count % 64 != 0);
+        const size_t validity_words = words == 0 ? 1 : words;
+
+        if (type == LogicalType::Text) {
+            if (!text) text = std::make_unique<DynamicDeviceBuffer<TextView>>(runtime, 0);
+            text->ensureCapacity(value_capacity);
+            text->zero();
+        } else if (type == LogicalType::Int64) {
+            if (!i64) i64 = std::make_unique<DynamicDeviceBuffer<std::int64_t>>(runtime, 0);
             i64->ensureCapacity(value_capacity);
             i64->zero();
         } else if (type == LogicalType::Float64) {
-            if (!f64) f64 = std::make_unique<DynamicDeviceBuffer<double>>(q, 0);
+            if (!f64) f64 = std::make_unique<DynamicDeviceBuffer<double>>(runtime, 0);
             f64->ensureCapacity(value_capacity);
             f64->zero();
         } else {
-            if (!u64) u64 = std::make_unique<DynamicDeviceBuffer<std::uint64_t>>(q, 0);
+            if (!u64) u64 = std::make_unique<DynamicDeviceBuffer<std::uint64_t>>(runtime, 0);
             u64->ensureCapacity(value_capacity);
             u64->zero();
         }
 
-        if (!validity) validity = std::make_unique<DynamicDeviceBuffer<uint64_t>>(q, 0);
+        if (!validity) validity = std::make_unique<DynamicDeviceBuffer<uint64_t>>(runtime, 0);
         validity->ensureCapacity(validity_words);
         validity->zero();
     }
 };
 
+/** @brief A base column owns its data and optional validity independently of borrowed views. */
+struct LoadedDeviceColumn {
+    std::unique_ptr<DynamicDeviceBuffer<int>> values;
+    std::unique_ptr<DynamicDeviceBuffer<uint64_t>> validity;
+};
+
 struct ExecutionContext {
-    sycl::queue* q_ = nullptr;
+    /** @brief Owners are declared before buffers so their stream outlives all allocations. */
+    std::shared_ptr<DeviceRuntime> runtime_;
+    std::shared_ptr<LegacyQueue> legacy_queue_;
+    /** @brief Prebuilt scan and conversion workspace, never owned by a generated module. */
+    std::shared_ptr<PlanPrefixService> prefix_service_;
+    std::unordered_map<std::string, LoadedDeviceColumn> base_columns_;
+    std::unordered_map<std::string, LoadedTextColumn> text_columns_;
+    std::unique_ptr<DynamicDeviceBuffer<uint8_t>> text_parameter_arena_;
+    std::shared_ptr<TextFetch> text_fetch_;
     std::unique_ptr<DynamicDeviceBuffer<unsigned long long>> result_buffer_;
     std::unique_ptr<DynamicDeviceBuffer<uint64_t>> result_validity_buffer_;
     std::unordered_map<std::string, void*> buffers_;
@@ -160,7 +209,9 @@ struct ExecutionContext {
     std::vector<ResultColumnDeviceBuffer> result_column_storage_;
     std::unordered_map<std::string, std::unique_ptr<DynamicDeviceBuffer<int>>> scratch_i32_buffers_;
     std::unordered_map<std::string, std::unique_ptr<DynamicDeviceBuffer<unsigned long long>>> scratch_u64_buffers_;
-    size_t scratch_device_bytes_{0};
+    /** @brief Temporary legacy adapter's runtime-owned, reusable byte allocations. */
+    std::unordered_map<std::string, std::unique_ptr<DynamicDeviceBuffer<uint8_t>>> plan_scratch_buffers_;
+    std::string active_plan_identity_; ///< Value-free owner of the retained query workspace, not a module cache key.
     size_t expected_result_validity_words_{0};
     QueryTimingStats timing_;
     CrystalConfig config_;
@@ -169,14 +220,14 @@ struct ExecutionContext {
     // DatabaseInstance использует это значение для copyToHost вместо хардкода 21000.
     size_t expected_result_size_{0};
 
-    // Bytes permanently allocated for loaded base-table columns.
-    // QueryEngine uses this for conservative preflight memory checks before
-    // allocating large result buffers or launching JIT kernels with temporary
-    // hash tables.
+    // Diagnostic base-column bytes only. DeviceRuntime's actual allocation ledger
+    // guards memory, including validity, retained typed storage, staging and growth peaks.
     size_t loaded_device_bytes_{0};
 
     template<typename T>
     T* getBuffer(const std::string& name) {
+        auto owned = base_columns_.find(name);
+        if (owned != base_columns_.end()) return reinterpret_cast<T*>(owned->second.values->data());
         auto it = buffers_.find(name);
         if (it != buffers_.end()) {
             return static_cast<T*>(it->second);
@@ -186,6 +237,8 @@ struct ExecutionContext {
 
 
     uint64_t* getNullBitmap(const std::string& name) {
+        auto owned = base_columns_.find(name);
+        if (owned != base_columns_.end()) return owned->second.validity ? owned->second.validity->data() : nullptr;
         auto it = null_bitmaps_.find(name);
         if (it == null_bitmaps_.end()) return nullptr;
         return it->second;
@@ -198,23 +251,15 @@ struct ExecutionContext {
 
     int* getScratchIntBuffer(const std::string& name, size_t element_count) {
         auto& buf = scratch_i32_buffers_[name];
-        if (!buf) buf = std::make_unique<DynamicDeviceBuffer<int>>(*q_, 0);
-        const size_t old_capacity = buf->capacity();
+        if (!buf) buf = std::make_unique<DynamicDeviceBuffer<int>>(runtime_, 0);
         buf->ensureCapacity(element_count == 0 ? 1 : element_count);
-        if (buf->capacity() > old_capacity) {
-            scratch_device_bytes_ += (buf->capacity() - old_capacity) * sizeof(int);
-        }
         return buf->data();
     }
 
     unsigned long long* getScratchUInt64Buffer(const std::string& name, size_t element_count) {
         auto& buf = scratch_u64_buffers_[name];
-        if (!buf) buf = std::make_unique<DynamicDeviceBuffer<unsigned long long>>(*q_, 0);
-        const size_t old_capacity = buf->capacity();
+        if (!buf) buf = std::make_unique<DynamicDeviceBuffer<unsigned long long>>(runtime_, 0);
         buf->ensureCapacity(element_count == 0 ? 1 : element_count);
-        if (buf->capacity() > old_capacity) {
-            scratch_device_bytes_ += (buf->capacity() - old_capacity) * sizeof(unsigned long long);
-        }
         return buf->data();
     }
 
@@ -226,11 +271,12 @@ struct ExecutionContext {
         return result_validity_buffer_ ? result_validity_buffer_->data() : nullptr;
     }
 
-    void ensureResultValidityCapacity(size_t value_count) {
-        expected_result_validity_words_ = (value_count + 63ULL) / 64ULL;
+    /** @brief Legacy capacity helper; the physical plan initializes explicitly when initialize=false. */
+    void ensureResultValidityCapacity(size_t value_count, bool initialize = true) {
+        expected_result_validity_words_ = value_count / 64 + (value_count % 64 != 0);
         if (result_validity_buffer_) {
             result_validity_buffer_->ensureCapacity(expected_result_validity_words_ == 0 ? 1 : expected_result_validity_words_);
-            result_validity_buffer_->zero();
+            if (initialize) result_validity_buffer_->zero();
         }
     }
 
@@ -238,13 +284,11 @@ struct ExecutionContext {
         result_is_columnar_ = true;
         result_column_count_ = column_count;
         result_column_row_capacity_ = row_count;
-        if (result_column_storage_.size() < column_count) {
-            result_column_storage_.resize(column_count);
-        }
+        result_column_storage_.resize(column_count);
         for (size_t col = 0; col < column_count; ++col) {
             LogicalType type = LogicalType::UInt64;
             if (col < result_columns_.size()) type = result_columns_[col].type;
-            result_column_storage_[col].ensure(*q_, type, row_count);
+            result_column_storage_[col].ensure(runtime_, type, row_count);
         }
     }
 
@@ -296,66 +340,45 @@ struct ExecutionContext {
     }
 };
 
-class IQueryCache {
-public:
-    virtual ~IQueryCache() = default;
-    virtual std::optional<std::string> get(const std::string& query_hash) = 0;
-    virtual void put(const std::string& query_hash, const std::string& lib_path) = 0;
-};
-
-class ICompiler {
-public:
-    virtual ~ICompiler() = default;
-    virtual std::string compile(const std::string& source_code, const std::string& query_hash) = 0;
-};
-
 class IExecutor {
 public:
     virtual ~IExecutor() = default;
-    virtual void execute(const std::string& lib_path, ExecutionContext* ctx) = 0;
-};
-
-class FileBasedQueryCache : public IQueryCache {
-public:
-    std::optional<std::string> get(const std::string& query_hash) override;
-    void put(const std::string& query_hash, const std::string& lib_path) override;
-private:
-    std::unordered_map<std::string, std::string> cache_;
-};
-
-class AdaptiveCppCompiler : public ICompiler {
-public:
-    AdaptiveCppCompiler(std::string include_dir = {},
-                        std::string deps_include_dir = {});
-    std::string compile(const std::string& source_code, const std::string& query_hash) override;
-private:
-    std::string include_dir_;
-    std::string deps_include_dir_;
+    virtual void execute(const LoadedKernels& kernels, const ExecutionPlan& plan,
+                         const ParameterValues& parameters, ExecutionContext* ctx) = 0;
+    /** @brief Strategies without staged execution remain correct by resolving the full set first. */
+    virtual void execute(const KernelLookup&,const ExecutionPlan&,const ParameterValues&,ExecutionContext*);
 };
 
 class DynamicLibraryExecutor : public IExecutor {
 public:
-    ~DynamicLibraryExecutor() override;
-    void execute(const std::string& lib_path, ExecutionContext* ctx) override;
-private:
-    std::vector<void*> handles_;
+    void execute(const LoadedKernels& kernels, const ExecutionPlan& plan,
+                   const ParameterValues& parameters, ExecutionContext* ctx) override;
+    /** @brief Experimental readiness is consumed only at a kernel's first actual launch. */
+    void execute(const KernelLookup&,const ExecutionPlan&,const ParameterValues&,ExecutionContext*) override;
 };
 
 class QueryEngine {
 public:
     QueryEngine(std::shared_ptr<Catalog> catalog,
-                std::unique_ptr<IQueryCache> cache,
+                std::unique_ptr<ProcessModuleCache> cache,
                 std::unique_ptr<ICompiler> compiler,
                 std::unique_ptr<IExecutor> executor);
 
     void executeQuery(const std::string& sql, ExecutionContext* ctx);
     std::string generateQueryCode(const std::string& sql);
+    /** @brief Actual process-lifetime preparation/load events; device JIT is a separate layer. */
+    const ModuleCounters& moduleCounters() const { return counters_; }
 
 private:
     std::shared_ptr<Catalog> catalog_;
-    std::unique_ptr<IQueryCache> cache_;
+    std::unique_ptr<ProcessModuleCache> cache_;
     std::unique_ptr<ICompiler> compiler_;
     std::unique_ptr<IExecutor> executor_;
+    struct CachedQuery;
+    std::unordered_map<std::string, std::shared_ptr<CachedQuery>> plans_;
+    /** @brief Last prepared slot types per logical/catalog shape, so SQL NULL retains a known numeric type. */
+    std::unordered_map<std::string, ParameterSchema> known_parameter_types_;
+    ModuleCounters counters_;
 };
 
 } // namespace db

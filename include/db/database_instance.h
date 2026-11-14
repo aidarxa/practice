@@ -3,7 +3,6 @@
 #include <memory>
 #include <string>
 #include <vector>
-#include <sycl/sycl.hpp>
 
 #include "core/execution.h"
 #include "core/config.h"
@@ -32,10 +31,11 @@ private:
     void initCatalog();
 
     CrystalConfig config_;
-    sycl::queue q_;
+    std::shared_ptr<DeviceRuntime> runtime_;
     std::shared_ptr<Catalog> catalog_;
     std::unique_ptr<ExecutionContext> ctx_;
     std::unique_ptr<QueryEngine> engine_;
+    bool data_loaded_ = false;
 };
 
 } // namespace db

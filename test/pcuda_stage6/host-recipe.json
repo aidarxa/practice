@@ -1,0 +1,24 @@
+{
+  "version": 1,
+  "inputs": ["include", "src/core", "deps", "test/pcuda_stage6/test_contracts.cpp"],
+  "build": [
+    ["{cxx}", "-std=c++17", "-O0", "-g", "-UNDEBUG", "{flags}", "-I{root}/include", "-I{root}/deps/include", "{root}/test/pcuda_stage6/test_contracts.cpp", "{root}/src/core/translator.cpp", "{root}/src/core/query_template.cpp", "{root}/src/core/optimizer_rules.cpp", "{root}/src/core/visitor.cpp", "{root}/src/core/parameter_value.cpp", "{root}/src/core/expression_codegen.cpp", "{root}/src/core/size_expression.cpp", "{root}/src/core/result_layout.cpp", "{root}/src/core/aggregate_codegen.cpp", "{root}/src/core/physical_planner.cpp", "{root}/src/core/execution_plan.cpp", "{root}/src/core/module_codegen.cpp", "{root}/src/core/content_hash.cpp", "{root}/src/core/code_symbols.cpp", "-L{root}/deps/lib", "-Wl,-rpath,{root}/deps/lib", "-lsqlparser", "-o", "{out}/checks"]
+  ],
+  "test": [["{out}/checks"]],
+  "objects": ["{out}/checks"],
+  "mutations": [
+    {"id":"projection-overflow", "file":"include/core/operators.h", "before":"return checkedSizeMultiply(row_count, tuple_size);", "after":"return row_count * tuple_size;"},
+    {"id":"avg-output", "file":"src/core/result_layout.cpp", "before":"return aggregate.isAvg() ? LogicalType::Float64 : aggregateStateType(aggregate, schema);", "after":"return aggregateStateType(aggregate, schema);"},
+    {"id":"fractional-state", "file":"src/core/result_layout.cpp", "before":"return sqlExpressionType(aggregate.agg_expr.get(), schema) == ParameterType::Float64 ? LogicalType::Float64 : LogicalType::Int64;", "after":"return LogicalType::Int64;"},
+    {"id":"negative-integer", "file":"src/core/translator.cpp", "before":"std::make_unique<LiteralIntExpr>(-literal->ival, literalOrigin(expr))", "after":"std::make_unique<LiteralIntExpr>(literal->ival, literalOrigin(expr))"},
+    {"id":"negative-float", "file":"src/core/translator.cpp", "before":"std::make_unique<LiteralFloatExpr>(-literal->fval, literalOrigin(expr))", "after":"std::make_unique<LiteralFloatExpr>(literal->fval, literalOrigin(expr))"},
+    {"id":"signed-minimum", "file":"include/core/aggregate_numeric.h", "before":"return a < b ? a : b;", "after":"return a > b ? a : b;"},
+    {"id":"signed-maximum", "file":"include/core/aggregate_numeric.h", "before":"return a > b ? a : b;", "after":"return a < b ? a : b;"},
+    {"id":"neutral-sum", "file":"include/core/aggregate_numeric.h", "before":"return T{0};", "after":"return T{1};"},
+    {"id":"neutral-maximum", "file":"include/core/aggregate_numeric.h", "before":"return std::numeric_limits<T>::lowest();", "after":"return std::numeric_limits<T>::max();"},
+    {"id":"count-native-promotion", "file":"include/core/inline_math.h", "before":"struct NumericCommon<A, B, true> { using type = TaggedNumeric; };", "after":"struct NumericCommon<A, B, true> { using type = uint64_t; };"},
+    {"id":"count-tagged-promotion", "file":"include/core/tagged_numeric.h", "before":"return numericInteger<op>(a, b);", "after":"return numericOperation<op>(static_cast<uint64_t>(a), static_cast<uint64_t>(b));"},
+    {"id":"negative-magnitude", "file":"include/core/tagged_numeric.h", "before":"uint64_t{0} - bits", "after":"bits"},
+    {"id":"minimum-magnitude", "file":"include/core/tagged_numeric.h", "before":"return TaggedNumeric(std::numeric_limits<int64_t>::min());", "after":"return TaggedNumeric(int64_t{0});"}
+  ]
+}

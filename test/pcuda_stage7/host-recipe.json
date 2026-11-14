@@ -1,0 +1,24 @@
+{
+  "version": 1,
+  "inputs": ["include", "src/core", "deps", "test/pcuda_stage7/test_storage.cpp", "test/pcuda_stage7/test_manual_spec.cpp", "test/pcuda_stage7/test_frontend.cpp", "test/pcuda_stage7/test_host.cpp", "test/queries/example/support/query_spec.h", "test/queries/example/support/query_spec.cpp"],
+  "build": [
+    ["{cxx}", "-std=c++17", "-O0", "-g", "-UNDEBUG", "-DSSB_COMBINED_TEST", "{flags}", "-I{root}/include", "-I{root}/deps/include", "-I{root}/test/queries/example", "{root}/test/pcuda_stage7/test_host.cpp", "{root}/test/pcuda_stage7/test_storage.cpp", "{root}/test/pcuda_stage7/test_manual_spec.cpp", "{root}/test/pcuda_stage7/test_frontend.cpp", "{root}/test/queries/example/support/query_spec.cpp", "{root}/src/core/translator.cpp", "{root}/src/core/query_template.cpp", "{root}/src/core/parameter_value.cpp", "{root}/src/core/expression_codegen.cpp", "{root}/src/core/size_expression.cpp", "{root}/src/core/result_layout.cpp", "-L{root}/deps/lib", "-Wl,-rpath,{root}/deps/lib", "-lsqlparser", "-o", "{out}/checks"]
+  ],
+  "test": [["{out}/checks"]],
+  "objects": ["{out}/checks"],
+  "mutations": [
+    {"id":"ddate-shift", "file":"include/storage/ssb_schema.h", "before":"{\"d_weekdayfl\", \"DDATE\", 16, ssbFlag}", "after":"{\"d_weekdayfl\", \"DDATE\", 14, ssbFlag}"},
+    {"id":"byte-raw-ascii", "file":"include/storage/column_loader.h", "before":"return value - '0';", "after":"return value;"},
+    {"id":"bad-flag-accepted", "file":"include/storage/column_loader.h", "before":"if (value != '0' && value != '1')", "after":"if (false)"},
+    {"id":"int-byte-order", "file":"include/storage/column_loader.h", "before":"(uint32_t(bytes[1]) << 8U)", "after":"(uint32_t(bytes[1]) << 16U)"},
+    {"id":"physical-width", "file":"include/storage/column_loader.h", "before":"if (storage.width != width)", "after":"if (false)"},
+    {"id":"text-as-numeric", "file":"include/storage/column.h", "before":"return encoding != PhysicalEncoding::FixedText;", "after":"return true;"},
+    {"id":"text-catalog-accepted", "file":"include/core/memory.h", "before":"if (!getColumnStorage(column).isNumeric())", "after":"if (false)"},
+    {"id":"star-bypasses-storage", "file":"src/core/translator.cpp", "before":"validateProjectionStorage(*projection->select_exprs.back());", "after":"(void)0;"},
+    {"id":"group-product", "file":"test/queries/example/support/query_spec.cpp", "before":"count = db::checkedSizeMultiply(count, group.extent);", "after":"count = db::checkedSizeAdd(count, group.extent);"},
+    {"id":"duplicate-keys", "file":"test/queries/example/support/query_spec.cpp", "before":"if (!unique.insert(key).second)", "after":"if (false)"},
+    {"id":"signed-bound", "file":"test/queries/example/support/query_spec.cpp", "before":"if (db::checkedSizeMultiply(rows, per_row) > static_cast<uint64_t>(INT64_MAX))", "after":"if (false)"},
+    {"id":"signed-bound-edge", "file":"test/queries/example/support/query_spec.cpp", "before":"if (db::checkedSizeMultiply(rows, per_row) > static_cast<uint64_t>(INT64_MAX))", "after":"if (db::checkedSizeMultiply(rows, per_row) >= static_cast<uint64_t>(INT64_MAX))"},
+    {"id":"manual-q11-window", "file":"test/queries/example/support/query_spec.cpp", "before":"{11, {{19930101, 19931231}, {1, 3}, {0, 24}}}", "after":"{11, {{19930101, 19940101}, {1, 3}, {0, 24}}}"}
+  ]
+}

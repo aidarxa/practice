@@ -1,0 +1,18 @@
+{
+  "version": 1,
+  "inputs": ["include", "src", "deps", "test", "CMakeLists.txt", "cmake", "tools/pcuda_pch_manifest.py"],
+  "build": [["bash", "{root}/test/pcuda_stage7_text/build_gpu.sh", "{out}", "{cxx}", "{flags}"]],
+  "test": [
+    ["bash", "-c", "export ACPP_APPDB_DIR=\"$1\"; exec \"$2\"", "text-resources", "{out}/resource-device-cache", "{out}/engine/test_pcuda_text_resources"],
+    ["python3", "{root}/test/pcuda_stage7_text/validate_gpu.py", "--build", "{out}/engine", "--output-root", "{out}"]
+  ],
+  "mutations": [
+    {"id":"group-collision-equality", "file":"src/core/text_plan_group.cpp", "before":"return equal;", "after":"return \"true\";"},
+    {"id":"join-collision-predicate", "file":"src/core/text_plan_join.cpp", "before":"std::string selected = trueValue(builder.expression(branches[branch], candidate, \"0\"));", "after":"std::string selected = \"true\";"},
+    {"id":"or-pair-duplicates", "file":"src/core/text_plan_join.cpp", "before":"for (size_t earlier = 0; earlier < branch; ++earlier)", "after":"for (size_t earlier = branch; earlier < branch; ++earlier)"},
+    {"id":"group-occupancy-sentinel", "file":"src/core/text_plan_group.cpp", "before":"FillBuffer{groups, 0, variable(capacity), 255}", "after":"FillBuffer{groups, 0, variable(capacity), 0}"},
+    {"id":"select-output-mapping", "file":"src/core/text_plan_group.cpp", "before":"output.visible = node.select_output_slots;", "after":"output.visible = {};"},
+    {"id":"text-sort-direction", "file":"src/core/text_plan_sort.cpp", "before":"const auto c=db::compareText(", "after":"const auto c=-db::compareText("},
+    {"id":"fetch-null-payload", "file":"src/core/text_fetch.cpp", "before":"lengths[i] = valid ? value.bytes : 0;", "after":"lengths[i] = value.bytes;"}
+  ]
+}

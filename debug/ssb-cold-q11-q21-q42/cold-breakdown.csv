@@ -1,0 +1,4 @@
+query,unique_modules,build_batches,summary_median_ms,summary_min_ms,summary_max_ms,build_median_ms,first_execution_median_ms,fetch_median_ms,load_median_ms,warm_total_median_ms
+q11,3,1,504.281,498.073,515.264,157.758,343.723,0.384,0.416,12.52
+q21,4,1,768.106,765.455,780.811,151.737,544.813,69.017,0.325,53.691500000000005
+q42,5,2,1090.962,1085.539,1150.029,307.982,712.595,69.148,0.634,40.320499999999996

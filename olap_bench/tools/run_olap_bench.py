@@ -23,7 +23,21 @@ METRIC_PATTERNS = {
     'library_load_old_ms': re.compile(r'Library load \+ execution start time:\s*([0-9.]+)\s*ms'),
     'engine_processing_ms': re.compile(r'Engine processing time:\s*([0-9.]+)\s*ms'),
     'total_query_ms': re.compile(r'Total query time:\s*([0-9.]+)\s*ms'),
+    'sql_to_pcuda_ms': re.compile(r'SQL to PCUDA time:\s*([0-9.]+)\s*ms'),
+    'startup_ms': re.compile(r'Startup time:\s*([0-9.]+)\s*ms'),
+    'data_load_ms': re.compile(r'Data loading time:\s*([0-9.]+)\s*ms'),
+    'main_to_first_result_ms': re.compile(r'Main to first result time:\s*([0-9.]+)\s*ms'),
 }
+OBSERVATION_TIMING_FIELDS = ['sql_to_pcuda_ms', 'startup_ms', 'data_load_ms', 'main_to_first_result_ms']
+MODULE_TIMING_FIELDS = [
+    'compile_wall_sum_ms', 'compile_user_sum_ms', 'compile_system_sum_ms',
+    'link_wall_sum_ms', 'link_user_sum_ms', 'link_system_sum_ms', 'build_elapsed_ms',
+]
+for _field, _label in zip(MODULE_TIMING_FIELDS, (
+        'Native compile wall sum', 'Native compile user sum', 'Native compile system sum',
+        'Native link wall sum', 'Native link user sum', 'Native link system sum', 'Module build elapsed')):
+    METRIC_PATTERNS[_field] = re.compile(re.escape(_label) + r':\s*([0-9.]+)\s*ms')
+MODULE_EVENT_FIELDS = ['plan_codegen', 'module_codegen', 'compiler', 'linker', 'hits', 'misses', 'loads', 'symbols']
 
 MARKER_PREFIX = '__CRYSTAL_BENCH_BEGIN__'
 MARKER_RE = re.compile(rf'{re.escape(MARKER_PREFIX)}\|(\d+)\|([^|]+)\|([^|]+)\|(\d+)')
@@ -91,21 +105,22 @@ def sum_numeric_fields(record: dict, fields) -> Optional[float]:
 def normalize_timing_record(record: dict) -> dict:
     sync_timing_aliases(record)
 
-    engine_sum = sum_numeric_fields(record, ENGINE_COMPONENT_FIELDS)
+    overlapping = record.get('reported_timing_model') == 'pcuda-modules-overlap-exp-v1'
+    engine_sum = None if overlapping else sum_numeric_fields(record, ENGINE_COMPONENT_FIELDS)
     record['engine_component_sum_ms'] = engine_sum
     if engine_sum is not None and is_number(record.get('engine_ms')):
         record['engine_minus_components_ms'] = record['engine_ms'] - engine_sum
     else:
         record['engine_minus_components_ms'] = None
 
-    total_sum = sum_numeric_fields(record, TIMING_COMPONENT_FIELDS)
+    total_sum = None if overlapping else sum_numeric_fields(record, TIMING_COMPONENT_FIELDS)
     record['timing_component_sum_ms'] = total_sum
     if total_sum is not None and is_number(record.get('total_query_ms')):
         record['timing_total_minus_components_ms'] = record['total_query_ms'] - total_sum
     else:
         record['timing_total_minus_components_ms'] = None
 
-    for field in CANONICAL_TIMING_FIELDS + COMPATIBILITY_TIMING_FIELDS + DERIVED_TIMING_FIELDS:
+    for field in CANONICAL_TIMING_FIELDS + COMPATIBILITY_TIMING_FIELDS + DERIVED_TIMING_FIELDS + OBSERVATION_TIMING_FIELDS:
         record.setdefault(field, None)
     return record
 
@@ -130,6 +145,14 @@ def parse_metrics(text: str) -> dict:
     if 'generated_execute_ms' not in out and 'gpu_execution_ms_legacy' in out:
         out['generated_execute_ms'] = out['gpu_execution_ms_legacy']
     sync_timing_aliases(out)
+    model = re.search(r'Timing model:\s*(\S+)', text)
+    if model:
+        out['reported_timing_model'] = model[1]
+    events = re.search(r'Module events:([^\n]+)', text)
+    if events:
+        for key, value in re.findall(r'(\w+)=(\d+)', events[1]):
+            if key in MODULE_EVENT_FIELDS:
+                out['module_' + key + '_calls' if key not in ('hits', 'misses') else 'module_cache_' + key] = int(value)
     return out
 
 
@@ -246,6 +269,27 @@ def split_session_output(text: str) -> dict:
     return segments
 
 
+def save_generated_sources(directory: pathlib.Path, query_id: str, text: str) -> None:
+    """Save native module candidates as separate translation units, never as one relinked query."""
+    found = re.search(r'---\s*Generated Code\s*---\n(.*?)---\s*End\s*---', text, re.DOTALL)
+    if not found:
+        return
+    code = found.group(1)
+    markers = list(re.finditer(r'^// ===== Separate module (\d+): (\S+) =====\n', code, re.MULTILINE))
+    if not markers:
+        (directory / f'{query_id}.cpp').write_text(code.strip() + '\n')
+        return
+    target = directory / query_id
+    target.mkdir(parents=True, exist_ok=True)
+    entries = []
+    for index, marker in enumerate(markers):
+        end = markers[index + 1].start() if index + 1 < len(markers) else len(code)
+        name = f'module-{marker[1]}.cpp'
+        (target / name).write_text(code[marker.end():end].strip() + '\n')
+        entries.append({'file': name, 'kernel': marker[2]})
+    (target / 'modules.json').write_text(json.dumps({'backend': 'pcuda', 'inspection_typed_candidates': True, 'modules': entries}, indent=2) + '\n')
+
+
 def run_single_session(db_cli: str, run_items: list, limit: str, timing: bool, timeout_pad: int) -> tuple[list, int, bool, str]:
     commands = ['\\timing on' if timing else '\\timing off']
     if limit:
@@ -336,9 +380,7 @@ def run_isolated(db_cli: str, run_items: list, limit: str, timing: bool, logs_di
         (logs_dir / f'{log_base}.err').write_text(stderr)
         
         if item['phase'] == 'dump' and codes_dir:
-            code_match = re.search(r'---\s*Generated Code\s*---\n(.*?)---\s*End\s*---', stdout, re.DOTALL)
-            if code_match:
-                (codes_dir / f"{item['query_id']}.cpp").write_text(code_match.group(1).strip() + '\n')
+            save_generated_sources(codes_dir,item['query_id'],stdout)
                 
         combined_output = stdout + '\n' + stderr
         metrics = parse_metrics(combined_output)
@@ -378,6 +420,8 @@ def main() -> int:
     ap.add_argument('--manifest', default='bench/olap_bench/manifest.json')
     ap.add_argument('--out', default=None)
     ap.add_argument('--runs', type=int, default=3)
+    ap.add_argument('--timing-model', choices=['legacy-generated-v1', 'explicit-plan-v1', 'pcuda-modules-v1', 'pcuda-modules-overlap-exp-v1'], default='legacy-generated-v1',
+                    help='Declare interval semantics; does not change SQL execution or historical records')
     ap.add_argument('--warmups', type=int, default=1)
     ap.add_argument('--limit', default='1000')
     ap.add_argument('--timing', action='store_true', default=True)
@@ -419,9 +463,7 @@ def main() -> int:
             (logs_dir / f'{log_base}.err').write_text('')
             
             if record['phase'] == 'dump' and args.dump_code:
-                code_match = re.search(r'---\s*Generated Code\s*---\n(.*?)---\s*End\s*---', segment, re.DOTALL)
-                if code_match:
-                    (codes_dir / f"{record['query_id']}.cpp").write_text(code_match.group(1).strip() + '\n')
+                save_generated_sources(codes_dir,record['query_id'],segment)
 
             if record['returncode'] != 0 or record['timed_out']:
                 failures += 1
@@ -436,6 +478,11 @@ def main() -> int:
     rows = []
     for r in all_records:
         if r.get('measured'):
+            if r.get('reported_timing_model') in ('pcuda-modules-v1','pcuda-modules-overlap-exp-v1') and args.timing_model != r.get('reported_timing_model'):
+                raise ValueError('Select the reported engine --timing-model explicitly: '+r['reported_timing_model'])
+            if args.timing_model in ('pcuda-modules-v1','pcuda-modules-overlap-exp-v1') and r.get('returncode') == 0 and r.get('reported_timing_model') != args.timing_model:
+                raise ValueError('Missing/mismatched engine timing model')
+            r['timing_model'] = args.timing_model
             normalize_timing_record(r)
             rows.append(r)
 
@@ -465,6 +512,7 @@ def main() -> int:
             cold_vals = successful_vals
 
         aggregate_record = {
+            'timing_model': args.timing_model,
             'query_id': key,
             'runs': len(vals),
             'successful_runs': len(successful_vals),
@@ -476,7 +524,7 @@ def main() -> int:
 
         jit_fields = {'codegen_ms', 'compile_ms', 'library_load_ms'}
 
-        for field in CANONICAL_TIMING_FIELDS + DERIVED_TIMING_FIELDS:
+        for field in CANONICAL_TIMING_FIELDS + DERIVED_TIMING_FIELDS + MODULE_TIMING_FIELDS + OBSERVATION_TIMING_FIELDS:
             if field in jit_fields:
                 aggregate_record[field] = cold_vals[0].get(field) if cold_vals else None
             else:
@@ -487,13 +535,14 @@ def main() -> int:
         r.pop('_raw_output', None)
 
     fields = [
-        'class_id','query_id','path','status','phase','run_index','measured','returncode','timed_out',
+        'class_id','query_id','path','status','phase','run_index','measured','returncode','timed_out','timing_model',
         'rows_returned','rows_shown',
         'prepare_ms','codegen_ms','compile_ms','library_load_ms','generated_execute_ms','host_fetch_ms',
         'engine_ms','total_query_ms',
         'engine_component_sum_ms','engine_minus_components_ms',
         'timing_component_sum_ms','timing_total_minus_components_ms'
-    ]
+    ] + MODULE_TIMING_FIELDS + OBSERVATION_TIMING_FIELDS + ['reported_timing_model'] + [
+        'module_' + key + '_calls' if key not in ('hits', 'misses') else 'module_cache_' + key for key in MODULE_EVENT_FIELDS]
     with (out_dir / 'summary.csv').open('w', newline='') as f:
         w = csv.DictWriter(f, fieldnames=fields, extrasaction='ignore')
         w.writeheader()
@@ -501,12 +550,12 @@ def main() -> int:
             w.writerow(r)
 
     aggregate_fields = [
-        'query_id','runs','successful_runs','failed_runs','last_returncode','last_timed_out','rows_returned_last',
+        'query_id','runs','successful_runs','failed_runs','last_returncode','last_timed_out','rows_returned_last','timing_model',
         'prepare_ms','codegen_ms','compile_ms','library_load_ms','generated_execute_ms','host_fetch_ms',
         'engine_ms','total_query_ms',
         'engine_component_sum_ms','engine_minus_components_ms',
         'timing_component_sum_ms','timing_total_minus_components_ms'
-    ]
+    ] + MODULE_TIMING_FIELDS + OBSERVATION_TIMING_FIELDS
     with (out_dir / 'aggregate_summary.csv').open('w', newline='') as f:
         w = csv.DictWriter(f, fieldnames=aggregate_fields, extrasaction='ignore')
         w.writeheader()
