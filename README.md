@@ -1,5 +1,11 @@
 # Crystal — PCUDA SQL engine
 
+**[Сборка, запуск и быстрая проверка SSB — подробное руководство на русском](docs/BUILD_AND_RUN.md).**
+It covers GPU Release/Debug and CPU-only builds, dependencies, SF10 data,
+interactive/batch SQL, manual SSB, result validation, installation and troubleshooting.
+For a quick check, start with [the SSB recipes](docs/BUILD_AND_RUN.md#ssb);
+the known Q1.1 file/oracle difference is explained there.
+
 ## Build and SQL JIT
 
 The engine uses C++17 and AdaptiveCpp generic PCUDA. Each specialized GPU kernel
