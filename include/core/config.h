@@ -2,12 +2,15 @@
 
 #include <cstddef>
 #include <string>
+#include "storage/ssb_dataset.h"
 
 namespace db {
 
 struct CrystalConfig {
     std::string include_dir;
     std::string deps_include_dir;
+    /** @brief Native dataset manifest/columns; CRYSTAL_DATA_DIR overrides this path. */
+    std::string data_dir = ssbDefaultDirectory;
 
     /** @brief Prebuilt compiler/flags/PCH/header manifest; no SQL-path PCH generation is allowed. */
     std::string pcuda_manifest;

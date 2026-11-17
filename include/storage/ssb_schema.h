@@ -1,8 +1,8 @@
 #pragma once
 /** @file
- * @brief Single physical schema for the converted SSB files.
- * @details City/nation/region and manufacturer/category/brand are already Int32
- * codes in these files. Other text remains text, never an invented dictionary ID.
+ * @brief Single physical schema for native, unencoded SSB files.
+ * @details Every source string remains Text, including categorical attributes.
+ * Widths cover the pinned dbgen fields, without truncation or dictionary IDs.
  * DDATE has 17 columns; monthnum/weeknum precede sellingseason and the four flags.
  */
 #include "storage/column.h"
@@ -13,6 +13,13 @@
 #include <vector>
 
 namespace db {
+/** @brief Table identity and source filename; row counts belong to the dataset manifest. */
+struct SsbTable { const char* name; const char* input; const char* primary_key; };
+inline constexpr std::array<SsbTable, 5> ssbTables{{
+    {"LINEORDER", "lineorder.tbl", ""}, {"SUPPLIER", "supplier.tbl", "s_suppkey"},
+    {"CUSTOMER", "customer.tbl", "c_custkey"}, {"PART", "part.tbl", "p_partkey"},
+    {"DDATE", "date.tbl", "d_datekey"}
+}};
 /** @brief Stable logical name, table and numbered physical file with its encoding. */
 struct SsbColumn {
     const char* name;
@@ -45,30 +52,30 @@ inline constexpr std::array<SsbColumn, 58> ssbColumns{{
     {"s_suppkey", "SUPPLIER", 0, ssbInt},
     {"s_name", "SUPPLIER", 1, {PhysicalEncoding::FixedText, 25}},
     {"s_address", "SUPPLIER", 2, {PhysicalEncoding::FixedText, 25}},
-    {"s_city", "SUPPLIER", 3, ssbInt},
-    {"s_nation", "SUPPLIER", 4, ssbInt},
-    {"s_region", "SUPPLIER", 5, ssbInt},
+    {"s_city", "SUPPLIER", 3, {PhysicalEncoding::FixedText, 10}},
+    {"s_nation", "SUPPLIER", 4, {PhysicalEncoding::FixedText, 15}},
+    {"s_region", "SUPPLIER", 5, {PhysicalEncoding::FixedText, 12}},
     {"s_phone", "SUPPLIER", 6, {PhysicalEncoding::FixedText, 15}},
     {"c_custkey", "CUSTOMER", 0, ssbInt},
     {"c_name", "CUSTOMER", 1, {PhysicalEncoding::FixedText, 25}},
     {"c_address", "CUSTOMER", 2, {PhysicalEncoding::FixedText, 25}},
-    {"c_city", "CUSTOMER", 3, ssbInt},
-    {"c_nation", "CUSTOMER", 4, ssbInt},
-    {"c_region", "CUSTOMER", 5, ssbInt},
+    {"c_city", "CUSTOMER", 3, {PhysicalEncoding::FixedText, 10}},
+    {"c_nation", "CUSTOMER", 4, {PhysicalEncoding::FixedText, 15}},
+    {"c_region", "CUSTOMER", 5, {PhysicalEncoding::FixedText, 12}},
     {"c_phone", "CUSTOMER", 6, {PhysicalEncoding::FixedText, 15}},
     {"c_mktsegment", "CUSTOMER", 7, {PhysicalEncoding::FixedText, 10}},
     {"p_partkey", "PART", 0, ssbInt},
     {"p_name", "PART", 1, {PhysicalEncoding::FixedText, 22}},
-    {"p_mfgr", "PART", 2, ssbInt},
-    {"p_category", "PART", 3, ssbInt},
-    {"p_brand1", "PART", 4, ssbInt},
+    {"p_mfgr", "PART", 2, {PhysicalEncoding::FixedText, 6}},
+    {"p_category", "PART", 3, {PhysicalEncoding::FixedText, 7}},
+    {"p_brand1", "PART", 4, {PhysicalEncoding::FixedText, 10}},
     {"p_color", "PART", 5, {PhysicalEncoding::FixedText, 11}},
     {"p_type", "PART", 6, {PhysicalEncoding::FixedText, 25}},
     {"p_size", "PART", 7, ssbInt},
     {"p_container", "PART", 8, {PhysicalEncoding::FixedText, 10}},
     {"d_datekey", "DDATE", 0, ssbInt},
     {"d_date", "DDATE", 1, {PhysicalEncoding::FixedText, 18}},
-    {"d_dayofweek", "DDATE", 2, {PhysicalEncoding::FixedText, 8}},
+    {"d_dayofweek", "DDATE", 2, {PhysicalEncoding::FixedText, 9}},
     {"d_month", "DDATE", 3, {PhysicalEncoding::FixedText, 9}},
     {"d_year", "DDATE", 4, ssbInt},
     {"d_yearmonthnum", "DDATE", 5, ssbInt},

@@ -83,6 +83,7 @@ static bool readConfigFile(const std::string& path, CrystalConfig& cfg) {
 
         if (key == "crystal_include_dir" || key == "include_dir") cfg.include_dir = value;
         else if (key == "crystal_deps_include_dir" || key == "deps_include_dir") cfg.deps_include_dir = value;
+        else if (key == "data_dir") cfg.data_dir = value;
         else if (key == "device_name") cfg.device_name = value;
         else if (key == "pcuda_manifest") cfg.pcuda_manifest = value;
         else if (key == "jit_artifact_dir") cfg.jit_artifact_dir = value;
@@ -148,6 +149,8 @@ CrystalConfig loadCrystalConfig() {
         if (*p) cfg.deps_include_dir = p;
     }
     if (const char* p = std::getenv("CRYSTAL_DEVICE_NAME")) cfg.device_name = p;
+    if (const char* p = std::getenv("CRYSTAL_DATA_DIR")) cfg.data_dir = p;
+    if (cfg.data_dir.empty()) throw std::runtime_error("data_dir must not be empty");
     if (const char* p = std::getenv("CRYSTAL_JIT_OVERLAP_EXPERIMENT")) cfg.jit_overlap_experiment=parseBool(p,"CRYSTAL_JIT_OVERLAP_EXPERIMENT");
     return cfg;
 }

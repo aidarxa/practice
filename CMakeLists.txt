@@ -49,9 +49,10 @@ target_include_directories(cli_startup_timing PUBLIC include)
 add_executable(pcuda_acceptance_first_result test/pcuda_compile_perf/first_result.cpp)
 add_library(checked_sizes STATIC src/core/size_expression.cpp)
 target_include_directories(checked_sizes PUBLIC include)
-add_library(query_values STATIC src/core/parameter_value.cpp src/core/expression_codegen.cpp src/core/result_layout.cpp src/storage/text_column.cpp)
+add_subdirectory(bench/loader)
+add_library(query_values STATIC src/core/parameter_value.cpp src/core/expression_codegen.cpp src/core/result_layout.cpp)
 target_include_directories(query_values PUBLIC include)
-target_link_libraries(query_values PUBLIC checked_sizes)
+target_link_libraries(query_values PUBLIC checked_sizes ssb_storage)
 add_library(physical_execution STATIC
     src/core/execution_plan.cpp
     src/core/physical_planner.cpp
@@ -98,8 +99,8 @@ add_sycl_to_target(TARGET pcuda_text_fetch)
 set_property(TARGET pcuda_text_fetch PROPERTY RULE_LAUNCH_COMPILE "${ACPP_COMPILER_LAUNCH_RULE} --acpp-pcuda")
 
 # Independent handwritten algorithms: no SQL parser/codegen/executor linkage.
-add_library(manual_ssb STATIC test/queries/example/support/runner.cpp)
-target_link_libraries(manual_ssb PUBLIC pcuda_scan manual_ssb_spec)
+add_library(manual_ssb STATIC test/queries/example/support/runner.cpp test/queries/example/support/dataset.cpp)
+target_link_libraries(manual_ssb PUBLIC pcuda_scan manual_ssb_spec ssb_storage)
 target_sources(manual_ssb PRIVATE src/core/config.cpp)
 add_sycl_to_target(TARGET manual_ssb)
 set_property(TARGET manual_ssb PROPERTY RULE_LAUNCH_COMPILE "${ACPP_COMPILER_LAUNCH_RULE} --acpp-pcuda")
@@ -239,6 +240,7 @@ target_link_libraries(test_optimizer PRIVATE
 
 # The optimizer lowers strings/contracts only; no GPU compiler/runtime is needed.
 target_compile_definitions(test_optimizer PRIVATE
+    CRYSTAL_TEST_SOURCE_DIR="${CMAKE_SOURCE_DIR}"
     CRYSTAL_INCLUDE_DIR_DEFAULT="${CRYSTAL_INCLUDE_DIR}"
     CRYSTAL_DEPS_INCLUDE_DIR_DEFAULT="${CRYSTAL_DEPS_INCLUDE_DIR}"
 )

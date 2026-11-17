@@ -49,6 +49,7 @@ __pycache__/
 
 # Downloaded dependencies, benchmark data and runtime-generated metadata.
 data/10/
+data/ssb/
 deps/
 sql-parser/*
 test/queries/result/

@@ -34,7 +34,7 @@ int main() {
         assert(rejected);
     }
     assert(prepare("SELECT COUNT(*) FROM supplier", catalog).query.plan);
-    assert(prepare("SELECT s_suppkey FROM supplier WHERE s_region=1", catalog).query.plan);
+    assert(prepare("SELECT s_suppkey FROM supplier WHERE s_region='AMERICA'", catalog).query.plan);
     std::cout << "Typed storage frontend checks passed\n";
     return 0;
 }

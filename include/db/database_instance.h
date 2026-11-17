@@ -31,6 +31,7 @@ private:
     void initCatalog();
 
     CrystalConfig config_;
+    SsbDataset dataset_;
     std::shared_ptr<DeviceRuntime> runtime_;
     std::shared_ptr<Catalog> catalog_;
     std::unique_ptr<ExecutionContext> ctx_;

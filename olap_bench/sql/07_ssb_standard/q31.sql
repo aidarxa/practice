@@ -3,8 +3,7 @@ from lineorder,customer, supplier,ddate
 where lo_custkey = c_custkey
 and lo_suppkey = s_suppkey
 and lo_orderdate = d_datekey
-and c_region = 2
-and s_region = 2
+and c_region = 'ASIA'
+and s_region = 'ASIA'
 and d_year >= 1992 and d_year <= 1997
 group by c_nation,s_nation,d_year;
-

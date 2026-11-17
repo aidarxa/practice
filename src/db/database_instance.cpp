@@ -21,6 +21,7 @@ static double elapsedMs(const Clock::time_point& start, const Clock::time_point&
 
 DatabaseInstance::DatabaseInstance()
     : config_(loadCrystalConfig()),
+      dataset_(SsbDataset::open(config_.data_dir)),
       runtime_(std::make_shared<DeviceRuntime>(config_)) {
     ctx_ = std::make_unique<ExecutionContext>();
     ctx_->runtime_ = runtime_;
@@ -46,13 +47,11 @@ DatabaseInstance::~DatabaseInstance() = default;
 void DatabaseInstance::initCatalog() {
     catalog_ = std::make_shared<Catalog>();
 
-    // Инициализируем кэш
-    // A new namespace prevents reuse of old raw-prefix/shifted-DDATE statistics.
-    db::CatalogCacheManager cache_manager("/dev/shm/catalog_cache_numeric_v2.txt");
+    db::CatalogCacheManager cache_manager(dataset_);
 
     // Лямбда: берет список колонок и размер таблицы, получает стату и записывает
     auto applyStats = [&](TableMetadata& table) {
-        int table_size = table.getSize(); // Возвращает LO_LEN, S_LEN и т.д.
+        const auto table_size = table.getSize();
         for (const auto& col_name : table.getColumnNames()) {
             const auto storage = ssbColumn(col_name).storage;
             table.setColumnStorage(col_name, storage);
@@ -64,57 +63,21 @@ void DatabaseInstance::initCatalog() {
         }
     };
 
-    auto applyNullabilityFromStorage = [](TableMetadata& table) {
+    auto applyNullabilityFromStorage = [&](TableMetadata& table) {
         for (const auto& col_name : table.getColumnNames()) {
-            if (hasNullBitmapFile(col_name)) {
+            if (hasNullBitmapFile(col_name, dataset_.directory())) {
                 table.setColumnNullable(col_name, true);
             }
         }
     };
 
-    // LINEORDER (fact)
-    TableMetadata lo("LINEORDER",
-                     ssbColumnNames("LINEORDER"),
-                     LO_LEN, true);
-    applyStats(lo);
-    applyNullabilityFromStorage(lo);
-    catalog_->pushTableMetadata(lo);
-
-    // SUPPLIER (dimension)
-    TableMetadata s("SUPPLIER",
-                    ssbColumnNames("SUPPLIER"),
-                    S_LEN, false);
-    applyStats(s);
-    applyNullabilityFromStorage(s);
-    s.setColumnPrimaryKey("s_suppkey");
-    catalog_->pushTableMetadata(s);
-
-    // CUSTOMER (dimension)
-    TableMetadata c("CUSTOMER",
-                    ssbColumnNames("CUSTOMER"),
-                    C_LEN, false);
-    applyStats(c);
-    applyNullabilityFromStorage(c);
-    c.setColumnPrimaryKey("c_custkey");
-    catalog_->pushTableMetadata(c);
-
-    // PART (dimension)
-    TableMetadata p("PART",
-                    ssbColumnNames("PART"),
-                    P_LEN, false);
-    applyStats(p);
-    applyNullabilityFromStorage(p);
-    p.setColumnPrimaryKey("p_partkey");
-    catalog_->pushTableMetadata(p);
-
-    // DDATE (dimension)
-    TableMetadata d("DDATE",
-                    ssbColumnNames("DDATE"),
-                    D_LEN, false);
-    applyStats(d);
-    applyNullabilityFromStorage(d);
-    d.setColumnPrimaryKey("d_datekey");
-    catalog_->pushTableMetadata(d);
+    for (const auto& definition : ssbTables) {
+        TableMetadata table(definition.name, ssbColumnNames(definition.name), dataset_.rowCount(definition.name), !*definition.primary_key);
+        applyStats(table);
+        applyNullabilityFromStorage(table);
+        if (*definition.primary_key) table.setColumnPrimaryKey(definition.primary_key);
+        catalog_->pushTableMetadata(table);
+    }
 }
 
 void DatabaseInstance::loadData() {
@@ -137,8 +100,8 @@ void DatabaseInstance::loadData() {
             current_column++;
             const auto storage = table.getColumnStorage(col_name);
             if (!storage.isNumeric()) {
-                auto validity = loadValidityBitmapIfExists(col_name, size);
-                const auto data = loadTextColumn(std::filesystem::path(DATA_DIR)/lookup(col_name), size, storage, validity);
+                auto validity = loadValidityBitmapIfExists(col_name, size, dataset_.directory());
+                const auto data = loadTextColumn(dataset_.columnPath(col_name), size, storage, validity);
                 const bool wide = checkedSizeMultiply(size, storage.width) > INT32_MAX;
                 loaded_bytes = checkedSizeAdd(loaded_bytes, checkedSizeAdd(data.bytes.size(), checkedSizeMultiply(data.offsets.size(), wide?8:4)));
                 loaded_bytes = checkedSizeAdd(loaded_bytes, checkedSizeMultiply(validity.size(), sizeof(uint64_t)));
@@ -148,7 +111,7 @@ void DatabaseInstance::loadData() {
             std::cout << "\r[" << current_column << "/" << total_columns << "] Loading " << std::left << std::setw(20) << col_name << std::flush;
 
             // Load from disk
-            std::vector<int> data = loadColumn<int>(col_name, size);
+            std::vector<int> data = loadColumn<int>(col_name, size, dataset_.directory());
 
             // Allocate and copy to GPU
             LoadedDeviceColumn column;
@@ -158,7 +121,7 @@ void DatabaseInstance::loadData() {
 
             std::string buf_name = "d_" + col_name;
 
-            std::vector<uint64_t> validity = loadValidityBitmapIfExists(col_name, size);
+            std::vector<uint64_t> validity = loadValidityBitmapIfExists(col_name, size, dataset_.directory());
             if (!validity.empty()) {
                 column.validity = std::make_unique<DynamicDeviceBuffer<uint64_t>>(runtime_, validity.size());
                 column.validity->copyFromHost(validity);

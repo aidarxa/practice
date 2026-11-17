@@ -116,7 +116,7 @@ def parse_rows(text):
         return columns, [], 0
     rows = []
     for line in lines:
-        if not line.startswith("Row ") and not (line.startswith('"') or re.fullmatch(r"(?:NULL|[-+0-9.eE]+)(?:\s*\|\s*(?:NULL|[-+0-9.eE]+))*", line.strip())):
+        if not line.startswith("Row ") and not re.match(r'(?:"|NULL\b|[-+0-9])', line.strip()):
             continue
         row = parse_cell_row(re.sub(r"^Row \d+:\s*", "", line))
         if len(row) != len(columns):

@@ -1,0 +1,23 @@
+{
+  "version": 1,
+  "inputs": ["include", "src/storage", "src/core/config.cpp", "src/core/size_expression.cpp", "test/assertions_enabled.h", "test/ssb_native_data/test_dataset.cpp", "test/ssb_native_data/test_host.cpp", "test/pcuda_stage7/test_manual_spec.cpp", "test/queries/example/support/query_spec.h", "test/queries/example/support/query_spec.cpp"],
+  "build": [
+    ["{cxx}", "-std=c++17", "-O0", "-g", "-UNDEBUG", "-DSSB_COMBINED_TEST", "{flags}", "-I{root}/include", "-I{root}", "-I{root}/test/queries/example", "{root}/test/ssb_native_data/test_host.cpp", "{root}/test/ssb_native_data/test_dataset.cpp", "{root}/test/pcuda_stage7/test_manual_spec.cpp", "{root}/test/queries/example/support/query_spec.cpp", "{root}/src/storage/ssb_dataset.cpp", "{root}/src/storage/ssb_import.cpp", "{root}/src/storage/text_column.cpp", "{root}/src/core/config.cpp", "{root}/src/core/size_expression.cpp", "-o", "{out}/checks"]
+  ],
+  "test": [["{out}/checks"]],
+  "objects": ["{out}/checks"],
+  "mutations": [
+    {"id":"manifest-overwrite", "file":"src/storage/ssb_dataset.cpp", "before":"O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC", "after":"O_WRONLY | O_CREAT | O_CLOEXEC"},
+    {"id":"skip-column-extent", "file":"src/storage/ssb_dataset.cpp", "before":"columnFileBytes(dataset.columnPath(column.name), static_cast<std::size_t>(count), column.storage.width);", "after":"(void)count;"},
+    {"id":"ignore-schema-record", "file":"src/storage/ssb_dataset.cpp", "before":"if (line(input) != columnRecord(column)) throw std::runtime_error(\"SSB manifest schema mismatch: \" + std::string(column.name));", "after":"(void)line(input);"},
+    {"id":"truncate-row-count", "file":"src/storage/ssb_dataset.cpp", "before":"return rows_[index];", "after":"return 1;"},
+    {"id":"unvalidated-text", "file":"src/storage/ssb_import.cpp", "before":"validateText(value);", "after":"(void)value;"},
+    {"id":"duplicate-dimension-key", "file":"src/storage/ssb_import.cpp", "before":"if (!keys.insert(key).second) throw std::runtime_error(\"Duplicate dimension primary key\");", "after":"(void)keys.insert(key);"},
+    {"id":"accept-invalid-flag", "file":"src/storage/ssb_import.cpp", "before":"value != \"0\" && value != \"1\"", "after":"value != \"0\" && value != \"1\" && value != \"2\""},
+    {"id":"wrong-int32-endian", "file":"src/storage/ssb_import.cpp", "before":"word >> (byte * 8U)", "after":"word << (byte * 8U)"},
+    {"id":"stale-dataset-statistics", "file":"include/core/catalog_cache.h", "before":"found->second.mtime == time", "after":"true"},
+    {"id":"ignore-data-env", "file":"src/core/config.cpp", "before":"cfg.data_dir = p;", "after":"cfg.data_dir = ssbDefaultDirectory;"},
+    {"id":"text-predicate-space-loss", "file":"test/queries/example/support/query_spec.h", "before":"first == 0 || last == 0", "after":"first >= 0 || last == 0"},
+    {"id":"group-capacity-overflow", "file":"test/queries/example/support/query_spec.cpp", "before":"count = db::checkedSizeMultiply(count, std::max<std::uint64_t>(cardinalities[i], 1));", "after":"count *= std::max<std::uint64_t>(cardinalities[i], 1);"}
+  ]
+}

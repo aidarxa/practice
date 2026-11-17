@@ -69,7 +69,7 @@ class PhysicalOracle:
             if c.min()<1 or c.max()>len(self.arrays["c_custkey"]):
                 raise ValueError("Invalid independent customer FK")
             if kind=="customer-region":
-                count += int(np.count_nonzero(self.arrays["c_region"][c-1]==1))
+                count += int(np.count_nonzero(self.arrays["c_region"][c-1]==b"AMERICA"))
             else:
                 if s.min()<1 or s.max()>len(self.arrays["s_suppkey"]):
                     raise ValueError("Invalid independent supplier FK")
@@ -93,7 +93,7 @@ class PhysicalOracle:
                 fact = self.fact_row(visible)
                 indexes = {"lineorder":fact,"customer":self.value("lo_custkey",fact)-1,"supplier":self.value("lo_suppkey",fact)-1}
                 identity = fact
-                if kind=="customer-region" and self.value("c_region",indexes["customer"])!=1:
+                if kind=="customer-region" and self.value("c_region",indexes["customer"])!="AMERICA":
                     raise ValueError("Visible row violates customer filter")
                 if kind=="same-nation" and self.value("c_nation",indexes["customer"])!=self.value("s_nation",indexes["supplier"]):
                     raise ValueError("Visible row violates cross-table filter")

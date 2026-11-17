@@ -21,9 +21,9 @@ create table lineorder (
 create table part (
    p_partkey integer not null,
    p_name varchar(22) not null,
-   p_mfgr integer not null,
-   p_category integer not null,
-   p_brand1 integer not null,
+    p_mfgr char(6) not null,
+    p_category char(7) not null,
+    p_brand1 char(10) not null,
    p_color varchar(11) not null,
    p_type varchar(25) not null,
    p_size integer not null,
@@ -34,9 +34,9 @@ create table supplier (
    s_suppkey integer not null,
    s_name char(25) not null,
    s_address varchar(25) not null,
-   s_city integer not null,
-   s_nation integer not null,
-   s_region integer not null,
+    s_city char(10) not null,
+    s_nation char(15) not null,
+    s_region char(12) not null,
    s_phone char(15) not null
 );
 
@@ -44,9 +44,9 @@ create table customer (
    c_custkey integer not null,
    c_name varchar(25) not null,
    c_address varchar(25) not null,
-   c_city integer not null,
-   c_nation integer not null,
-   c_region integer not null,
+    c_city char(10) not null,
+    c_nation char(15) not null,
+    c_region char(12) not null,
    c_phone char(15) not null,
    c_mktsegment char(10) not null
 );

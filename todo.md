@@ -4,6 +4,17 @@
 
 ## Цель и согласованные границы
 
+### Согласованное расширение 2026-11-15: native SSB datasets
+
+- [x] Один entry point `bench/prepare_ssb.sh`: pinned dbgen → host-only C++17 converter → проверка → atomic no-replace publication.
+- [x] Native Text вместо девяти категориальных кодов; общий physical schema/manifest, полный `Wednesday`, без усечения/словаря.
+- [x] Выбираемый SF и `data_dir` / `CRYSTAL_DATA_DIR`; фактические row counts, dataset-scoped statistics и все пути загрузки.
+- [x] Native SQL, независимые manual GPU SSB и свежие CPU-oracles на малом наборе/SF1/SF10; старые numeric данные/references/raw сохранены.
+- [x] Host/GPU/resource/NULL/MHT/OR, plain/traced Text и current/current_heavy + targeted регрессии, локальные quality tools; [основной отчёт](test/ssb_native_data/REPORT.md).
+- Это не новый performance baseline: прежние numeric SF10 timings и цели прототипа не переносятся на Text. Этап 8, SQL SLA и default-on adoption остаются открытыми; warm backlog/replay не начинать автоматически.
+
+### Исходные границы PCUDA-переноса
+
 - Полностью заменить SYCL на PCUDA: ядра, память, управление выполнением, загрузку данных, служебные GPU-операции и ручные примеры SSB.
 - Сохранить Data-Centric Push-модель, Predicate Pushdown и Kernel Fusion внутри каждого ядра.
 - Отдельно компилировать и загружать специализированные ядра; не перелинковывать библиотеку всего запроса при изменении одного ядра.

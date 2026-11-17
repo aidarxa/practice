@@ -20,6 +20,7 @@
 #include <cassert>
 #include <iterator>
 #include <iostream>
+#include <fstream>
 #include <string>
 #include <vector>
 
@@ -958,7 +959,38 @@ static void test_value_free_cross_plan_modules() {
     assert(!shared.empty() && count != sum);
 }
 
+/** @brief The current SSB SQL resolves against unencoded native types and arbitrary table sizes. */
+static void test_native_ssb_plan_schema() {
+    Catalog catalog;
+    for (const auto& definition : ssbTables) {
+        TableMetadata table(definition.name, ssbColumnNames(definition.name), 12345, !*definition.primary_key);
+        for (const auto& column : ssbColumns)
+            if (std::string_view(column.table) == definition.name) table.setColumnStorage(column.name, column.storage);
+        if (*definition.primary_key) table.setColumnPrimaryKey(definition.primary_key);
+        catalog.pushTableMetadata(table);
+    }
+    for (const auto* id : {"11", "12", "13", "21", "22", "23", "31", "32", "33", "34", "41", "42", "43"}) {
+        std::ifstream file(std::string(CRYSTAL_TEST_SOURCE_DIR) + "/test/queries/sql/q" + id + ".sql");
+        assert(file);
+        const std::string sql{std::istreambuf_iterator<char>(file), std::istreambuf_iterator<char>()};
+        hsql::SQLParserResult parsed;
+        const auto* ast = parseSQL(sql, parsed);
+        assert(ast);
+        auto prepared = QueryTranslator{}.prepare(ast, catalog);
+        prepared.query.plan = Optimizer{}.optimize(std::move(prepared.query.plan));
+        if (id[0] == '1') continue; // These three use only numeric fact columns.
+        assert(usesTextPlan(*prepared.query.plan, catalog, prepared.query.parameter_schema));
+        const auto native = lowerTextPlan(*prepared.query.plan, catalog, prepared.query.parameter_schema);
+        assert(!native.bodies.empty());
+        for (std::size_t i = 0; i < native.bodies.size(); ++i) {
+            const auto source = generatePcudacode(native.plan.kernels[i], native.bodies[i], "native-ssb").source;
+            assert(source.find("sycl::") == std::string::npos && source.find("MFGR#") == std::string::npos);
+        }
+    }
+}
+
 int main() {
+    test_native_ssb_plan_schema();
     test_value_free_cross_plan_modules();
     test_text_parameterized_physical_plan();
     test_decoded_flag_parameter_plan();

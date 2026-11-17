@@ -18,18 +18,21 @@ int main() {
     for (const auto id : {11, 12, 13, 21, 22, 23, 31, 32, 33, 34, 41, 42, 43}) {
         const auto query = ssb::querySpec(id);
         assert(query.id == static_cast<unsigned>(id));
-        assert(ssb::groupCapacity(query) > 0);
+        assert(ssb::groupCapacity(query, {7, 25, 25}) > 0);
     }
     rejects([] { ssb::querySpec(0); });
-    assert(ssb::groupCapacity(ssb::querySpec(33)) == 7 * 250 * 250);
-    assert(ssb::groupCapacity(ssb::querySpec(43)) == 7 * 250 * 1000);
+    assert(ssb::groupCapacity(ssb::querySpec(33), {7, 250, 250}) == 2 * 7 * 250 * 250);
+    assert(ssb::groupCapacity(ssb::querySpec(43), {7, 250, 1000}) == 2 * 7 * 250 * 1000);
     auto spec = ssb::querySpec(33);
-    spec.group_count = 4; rejects([&] { ssb::groupCapacity(spec); });
-    spec = ssb::querySpec(33); spec.groups[0].extent = 0; rejects([&] { ssb::groupCapacity(spec); });
-    spec = ssb::querySpec(33); spec.groups[0].slot = 4; rejects([&] { ssb::groupCapacity(spec); });
+    spec.group_count = 4; rejects([&] { ssb::groupCapacity(spec, {1, 1, 1}); });
+    spec = ssb::querySpec(33); spec.groups[0].slot = 4; rejects([&] { ssb::groupCapacity(spec, {1, 1, 1}); });
     spec = ssb::querySpec(33);
-    for (auto& group : spec.groups) group.extent = UINT_MAX;
-    rejects([&] { ssb::groupCapacity(spec); });
+    rejects([&] { ssb::groupCapacity(spec, {UINT64_MAX, UINT64_MAX, UINT64_MAX}); });
+    rejects([&] { ssb::groupCapacity(spec, {std::uint64_t{1} << 63, 2, 1}); });
+    assert(ssb::groupCapacity(spec, {0, 0, 0}) == 2);
+    const ssb::Filter text{"ASIA", "EUROPE", true};
+    const auto view = [](const char* value) { return db::TextView{reinterpret_cast<const std::uint8_t*>(value), std::char_traits<char>::length(value)}; };
+    assert(text.matches(view("ASIA")) && text.matches(view("EUROPE")) && !text.matches(view("ASIA ")));
     const auto range = ssb::Filter{2, 4};
     assert(!range.matches(1) && range.matches(2) && range.matches(3) && range.matches(4) && !range.matches(5));
     const auto either = ssb::Filter{2, 4, true};

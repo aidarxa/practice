@@ -1,6 +1,7 @@
 #pragma once
 /** @file @brief Host-only SSB numeric/validity loading; device headers stay separate. */
 #include "storage/ssb_schema.h"
+#include "storage/ssb_dataset.h"
 #include "storage/column_loader.h"
 #include <algorithm>
 #include <cstddef>
@@ -13,25 +14,6 @@
 #include <type_traits>
 #include <utility>
 #include <vector>
-#ifndef BASE_PATH
-#define BASE_PATH "data/"
-#endif
-#define SF 10
-#if SF == 10
-#define DATA_DIR BASE_PATH "10/"
-#define LO_LEN 59986217
-#define P_LEN 800000
-#define S_LEN 20000
-#define C_LEN 300000
-#define D_LEN 2557
-#else // 20
-#define DATA_DIR BASE_PATH "20/"
-#define LO_LEN 119994746
-#define P_LEN 1000000
-#define S_LEN 40000
-#define C_LEN 600000
-#define D_LEN 2556
-#endif
 
 inline std::string getTableName(std::string col_name) {
   if (col_name.empty()) return "";
@@ -99,7 +81,7 @@ enum class NullBitmapFileKind {
 };
 
 inline std::vector<std::pair<std::string, NullBitmapFileKind>> nullBitmapCandidateFiles(
-    const std::string& col_name, const std::filesystem::path& directory = DATA_DIR) {
+    const std::string& col_name, const std::filesystem::path& directory = db::ssbDefaultDirectory) {
   const std::string physical = (directory / lookup(col_name)).string();
   const std::string logical = (directory / col_name).string();
 
@@ -125,7 +107,7 @@ inline std::vector<std::pair<std::string, NullBitmapFileKind>> nullBitmapCandida
   return candidates;
 }
 
-inline bool hasNullBitmapFile(const std::string& col_name, const std::filesystem::path& directory = DATA_DIR) {
+inline bool hasNullBitmapFile(const std::string& col_name, const std::filesystem::path& directory = db::ssbDefaultDirectory) {
   for (const auto& [path, kind] : nullBitmapCandidateFiles(col_name, directory)) {
     (void)kind;
     if (std::filesystem::exists(std::filesystem::path(path))) {
@@ -136,11 +118,12 @@ inline bool hasNullBitmapFile(const std::string& col_name, const std::filesystem
 }
 
 inline std::vector<uint64_t> loadValidityBitmapIfExists(const std::string& col_name,
-                                                        std::size_t num_entries) {
+                                                        std::size_t num_entries,
+                                                        const std::filesystem::path& directory = db::ssbDefaultDirectory) {
   const std::size_t word_count = nullBitmapWordCount(num_entries);
   if (word_count == 0U) return {};
 
-  for (const auto& [path, kind] : nullBitmapCandidateFiles(col_name)) {
+  for (const auto& [path, kind] : nullBitmapCandidateFiles(col_name, directory)) {
     std::filesystem::path fs_path(path);
     if (!std::filesystem::exists(fs_path)) {
       continue;
@@ -196,8 +179,9 @@ inline std::vector<uint64_t> loadValidityBitmapIfExists(const std::string& col_n
  * Engine and manual queries use this strict entry, never its raw view.
  */
 template <typename T>
-inline std::vector<T> loadColumn(std::string col_name, std::size_t num_entries) {
+inline std::vector<T> loadColumn(std::string col_name, std::size_t num_entries,
+                                 const std::filesystem::path& directory = db::ssbDefaultDirectory) {
   static_assert(std::is_same<T, int32_t>::value, "SSB numeric storage decodes to Int32");
   const auto& column = db::ssbColumn(col_name);
-  return db::loadNumericColumn(std::filesystem::path(DATA_DIR) / column.fileName(), num_entries, column.storage);
+  return db::loadNumericColumn(directory / column.fileName(), num_entries, column.storage);
 }

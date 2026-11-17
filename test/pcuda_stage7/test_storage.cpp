@@ -74,7 +74,7 @@ void schema() {
         assert(db::ssbColumnNames(column.table).at(column.index) == column.name);
         assert(column.storage.width > 0);
     }
-    assert(db::ssbColumn("s_city").storage.isNumeric());
+    assert(!db::ssbColumn("s_city").storage.isNumeric());
     assert(!db::ssbColumn("s_name").storage.isNumeric());
     assert(db::ssbColumnNames("DDATE").size() == 17);
     rejects([] { lookup(""); });

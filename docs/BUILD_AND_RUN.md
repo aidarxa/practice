@@ -3,7 +3,7 @@
 Инструкция для текущего **Crystal-PCUDA**, Linux и Bash. Все команды, если явно
 не сказано иначе, выполняются **из корня репозитория**. Движок использует C++17,
 AdaptiveCpp generic PCUDA и GPU; CPU-only вариант ниже собирает тесты, а не
-CPU-версию SQL-движка.
+CPU-версию SQL-движка. Подготовка данных собирается отдельно и GPU не требует.
 
 Первичная аппаратная проверка выполнена на AMD Radeon 780M. NVIDIA/Intel этой
 инструкцией не объявляются аппаратно проверенными. SQL SLA и окончательная
@@ -26,10 +26,11 @@ CPU-версию SQL-движка.
 
 ## 1. Что выбрать
 
-| Задача | Вариант | Нужны GPU / SF10-данные |
+| Задача | Вариант | Нужны GPU / данные |
 | --- | --- | --- |
 | Проверить host-код без GPU-стека | `CRYSTAL_BUILD_GPU=OFF`, затем CTest | Нет / нет |
-| Запускать SQL | GPU Release, target `db_cli` | Да / да |
+| Создать готовые данные любого поддерживаемого SF | `bash bench/prepare_ssb.sh --scale SF` | Нет / создаёт сама |
+| Запускать SQL | GPU Release, target `db_cli` | Да / выбранный native dataset |
 | Получить все обычные targets и тесты | GPU Release, сборка без `--target` | Для сборки нужен SDK; для SQL — GPU и данные |
 | Отлаживать host-код | Отдельная GPU Debug-сборка | Для SQL — да / да |
 | Проверить Q3.3 без SQL-компилятора | Target `ssb_q33` | Да / да |
@@ -38,7 +39,7 @@ CPU-версию SQL-движка.
 | Прогнать широкую регрессию | [Functional acceptance](#regression) | Да / да; дополнительно NumPy |
 
 **Короткий маршрут:** подготовить зависимости → собрать GPU Release → разместить
-готовые данные в `data/10/` → выполнить один `q33.sql` → запустить SSB runner.
+данные командой `bash bench/prepare_ssb.sh` → выполнить один `q33.sql` → запустить SSB runner.
 Не начинайте с большой performance-серии: это не быстрый smoke test.
 
 <a id="requirements"></a>
@@ -244,11 +245,59 @@ PCH готовится при build/install, а не заново при каж�
 
 ## 4. Какие нужны данные
 
-### 4.1. Текущий формат — готовый SF10
+### 4.1. Один запуск: dbgen → готовые колонки
 
-Данные не скачиваются при сборке и не входят в Git. По умолчанию CLI открывает
-`data/10/` **относительно текущего рабочего каталога**, не каталога бинарника.
-Текущий обычный CLI настроен на фиксированный SF10:
+Из корня проекта, даже до сборки движка:
+
+```bash
+bash bench/prepare_ssb.sh
+```
+
+Default — **SF10 в `data/ssb/sf10`**. Скрипт сам:
+
+1. Собирает host-only C++17 конвертер и запускает его тесты.
+2. При необходимости получает только submodule `bench/ssb-dbgen` на закреплённом
+   revision. Уже изменённый submodule не перезаписывает, а выдаёт ошибку.
+3. Собирает dbgen, генерирует все пять `.tbl` в приватном каталоге.
+4. Потоково проверяет поля и создаёт 58 колонок без словаря.
+5. Проверяет manifest/размеры и атомарно публикует **целый** новый набор.
+
+Нужны Bash, Git, CMake и C/C++17 compiler, для первого получения submodule — сеть.
+AdaptiveCpp, GPU, `deps/` и SQL parser для подготовки **не нужны**. Toolchain можно
+выбрать обычными `CC`/`CXX`; пути к SDK не зашиты в конвертер. Например:
+
+```bash
+bash bench/prepare_ssb.sh --scale 1
+bash bench/prepare_ssb.sh --scale 1 --output /absolute/path/to/new-sf1 --keep-tbl
+bash bench/prepare_ssb.sh --scale 1 --from-tbl /path/to/original-tables \
+  --output /absolute/path/to/imported-sf1
+```
+
+Все `--output` должны быть **новыми**. Скрипт не имеет `--force`: повторный запуск
+не заменяет существующий набор или чужие файлы. Не удаляйте исходные данные ради
+повторения команды. Ошибка конвертации не публикует частичный набор; приватные
+staging-файлы при обработанной ошибке удаляются. Атомарность публикации не является
+обещанием crash durability при отключении питания.
+
+`--jobs N` задаёт параллельность host-сборки; default 4. Артефакты и CMake-команды
+остаются в напечатанном `build/ssb-tools/prepare-*`. Обычно исходные `.tbl` после
+успеха удаляются, `--keep-tbl` сохраняет их там для независимой побайтной проверки.
+Это потребует дополнительного диска. `--from-tbl` никогда не удаляет входной каталог.
+Файлы должны называться `lineorder.tbl`, `supplier.tbl`, `customer.tbl`, `part.tbl`,
+**`date.tbl`**, с pipe-разделителем и завершающим `|`, без заголовков.
+
+SF ≥1 должен быть целым: upstream молча усекал бы `1.5`, поэтому скрипт отклоняет
+его. Десятичный SF <1 пригоден для smoke test, но dbgen масштабирует также DDATE:
+например, SF0.01 дал лишь 25 дат. Для обычного SSB используйте целый SF ≥1.
+Размеры таблиц всегда фактические, не вычисляются по SF. Очень большой SF может
+превысить Int32-ключи генератора, диск или память устройства — скрипт не обещает
+произвольный масштаб; переполнение полей отклоняется, а runtime сохраняет memory guard.
+
+### 4.2. Формат и выбор набора
+
+Набор содержит `dataset.manifest` с версией `CRYSTAL_SSB_NATIVE_1`, SF,
+идентификатором генератора, реальными row counts, именами/типами/ширинами колонок.
+Загрузчик проверяет manifest и все размеры **до GPU allocations**. Пример SF10:
 
 | Таблица | Строк | Файлы |
 | --- | ---: | --- |
@@ -265,47 +314,38 @@ PCH готовится при build/install, а не заново при каж�
 - Flags — ASCII `'0'`/`'1'`, один байт на строку.
 - FixedText — фиксированная ширина из схемы, декодирование до bounded NUL либо
   на всю ширину; содержимое должно быть валидным UTF-8.
-- City/nation/region и manufacturer/category/brand уже представлены числовыми
-  кодами физической схемы. Остальные Text-колонки нельзя заменять Int32-словарём.
+- Все исходные строки, в том числе city/nation/region и manufacturer/category/brand,
+  остаются **настоящим Text**. Никакого словаря или скрытых Int32-категорий нет.
+- День недели занимает 9 байт: `Wednesday` сохраняется целиком; brand — до 10 байт.
 
 Быстрая проверка трёх характерных размеров:
 
 ```bash
 stat -c '%n: %s bytes' \
-  data/10/LINEORDER5 data/10/CUSTOMER7 data/10/DDATE16
+  data/ssb/sf10/LINEORDER5 data/ssb/sf10/CUSTOMER7 data/ssb/sf10/DDATE16
 ```
 
 Для указанного SF10 ожидаются **239944868**, **3000000**, **2557** байт
 соответственно. Это только предварительная проверка, не валидация всех данных.
 Остальные файлы, размеры и Text также проверяются загрузчиком.
 
-Если готовый набор находится вне проекта, а `data/10` ещё не существует:
+Выбор SF не требует пересборки. Передайте каталог через env или config:
 
 ```bash
-mkdir -p data
-test ! -e data/10 && test ! -L data/10 &&
-  ln -s /absolute/path/to/converted-sf10 data/10
+CRYSTAL_DATA_DIR="$ROOT/data/ssb/sf1" "$BUILD/db_cli" < test/queries/sql/q33.sql
 ```
 
-Не заменяйте существующий набор, не удаляйте его ради smoke test.
+Default config: `data_dir = ./data/ssb/sf10`; `CRYSTAL_DATA_DIR` приоритетнее.
+Относительный путь считается от cwd, абсолютный не зависит от cwd. Статистика
+числовых колонок кешируется отдельно внутри выбранного набора
+(`.crystal-numeric-stats-v1`), а не в общем SF10-кеше; read-only набор работает
+без записи кеша. Статистика не является постоянным кешем SQL-модулей.
 
-### 4.2. Ограничение старых инструментов подготовки
-
-`bench/ssb-dbgen` — отдельный submodule; для его исходников нужен
-`git submodule update --init bench/ssb-dbgen`. Но получение `.tbl` через dbgen
-**ещё не создаёт** описанный выше набор бинарных колонок.
-
-**Не используйте `bench/loader/load_modified.c` как готовую подготовку данных
-для текущего Text-движка:** он пишет `CUSTOMER7` через `strtol`/`sizeof(int)`,
-тогда как нужен FixedText шириной 10. Опция `--encode-mktsegment` у
-`bench/loader/convert.py` также не подходит этому контракту. В этом руководстве
-не заявляется проверенный end-to-end импорт из dbgen; используйте совместимый
-подготовленный набор. Исправление legacy loader — отдельная работа.
-
-У CLI нет опции `--data`, а изменение окружения `BASE_PATH` не меняет бинарник:
-`BASE_PATH` — compile definition. `--data` у некоторых Python/manual-клиентов
-не перенастраивает путь загрузки уже собранного SQL CLI. Другой SF нельзя
-включить простым runtime-флагом.
+Прежний `data/10/`, старый `bench/loader/load_modified.c`/`convert.py` и числовые
+`test/queries/result/scale10` сохранены **как исторические**. Они не совместимы
+с native manifest/Text-схемой и не выбираются автоматически. Перекодировать их
+поверх существующих файлов нельзя — создайте новый набор. CLI по-прежнему не
+разбирает `--data`; используйте `CRYSTAL_DATA_DIR`.
 
 <a id="run"></a>
 
@@ -323,13 +363,17 @@ RUN=$(mktemp -d "$ROOT/build/smoke/run-XXXXXXXX")
 printf 'Artifacts: %s\n' "$RUN"
 cp crystal.conf.example "$RUN/crystal.conf"
 export CRYSTAL_CONFIG="$RUN/crystal.conf"
+export CRYSTAL_DATA_DIR="$ROOT/data/ssb/sf10"
 export CRYSTAL_PCUDA_MANIFEST="$BUILD/pcuda-jit/toolchain.manifest"
 export CRYSTAL_JIT_OVERLAP_EXPERIMENT=off
 export ACPP_APPDB_DIR="$RUN/device-cache"
 export LC_ALL=C
 ```
 
-`RUN` нужен для следующих примеров; сохраните напечатанные runners пути.
+`RUN` нужен для примеров, которые явно используют эту переменную; сохраните
+напечатанные runners пути. В новой оболочке переменные `ROOT`/`BUILD`/`RUN` нужно
+задать снова. Не передавайте `"$RUN/…"`, если `RUN` не задан: получится путь `/…`
+в корне файловой системы. Самостоятельный quick test без этих переменных — в 6.1.
 Некоторые текущие runners сами используют `/tmp/opencode`, поэтому этот каталог
 должен существовать и быть доступен вашему пользователю. Чужие права не меняйте.
 Новый `ACPP_APPDB_DIR` изолирует device JIT-cache; OS/HIP/driver caches не очищаются.
@@ -429,6 +473,7 @@ match — ошибка, не молчаливый CPU fallback.
 | `jit_artifact_dir` | Родитель приватного каталога сессии; пусто — системный temporary directory |
 | `jit_traces` | Clang/LLD traces для диагностики; default off |
 | `pcuda_manifest` | Явный PCH/toolchain manifest; env `CRYSTAL_PCUDA_MANIFEST` приоритетнее |
+| `data_dir` | Native dataset; default `./data/ssb/sf10`, env `CRYSTAL_DATA_DIR` приоритетнее |
 | `dump_generated_code` | Генерировать код вместо запроса; для SQL-проверок нужен off |
 | `extended_timing` | Подробные таймеры; эквивалент настройки `\timing` |
 | `output_limit` | Default 1000; `off`/`all` отключают ограничение вывода |
@@ -444,60 +489,82 @@ Boolean принимает `on/off`, `true/false`, `yes/no`, `1/0`. Неизве
 
 ## 6. Быстро проверить SSB
 
-Все команды ниже предполагают готовые данные и окружение раздела 5.1.
-Не запускайте GPU-клиенты параллельно друг другу.
+Нужны готовые native данные и собранный движок. Пример 6.1 самодостаточен и не
+требует переменных раздела 5.1; остальные примеры с `BUILD`/`RUN`/`CRYSTAL_DATA_DIR`
+предполагают их предварительную настройку. Все команды выполняются **из корня
+репозитория**, не из `test/ssb_native_data/`. Не запускайте GPU-клиенты параллельно.
 
 <a id="ssb-sql"></a>
 
-### 6.1. Все 13 SQL, один процесс, сравнение с эталонами
+### 6.1. Все 13 SQL и manual с независимыми Text-oracles
 
 Рекомендуемая быстрая проверка: каждый запрос два раза — первый запуск и reuse.
-Данные загружаются один раз на всю сессию:
+Данные загружаются один раз на всю сессию. Ниже используется build-каталог
+`build/pcuda-release` из раздела 3; если вы собирали в `build/`, замените этот путь
+в обеих командах на `build/`:
 
 ```bash
-python3 test/pcuda_stage5/validate_cli.py \
-  --db-cli "$BUILD/db_cli" \
-  --mode ssb --runs 2 \
-  --timing-model pcuda-modules-v1 \
-  --output-root "$RUN/sql-ssb"
+cmake --build build/pcuda-release -j4
+python3 test/ssb_native_data/validate.py \
+  --build build/pcuda-release --data data/ssb/sf10 --trials 2 \
+  --timing-model pcuda-modules-v1
 ```
 
-Минимальный smoke без проверки повторного запуска: замените `--runs 2` на
-`--runs 1`. При `--runs 1` значение `warm_reuse_verified` не подтверждает reuse:
-проверять было нечего. Это не серия независимых cold-процессов на каждый SQL:
-общие service kernels могут переиспользоваться между запросами.
+Первая команда обязательна, если ранее собирался только target `db_cli`: default
+runner проверяет **SQL и manual**, поэтому нужны все `ssb_qNN` и CPU oracle
+`bench/loader/ssb_reference`. Перед запуском SQL runner проверяет их наличие и
+выдаёт команду сборки, если чего-то не хватает; сам он сборку не запускает.
 
-Runner печатает `Artifacts: .../ssb-plain-...`. В этом каталоге:
+Без `--output-root` runner сам создаёт результаты в
+`build/ssb-native-validation/native-*`, каждый запуск — в отдельном каталоге.
+Можно явно добавить `--output-root build/sql-ssb`; для этого `RUN` не нужен.
+Не используйте `sudo` для обхода ошибки `/sql-ssb`: исправьте пустую переменную
+или уберите `--output-root`, как в примере выше.
+
+Минимальный smoke: `--trials 1`; только SQL: `--sql-only`. Для SQL-only ручные
+`ssb_qNN` не нужны, но `db_cli` **и** CPU reference target `ssb_reference` обязательны.
+Они входят в полную сборку. Нужен только стандартный Python;
+NumPy требуется при добавлении `--manifest` и для широкой Text-регрессии.
+SQL исполняются в одной сессии, manual — отдельным процессом на запрос.
+Второй SQL проверяется нулевыми codegen/compiler/link/load/symbol counters.
+Один trial не доказывает reuse. Это не серия независимых cold-процессов.
+
+Runner печатает `Artifacts: .../native-...`. В этом каталоге:
 
 - `report.json` — каждый запрос, строки результата, статус, ошибки, таймеры и counters;
-- `stdout.txt`, `stderr.txt`, `stdin.sql` — полная сессия;
-- `process.time.json` — native время всего процесса, **не** SQL summary;
+- `sql/stdout.txt`, `sql/stderr.txt`, `sql/stdin.sql` — SQL-сессия;
+- `qNN/` — команды и результаты отдельных manual-клиентов;
+- `reference.json` — свежий независимый CPU oracle; `oracle.*` — его команда/вывод;
+- `*/native.time` — native время всего процесса, **не** SQL summary;
 - сохранённые JIT-команды/модули и приватный device-cache.
 
-Для совместимого SF10 ожидается особенность: **24/26 file matches** при двух
-повторах либо **12/13** при одном. Только Q1.1 не совпадает с историческим файлом.
-Из-за него runner возвращает **exit code 1** и `success:false`. Не заменяйте это
-на общий success и не игнорируйте другие failures; выполните независимую проверку
-ниже. При `set -e` учитывайте этот ненулевой статус отдельно.
+Ожидается **26/26 SQL payload checks и 26 manual результатов** при двух trials.
+Города/страны/brands сравниваются как строки, не как числовые коды. Числовые
+`scale10/*.txt` не являются oracle нового формата. Любое новое несовпадение даёт
+ненулевой статус; нет исключения, скрывающего ошибку Q1.1.
+
+Если подготовка выполнялась с `--keep-tbl`, можно дополнительно сверить **каждое
+поле всех 58 колонок** с оригиналом: добавьте `--tables /path/to/prepare-ID/tables`.
+Это потоковая CPU-проверка после завершения GPU-процессов, вне SQL summary.
+Для current/current_heavy manifest и целевых dimension-проверок добавьте `--manifest`.
+Oracle строится заново для выбранного набора; готовый чужой reference не подставляется.
 
 ### 6.2. Почему Q1.1 отличается и как проверить
 
 [`q11.sql`](../test/queries/sql/q11.sql) включает `1994-01-01`, а ручная
 реализация/`scale10/11.txt` — только 1993 год. Это известная граница, не повод
-менять SQL или эталонный файл. Свежий независимый CPU oracle:
+менять SQL или эталонный файл. Новый runner из 6.1 проверяет **обе границы**
+раздельно: `reference.json` содержит `sql.q11` и `manual.q11`. Чтобы получить
+CPU-результаты отдельно от GPU:
 
 ```bash
-"$CXX" -std=c++17 -O3 ${HOST_FLAGS:+$HOST_FLAGS} \
-  test/pcuda_stage0/q11_reference.cpp -o "$RUN/q11-reference"
-"$RUN/q11-reference" "$ROOT/data/10" > "$RUN/q11-oracle.json"
-cat "$RUN/q11-oracle.json"
+cmake --build "$BUILD" --target ssb_reference -j4
+"$BUILD/bench/loader/ssb_reference" "$CRYSTAL_DATA_DIR" > "$RUN/ssb-reference.json"
 ```
 
-Для проверенного набора: `sql_q11=4486422947100`, `year_1993=4474878955766`,
-`january_1_1994=11543991334`. Сверьте результат Q1.1 в `report.json` с **новым**
-`sql_q11` своего oracle, а не только с этой напечатанной константой. Должно
-выполняться `sql_q11 = year_1993 + january_1_1994`. Остальные 12 запросов должны
-совпадать с файлами, с сохранением повторяющихся строк.
+Разница включает вклад `1994-01-01` и зависит от выбранного набора/SF. Исторические
+failed file comparisons сохранены в старых отчётах; новый независимый oracle не
+делает их успешными задним числом.
 
 <a id="ssb-manual"></a>
 
@@ -507,7 +574,7 @@ cat "$RUN/q11-oracle.json"
 
 ```bash
 cmake --build "$BUILD" --target ssb_q33 -j4
-"$BUILD/ssb_q33" "$ROOT/data/10" 1
+"$BUILD/ssb_q33" "$CRYSTAL_DATA_DIR" 1
 ```
 
 Формат: `ssb_qNN [data-directory [trials]]`; default trials 4, допустимо 1–1000.
@@ -520,16 +587,18 @@ Targets: `ssb_q11`, `ssb_q12`, `ssb_q13`, `ssb_q21`, `ssb_q22`, `ssb_q23`,
 cmake --build "$BUILD" --target \
   ssb_q11 ssb_q12 ssb_q13 ssb_q21 ssb_q22 ssb_q23 \
   ssb_q31 ssb_q32 ssb_q33 ssb_q34 ssb_q41 ssb_q42 ssb_q43 -j4
-python3 test/pcuda_stage7/validate.py manual \
-  --build "$BUILD" --data "$ROOT/data/10" --trials 1 \
+python3 test/ssb_native_data/validate.py \
+  --build "$BUILD" --data "$CRYSTAL_DATA_DIR" --trials 1 \
   --timing-model pcuda-modules-v1 \
   --output-root "$RUN/manual-ssb"
 ```
 
-Ожидается **13/13** независимых file matches. Для обычных четырёх повторов
-поставьте `--trials 4`: получится 52 проверки. Ручной Q1.1 использует границу
-эталона и совпадает с ним. Эти реализации требуют nonnullable input и уникальные
-dimension keys; это не заменяет SQL-проверки NULL/MHT/OR.
+Runner проверит также SQL. У manual все 13 результатов должны совпасть со свежим
+CPU oracle. Для четырёх повторов поставьте `--trials 4`. Ручной вывод — JSON-массивы
+между `__SSB_RESULT_BEGIN__`/`__SSB_RESULT_END__`; Text остаётся строками. Без явного
+аргумента каталог выбирается так же, как в CLI, через config/env. Эти реализации
+требуют nonnullable input и уникальные dimension keys; это не заменяет SQL-проверки
+NULL/MHT/OR. Ссылки на строки в PHT/group table — не словарное кодирование Text.
 
 Время `Query CPU-ready ms` относится к ручной реализации, **не** к SQL parse,
 codegen и сборке SQL-модулей. Prebuilt GPU-код всё ещё может требовать первого
@@ -572,9 +641,11 @@ python3 test/pcuda_stage8/validate.py \
 ```
 
 Набор включает GPU/resource/ABI/NULL, Text, все SSB, manual и current/current_heavy
-manifest. Родительский отчёт отдельно допускает прежний Q1.1 mismatch, но сохраняет
-`full_file_parity:false` и исходный failed SSB child report; CPU oracle запускайте
-отдельно. Категории `future` автоматически не становятся поддерживаемыми.
+manifest. Он использует новый native SSB validator, самостоятельно проверяющий обе
+границы Q1.1; старые numeric file reports не изменяются. `full_file_parity:false`
+по-прежнему не обещает oracle каждого поля произвольного manifest-запроса.
+`--data PATH` выбирает набор для всей серии. Категории `future` автоматически не
+становятся поддерживаемыми.
 Исторический `test/pcuda_stage7/validate.py storage` проверял прежний numeric-only
 этап с Text rejection; не используйте его как текущую общую Text-регрессию.
 
@@ -605,42 +676,27 @@ CRYSTAL_JIT_OVERLAP_EXPERIMENT=on \
 ```
 
 Это меняет runtime-путь на `pcuda-modules-overlap-exp-v1`, но не включает replay,
-parallel S2 или jobs>4. Default остаётся off. Для stage-5 runner выбирайте
+parallel S2 или jobs>4. Default остаётся off. Для native SSB runner выбирайте
 `--timing-model pcuda-modules-overlap-exp-v1`: он сам выставит соответствующий
 env override. Общему CSV runner нужны **и env override, и matching timing model**;
 его `--timing-model` сам по себе не включает оптимизацию. В эксперименте
 build/load/execution перекрываются, component sums/residuals — null.
 Результаты и границы — [8-ANALYSIS](../test/pcuda_stage8_analysis/REPORT.md).
 
-### 7.3. Настоящая cold/warm-серия — не quick test
+### 7.3. Производительность после смены формата
 
-Нужен отдельный native first-result launcher. Для штатного пути:
+Прежние `test/pcuda_stage8/measure.py`/stage-5 numeric file validators и измерения
+относятся к старой кодированной схеме. Их нельзя применять как Text oracle или
+сопоставимый baseline нового алгоритма. Новая correctness-серия не утверждает SLA,
+ускорение Text или закрытие этапа 8. Для диагностики native runner поддерживает
+`--traces` с сохранением Clang/LLD traces, но такие времена не являются plain baseline.
 
-```bash
-cmake --build "$BUILD" --target db_cli pcuda_acceptance_first_result -j4
-CRYSTAL_JIT_OVERLAP_EXPERIMENT=off \
-python3 test/pcuda_stage8/measure.py measure \
-  --build "$BUILD" --output-root "$RUN/performance" \
-  --sessions 7 --runs 9 --timing-model pcuda-modules-v1
-```
-
-Это 7 cold-процессов на SQL/режим, cold +8 warm в каждом, plain/traced отдельно;
-Q3.3 дополнительно меняет параметры. **Не запускайте** рядом сборки, другие GPU
-клиенты, CPU oracles или online-анализ. После завершения **всей** серии запустите
-oracle из 6.2 и отдельный анализ, подставив напечатанный каталог `ssb-series-*`:
-
-```bash
-python3 test/pcuda_stage8/measure.py analyze \
-  --series "$RUN/performance/ssb-series-ID" \
-  --q11-oracle "$RUN/q11-oracle.json" \
-  --output "$RUN/performance-analysis"
-```
-
-Проверку oracle после серии выполните заново; не запускайте измеритель поверх
-исторических raw. Для небольшой диагностической серии можно выбрать `--query q33`,
-но её нельзя выдавать за проверку всех 13. Методика и ограничения —
-[отчёт этапа 8](../test/pcuda_stage8/REPORT.md). Числа прототипов и единичные smoke
-timings не являются SLA полного SQL.
+Для новой performance-приёмки отдельно согласуются нагрузка и цели. Обязательны
+непрерывный summary, native process timing, раздельные cold/warm, минимум семь
+независимых cold-процессов и восемь warm на каждый, plain/traced серии с ротацией,
+состояние всех кешей и offline oracle после **всей** серии. Не запускайте рядом
+сборки, GPU-клиенты или online-анализ. Историческая методика и ограничения —
+[отчёт этапа 8](../test/pcuda_stage8/REPORT.md) и [timing.md](../timing.md).
 
 <a id="install"></a>
 
@@ -668,7 +724,8 @@ Clang PCH хранит абсолютные пути. Нельзя просто 
 4. build-tree manifest, встроенный при сборке.
 
 Чтобы предыдущий smoke env не выбрал build-tree PCH, укажите installed manifest
-явно. Рабочий каталог по-прежнему корень проекта с `data/10/`:
+явно. Для относительного `data_dir` рабочий каталог — корень проекта;
+`CRYSTAL_DATA_DIR` с абсолютным путём позволяет выбрать набор из любого cwd:
 
 ```bash
 CRYSTAL_PCUDA_MANIFEST="$PREFIX/lib/crystal/pcuda-jit/toolchain.manifest" \
@@ -687,13 +744,15 @@ CRYSTAL_PCUDA_MANIFEST="$PREFIX/lib/crystal/pcuda-jit/toolchain.manifest" \
 | `libsqlparser.so`/`libacpp-rt.so` not found | `ldd`, build/install RPATH, окружение установленного SDK; не смешивать версии runtime |
 | Manifest/PCH несовместим | Выбранный manifest, прежние env overrides, compiler/flags/headers; пересобрать `cmake --build "$BUILD" --target pcuda_jit_pch`, при смене toolchain — новая конфигурация |
 | После build PCH всё ещё отклонён | Посмотреть конкретный fingerprint mismatch; не удалять manifest и не отключать проверки, runtime сам PCH не пересоздаёт |
-| Нет `data/10/...` | Рабочий каталог, готовые бинарные колонки, правильные имена; не запускать через `cd build` |
+| Нет `dataset.manifest` или неверная схема | Выбранный `data_dir`/`CRYSTAL_DATA_DIR`; создать новый native набор через `bench/prepare_ssb.sh`, не подсовывать старый `data/10` |
 | Неверный размер `CUSTOMER7` | Нужен Text 10 bytes/row, не старое Int32-кодирование |
-| Ожидали SF1/SF20 | Обычный CLI использует фиксированные SF10 размеры; runtime scale-флага нет |
+| Ожидали другой SF | Создать новый набор `--scale SF`, выбрать его каталог; row counts берутся из manifest, runtime-флаг SF не нужен |
 | Memory guard/OOM | Свободную GPU/UMA и host memory, лишние клиенты, корректность размеров данных; сохранять guard включённым |
 | Есть код, но нет результата | `\dump off`; `\dump on` генерирует исходники вместо исполнения |
 | Результат обрезан | `\limit all` либо достаточный `output_limit` перед сравнением |
-| SSB runner завершился с 1 | Смотреть `report.json`: допустимо только отдельно проверенное Q1.1 расхождение, не любые ошибки |
+| Native SSB runner завершился с 1 | Смотреть `report.json`: это ошибка исполнения/oracle/reuse. Обе границы Q1.1 проверяются отдельно, исключения для mismatch нет |
+| `PermissionError: '/sql-ssb'` | `RUN` пуст: `"$RUN/sql-ssb"` стал `/sql-ssb`. Убрать `--output-root` или указать `--output-root build/sql-ssb`; `sudo` не нужен |
+| Не найден `ssb_q11` / `ssb_reference` | Собран только CLI или выбран другой build-каталог. Выполнить `cmake --build build -j4` для своего `--build`; default проверяет SQL и manual, а SQL-only всё равно требует CPU oracle |
 | Ошибка каталога `/tmp/opencode` | Создать доступный своему пользователю каталог; не менять права чужих файлов |
 
 Не используйте старый [`test_db_cli.sh`](../test_db_cli.sh) как основной quick
@@ -705,7 +764,19 @@ runner: он меняет cwd на `build`, пишет только логи и 
 
 <a id="verified"></a>
 
-## 10. Проверка команд — 2026-11-15
+## 10. Проверка команд
+
+### Native datasets — 2026-11-15–16
+
+Сборка/запуск после перехода проверены на AMD Radeon 780M: Release **20/20 CTest**,
+CPU-only **18/18**, host-only preparation и тесты публичного скрипта, малый набор,
+SF1 и SF10, все 13 SQL/manual с независимыми Text-oracles, широкая GPU-регрессия
+и plain/traced Text-сессии. Все 58 колонок новых наборов сверены с исходными `.tbl`.
+Подробные scope, hashes, raw, quality gates и ограничения —
+[один основной отчёт интеграции](../test/ssb_native_data/REPORT.md).
+Это не performance-серия и не закрытие этапа 8.
+
+### Историческая проверка инструкции до перехода формата — 2026-11-15
 
 На стенде AMD Radeon 780M, Clang/LLVM 17 из ROCm SDK 6.1.2 и установленном
 AdaptiveCpp проверены новые, отдельные build-каталоги:

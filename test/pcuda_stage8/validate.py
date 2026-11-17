@@ -20,6 +20,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--build", type=Path, required=True)
     parser.add_argument("--output-root", type=Path, required=True)
+    parser.add_argument("--data", type=Path, default=ROOT / "data/ssb/sf10")
     parser.add_argument("--timing-model", choices=("pcuda-modules-v1","pcuda-modules-overlap-exp-v1"), required=True)
     args = parser.parse_args()
     args.output_root.mkdir(parents=True, exist_ok=True)
@@ -28,8 +29,10 @@ def main():
     env = dict(os.environ, LC_ALL="C", TMPDIR="/tmp/opencode", ACPP_ADAPTIVITY_LEVEL="1", ACPP_ALLOCATION_TRACKING="1", PYTHONDONTWRITEBYTECODE="1")
     overlap=args.timing_model=="pcuda-modules-overlap-exp-v1"
     env["CRYSTAL_JIT_OVERLAP_EXPERIMENT"]="on" if overlap else "off"
+    env["CRYSTAL_DATA_DIR"] = str(args.data.resolve())
     os.environ.update({name:env[name] for name in ("LC_ALL", "TMPDIR", "ACPP_ADAPTIVITY_LEVEL", "ACPP_ALLOCATION_TRACKING", "PYTHONDONTWRITEBYTECODE")})
     os.environ["CRYSTAL_JIT_OVERLAP_EXPERIMENT"]=env["CRYSTAL_JIT_OVERLAP_EXPERIMENT"]
+    os.environ["CRYSTAL_DATA_DIR"]=env["CRYSTAL_DATA_DIR"]
     records = []
     for target in ("test_pcuda_text_resources", "test_pcuda_primitives_sql", "test_gpu_plan", "test_pcuda_sql_modules",
                    "test_pcuda_runtime_parameters", "test_pcuda_primitives_gpu", "test_pcuda_gpu_runtime", "test_manual_ssb_gpu"):
@@ -45,11 +48,9 @@ def main():
         print(target, record["success"], flush=True)
     jobs = [
         ("text-gpu", ["test/pcuda_stage7_text/validate_gpu.py", "--build", build]),
-        ("text-cli-plain", ["test/pcuda_stage7_text/validate_cli.py", "--build", build, "--timing-model",args.timing_model]),
-        ("text-cli-traced", ["test/pcuda_stage7_text/validate_cli.py", "--build", build, "--traces", "--timing-model",args.timing_model]),
-        ("ssb", ["test/pcuda_stage5/validate_cli.py", "--db-cli", build / "db_cli", "--mode", "ssb", "--runs", "3", "--timing-model",args.timing_model]),
-        ("manual", ["test/pcuda_stage7/validate.py", "manual", "--build", build, "--timing-model", "pcuda-modules-v1"]),
-        ("manifest", ["test/pcuda_stage5/validate_cli.py", "--db-cli", build / "db_cli", "--mode", "manifest", "--runs", "1", "--timing-model",args.timing_model]),
+        ("text-cli-plain", ["test/pcuda_stage7_text/validate_cli.py", "--build", build, "--data", args.data, "--timing-model",args.timing_model]),
+        ("text-cli-traced", ["test/pcuda_stage7_text/validate_cli.py", "--build", build, "--data", args.data, "--traces", "--timing-model",args.timing_model]),
+        ("native-ssb-manual-manifest", ["test/ssb_native_data/validate.py", "--build", build, "--data", args.data, "--manifest", "--trials", "3", "--timing-model",args.timing_model]),
     ]
     for name, argv in jobs:
         directory = output / name
@@ -60,15 +61,11 @@ def main():
             result = subprocess.run(argv, cwd=ROOT, env=env, stdout=stdout, stderr=stderr)
         reports = list(directory.glob("*/report.json"))
         record = dict(name=name, returncode=result.returncode, reports=[str(p.relative_to(output)) for p in reports], success=result.returncode == 0 and len(reports) == 1)
-        if name == "ssb" and len(reports) == 1:
-            raw = json.loads(reports[0].read_text())
-            failures = [r for r in raw["records"] if not r["success"]]
-            record["known_q11_file_mismatch_only"] = len(failures) == 3 and all(r["id"] == f"q11-{i}" and r["error"] == "SF10 reference mismatch" for i,r in enumerate(failures)) and raw["warm_reuse_verified"]
         records.append(record)
         print(name, record, flush=True)
-    complete = all(r["success"] or (r["name"] == "ssb" and r.get("known_q11_file_mismatch_only")) for r in records)
+    complete = all(r["success"] for r in records)
     (output / "report.json").write_text(json.dumps(dict(functional_checks_passed=complete, full_file_parity=False,timing_model=args.timing_model, records=records,
-        note="The SSB runner's original success:false and Q1.1 mismatches remain unchanged. Run the independent Q1.1 CPU oracle separately; manifest is execution parity, not an oracle of every cell."), indent=2) + "\n")
+        note="Native datasets use fresh independent Text SSB oracles for both Q1.1 date bounds. Historical numeric file mismatches/reports are unchanged; other manifest checks are execution parity, not an oracle of every cell."), indent=2) + "\n")
     print(output, flush=True)
     return 0 if complete else 1
 

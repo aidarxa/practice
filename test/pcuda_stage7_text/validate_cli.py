@@ -19,10 +19,10 @@ from validate import process, module, unexpected_diagnostics
 
 # Independent physical source description; deliberately not imported from the C++ schema.
 SOURCES = {
-    "customer": [("c_custkey",0),("c_name",25),("c_address",25),("c_city",0),("c_nation",0),("c_region",0),("c_phone",15),("c_mktsegment",10)],
-    "supplier": [("s_suppkey",0),("s_name",25),("s_address",25),("s_city",0),("s_nation",0),("s_region",0),("s_phone",15)],
-    "part": [("p_partkey",0),("p_name",22),("p_mfgr",0),("p_category",0),("p_brand1",0),("p_color",11),("p_type",25),("p_size",0),("p_container",10)],
-    "ddate": [("d_datekey",0),("d_date",18),("d_dayofweek",8),("d_month",9),("d_year",0),("d_yearmonthnum",0),("d_yearmonth",7),("d_daynuminweek",0),("d_daynuminmonth",0),("d_daynuminyear",0),("d_monthnuminyear",0),("d_weeknuminyear",0),("d_sellingseason",12),("d_lastdayinweekfl",-1),("d_lastdayinmonthfl",-1),("d_holidayfl",-1),("d_weekdayfl",-1)]
+    "customer": [("c_custkey",0),("c_name",25),("c_address",25),("c_city",10),("c_nation",15),("c_region",12),("c_phone",15),("c_mktsegment",10)],
+    "supplier": [("s_suppkey",0),("s_name",25),("s_address",25),("s_city",10),("s_nation",15),("s_region",12),("s_phone",15)],
+    "part": [("p_partkey",0),("p_name",22),("p_mfgr",6),("p_category",7),("p_brand1",10),("p_color",11),("p_type",25),("p_size",0),("p_container",10)],
+    "ddate": [("d_datekey",0),("d_date",18),("d_dayofweek",9),("d_month",9),("d_year",0),("d_yearmonthnum",0),("d_yearmonth",7),("d_daynuminweek",0),("d_daynuminmonth",0),("d_daynuminyear",0),("d_monthnuminyear",0),("d_weeknuminyear",0),("d_sellingseason",12),("d_lastdayinweekfl",-1),("d_lastdayinmonthfl",-1),("d_holidayfl",-1),("d_weekdayfl",-1)]
 }
 
 
@@ -76,7 +76,8 @@ def custom2(data):
         for year,mask in ((1998,building[keys]),(1997,furniture[keys])):
             valid_dates = np.array([date for date,mapped in year_by_date.items() if mapped==year],dtype=np.int32)
             selected = mask & np.isin(when,valid_dates)
-            totals[year] += int(value[selected].sum(dtype=np.int64))
+            if np.any(selected):
+                totals[year] += int(value[selected].sum(dtype=np.int64))
     return list(totals.items())
 
 
@@ -94,7 +95,7 @@ def workload():
         "SELECT p_color,p_category,COUNT(*),SUM(p_size) FROM part GROUP BY p_color,p_category ORDER BY 1,2 LIMIT 32",
         "SELECT COUNT(*),d_dayofweek FROM ddate GROUP BY d_dayofweek ORDER BY 2 DESC",
         "SELECT d_sellingseason,COUNT(*),MIN(d_date),MAX(d_date) FROM ddate GROUP BY d_sellingseason HAVING COUNT(*)>0 ORDER BY 1",
-        "SELECT CASE WHEN c_region<2 THEN c_mktsegment ELSE 'other' END,COUNT(*) FROM customer GROUP BY CASE WHEN c_region<2 THEN c_mktsegment ELSE 'other' END ORDER BY 1",
+        "SELECT CASE WHEN c_region<'ASIA' THEN c_mktsegment ELSE 'other' END,COUNT(*) FROM customer GROUP BY CASE WHEN c_region<'ASIA' THEN c_mktsegment ELSE 'other' END ORDER BY 1",
         "SELECT c_name,c_address FROM customer WHERE c_name<'Customer#000000008' ORDER BY 1",
     )):
         add(sql)
@@ -121,10 +122,11 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--timing-model",choices=("pcuda-modules-v1","pcuda-modules-overlap-exp-v1"),default="pcuda-modules-v1")
     parser.add_argument("--build",type=Path,required=True)
-    parser.add_argument("--data",type=Path,default=ROOT/"data/10")
+    parser.add_argument("--data",type=Path,default=ROOT/"data/ssb/sf10")
     parser.add_argument("--output-root",type=Path,required=True)
     parser.add_argument("--traces",action="store_true")
     args = parser.parse_args()
+    os.environ["CRYSTAL_DATA_DIR"] = str(args.data.resolve())
     os.environ["CRYSTAL_JIT_OVERLAP_EXPERIMENT"]="on" if args.timing_model=="pcuda-modules-overlap-exp-v1" else "off"
     args.output_root.mkdir(parents=True,exist_ok=True)
     output = Path(tempfile.mkdtemp(prefix="text-cli-traced-" if args.traces else "text-cli-plain-",dir=args.output_root.resolve()))

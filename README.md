@@ -1,7 +1,7 @@
 # Crystal — PCUDA SQL engine
 
 **[Сборка, запуск и быстрая проверка SSB — подробное руководство на русском](docs/BUILD_AND_RUN.md).**
-It covers GPU Release/Debug and CPU-only builds, dependencies, SF10 data,
+It covers GPU Release/Debug and CPU-only builds, dependencies, selectable-scale data,
 interactive/batch SQL, manual SSB, result validation, installation and troubleshooting.
 For a quick check, start with [the SSB recipes](docs/BUILD_AND_RUN.md#ssb);
 the known Q1.1 file/oracle difference is explained there.
@@ -94,11 +94,29 @@ See `crystal.conf.example`, [timing.md](timing.md), and the
 
 ## SSB storage and manual examples
 
-`include/storage/ssb_schema.h` describes the converted SF10 files, including all
+Generate a ready-to-use dataset with **one command**, without a GPU or engine build:
+
+```bash
+bash bench/prepare_ssb.sh                        # SF10 -> data/ssb/sf10
+# Or choose a scale and a new output directory:
+bash bench/prepare_ssb.sh --scale 1 --output data/ssb/sf1
+CRYSTAL_DATA_DIR="$PWD/data/ssb/sf1" build/db_cli < test/queries/sql/q33.sql
+```
+
+The script initializes the pinned `ssb-dbgen` submodule if missing, builds it and
+the host-only C++17 importer, generates all five tables, validates every value,
+then atomically publishes the columns and `dataset.manifest`. Existing output is
+**never overwritten**. Requirements: Git, Bash, CMake and a C/C++17 toolchain;
+the first submodule initialization needs network access. `--keep-tbl` retains raw
+tables; `--from-tbl DIRECTORY` imports existing dbgen output without regeneration.
+Build commands/logs remain under the printed `build/ssb-tools/prepare-*` directory.
+
+`include/storage/ssb_schema.h` describes the native unencoded files, including all
 17 DDATE columns. Numeric Int32 files must have the exact expected length;
 ASCII byte flags are decoded from `'0'`/`'1'` into Int32 values 0/1. No prefix
-truncation or manufactured zero tail is used. Existing numeric city/nation/brand
-codes are unchanged. FixedText is decoded to validated UTF-8 **Text**, never an
+truncation or manufactured zero tail is used. City/nation/region and manufacturer/
+category/brand retain their **original Text**, not numeric codes. FixedText is decoded
+to validated UTF-8 **Text**, never an
 integer/dictionary code: the first bounded NUL ends a value, otherwise the full
 width is used. The physical tail is ignored; trailing spaces are significant.
 NULL is separate from the empty string. Comparisons use unsigned UTF-8 bytes,
@@ -122,25 +140,31 @@ evidence and limitations. `custom2.sql` now uses the approved
 `'BUILDING'`/`'FURNITURE'` literals. Historical failures are retained; this does not
 close stage 8 or establish full-SQL performance targets.
 
-Data defaults to `data/10/` relative to the working directory. A deployment can
-override the existing `BASE_PATH` compile definition; manual examples also accept
-the directory directly:
+Data defaults to `data/ssb/sf10` relative to the working directory. Set runtime
+`data_dir` or `CRYSTAL_DATA_DIR` to select a dataset; actual row counts and schema
+come from its mandatory manifest, before GPU allocations. The old `data/10/`,
+encoded loader and numeric reference files are historical, not native-format inputs.
+Manual examples also accept the directory directly:
 
 ```bash
 cmake --build build --target ssb_q33 test_manual_ssb_gpu -j4
-build/ssb_q33 "$PWD/data/10" 4
+build/ssb_q33 "$PWD/data/ssb/sf10" 4
 build/test_manual_ssb_gpu
-python3 test/pcuda_stage7/validate.py manual --build build \
-  --output-root build/stage7-check --timing-model pcuda-modules-v1
+python3 test/ssb_native_data/validate.py --build build --data data/ssb/sf10 \
+  --output-root build/native-ssb-check --timing-model pcuda-modules-v1
 ```
 
 Targets `ssb_q11` through `ssb_q43` cover all thirteen queries. Shared manual
-support owns buffers/stream and supplies handwritten PHT build/fused probe kernels;
+support owns buffers/stream and supplies handwritten PHT build/fused Text probe kernels;
 it does not link the SQL parser, generator or executor. A presence buffer retains
 zero/negative sums; GPU count/scan/write fetches a compact result with checked
 capacity. Manual inputs must be nonnullable and have unique dimension keys;
 the examples explicitly reject null sidecars and duplicate keys. Engine fixtures
 separately test nullable data and nonunique joins.
+Native groups hash/compare original values; representative row references are not
+a dictionary. Typed manual result rows are JSON arrays. The independent streaming
+CPU oracle can additionally verify all 58 columns against `.tbl` using `--tables`.
+See the [native dataset integration report](test/ssb_native_data/REPORT.md).
 
 Manual Q1.1 and `scale10/11.txt` use 1993 only. The original SQL file also includes
 1994-01-01; that known difference is checked independently, not silently corrected
@@ -157,15 +181,12 @@ manifest clients; `future` is not promoted to supported SQL.
 ctest --test-dir build --output-on-failure
 python3 test/pcuda_stage8/validate.py --build build \
   --output-root build/stage8-functional --timing-model pcuda-modules-v1
-python3 test/pcuda_stage8/measure.py measure --build build \
-  --output-root build/stage8-performance --sessions 7 --runs 9 \
-  --timing-model pcuda-modules-v1
 ```
 
-Do not run builds, other GPU clients or oracle analysis alongside the performance
-series. Each query gets its own process and initially empty device cache, followed
-by eight warm executions; Q3.3 also changes parameters eight times. Analysis is a
-separate command after all measurements; see
+The older numeric-SF10 measurement scripts/results are historical and are not
+native-Text performance oracles. No performance/SLA conclusion follows from the
+format migration. Do not run builds, other GPU clients or oracle analysis alongside
+a performance series. Historical methodology and measurements are in
 [the stage-8 report](test/pcuda_stage8/REPORT.md) for reproduction and actual status.
 Cold-path/JIT analysis and the deferred warm backlog are maintained separately in
 [8-ANALYSIS](test/pcuda_stage8_analysis/REPORT.md); proposed optimizations are not

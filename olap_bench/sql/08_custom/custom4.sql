@@ -6,6 +6,6 @@ WHERE lo_custkey = c_custkey
     OR
     (lo_tax + lo_discount >= 5 AND lo_tax + lo_discount <= 10)
     OR
-    (c_region = 2 AND lo_revenue > 1000000)
+    (c_region = 'ASIA' AND lo_revenue > 1000000)
   )
 GROUP BY c_region;
