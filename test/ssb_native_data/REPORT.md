@@ -204,25 +204,23 @@ speedup, полные SQL SLA, hardware parity NVIDIA/Intel или закрыт�
 
 ## 7. Воспроизведение и оставшаяся работа
 
-Подробная инструкция — [BUILD_AND_RUN.md](../../docs/BUILD_AND_RUN.md#data).
-Для нового набора и уже собранного GPU build:
+Сначала выполните [быстрый старт](../../docs/BUILD_AND_RUN.md#quick-start).
+Для нового набора в отдельном каталоге после полной GPU-сборки:
 
 ```bash
-mkdir -p build/ssb-native-data
-RUN=$(mktemp -d build/ssb-native-data/reproduce-XXXXXXXX)
-bash bench/prepare_ssb.sh --scale 1 --output "$RUN/sf1" --keep-tbl
-CRYSTAL_DATA_DIR="$PWD/$RUN/sf1" ./build/db_cli < test/queries/sql/q33.sql
-python3 test/ssb_native_data/validate.py --build build --data "$RUN/sf1" \
-  --manifest --trials 2 --timing-model pcuda-modules-v1 --output-root "$RUN/checks"
+bash bench/prepare_ssb.sh --scale 1 --output data/ssb/reproduce-sf1 --keep-tbl
+CRYSTAL_DATA_DIR=data/ssb/reproduce-sf1 ./build/pcuda-release/db_cli < test/queries/sql/q33.sql
+python3 test/ssb_native_data/validate.py --build build/pcuda-release --data data/ssb/reproduce-sf1 \
+  --manifest --timing-model pcuda-modules-v1
 ```
 
-Для полной проверки исходных файлов добавьте `--tables` с напечатанным private
-`prepare-ID/tables`. Standalone без SQL/GPU deps:
+Каталог `data/ssb/reproduce-sf1` должен быть новым. Для проверки исходных файлов
+добавьте `--tables` с напечатанным `prepare-ID/tables`. Standalone без SQL/GPU deps:
 
 ```bash
-cmake -S bench/loader -B "$RUN/host" -DCMAKE_BUILD_TYPE=Release
-cmake --build "$RUN/host" -j4
-ctest --test-dir "$RUN/host" --output-on-failure
+cmake -S bench/loader -B build/ssb-loader -DCMAKE_BUILD_TYPE=Release
+cmake --build build/ssb-loader -j4
+ctest --test-dir build/ssb-loader --output-on-failure
 ```
 
 Для quality используйте `test/ssb_native_data/host-recipe.json` с
@@ -240,8 +238,8 @@ cross-file `dryer.py`; точные argv, compiler flags и TU choices сохр�
 
 Пользователь воспроизвёл `PermissionError: '/sql-ssb'`: пустая shell-переменная
 `RUN` превратила `"$RUN/sql-ssb"` в абсолютный путь у корня файловой системы.
-В руководстве 6.1 теперь самодостаточная команда без `RUN` и явное требование
-запуска из корня репозитория. Используется уже существующий default output root
+В той редакции руководства (§6.1) исправили команду, убрав `RUN`, и явно указали
+запуск из корня репозитория. Использовался уже существующий default output root
 `build/ssb-native-validation`; Python runner, loader и GPU-код не менялись.
 Синтаксис и shell argv проверены с незаданными переменными, без нового GPU-прогона.
 Журнал и diff: [`quickstart-docs-1q_c2kb3/`](../../build/ssb-native-data/quickstart-docs-1q_c2kb3/).
@@ -267,3 +265,34 @@ native набор снова прошёл **26/26 SQL +26/26 manual** с нез�
 C++ engine, генерация, измерительные интервалы и прежние raw не менялись; новой
 performance-приёмки нет. Команды, red/green и smoke:
 [`validator-preflight-vudcrlgh/`](../../build/ssb-native-data/validator-preflight-vudcrlgh/).
+
+<a id="quick-start-verification"></a>
+
+### Переработка руководства — 2026-11-18
+
+По запросу пользователя [быстрый старт](../../docs/BUILD_AND_RUN.md#quick-start)
+перенесён в начало руководства и README: одна конфигурация, одна полная сборка,
+однократная подготовка данных и SQL. Разработческие проверки/диагностика вынесены
+после пользовательского сценария. Для обычного запуска не задаются переменные
+Crystal/AdaptiveCpp или config overrides; остаётся установленный SDK и его
+обычное системное окружение. Код, CMake и старые наборы не менялись.
+
+На стенде из раздела 2 проверены:
+
+| Проверка | Результат |
+| --- | --- |
+| Конфигурация без явного GCC | Прошла, но полная сборка с Clang 17 и GCC 16 headers упала; нерабочая команда не вошла в быстрый старт |
+| Конфигурация и полная сборка `build/pcuda-release` | Прошли в новом каталоге с GCC 14.3.1 для host и PCH/JIT; старый `build/` не реконфигурировался |
+| `install-deps.sh` | Свежая загрузка и сборка зависимостей в отдельном каталоге; основные шаги запускались с существующим `deps/` |
+| Подготовка данных | SF0.01 успешно сгенерирован в новом каталоге; для проверок SF10 переиспользован, не пересоздавался |
+| Q3.3 прямым запуском, без runtime overrides | 24 строки, сверены с независимым CPU oracle нового прогона |
+| Native SSB validator без `--data`, `--trials` и `--output-root` | `SQL 26/26; manual 13/13; success=True`, у каждого manual по два результата; default output в `build/ssb-native-validation/` |
+
+Команды, окружение, исходный failure, stdout/stderr и сводка сохранены в
+[`build/docs-build-run/quickstart-orllh0ja/`](../../build/docs-build-run/quickstart-orllh0ja/).
+Широкая регрессия и performance-серии не повторялись. Историческая проверка
+руководства до native Text сохранена отдельно:
+[`validation-with-debug.json`](../../build/docs-build-run/run-v9qyoz3y/validation-with-debug.json).
+Там Release/CPU-only CTest **19/19 и 17/17**, Debug compile, CLI/reuse/install,
+24 SQL file matches +2 прежних Q1.1, отдельно проверенных CPU, manual **13/13**
+и 26 CSV-исполнений без сравнения payload. Эти результаты не подменяют новые.

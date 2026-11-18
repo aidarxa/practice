@@ -1,10 +1,33 @@
 # Crystal — PCUDA SQL engine
 
-**[Сборка, запуск и быстрая проверка SSB — подробное руководство на русском](docs/BUILD_AND_RUN.md).**
-It covers GPU Release/Debug and CPU-only builds, dependencies, selectable-scale data,
-interactive/batch SQL, manual SSB, result validation, installation and troubleshooting.
-For a quick check, start with [the SSB recipes](docs/BUILD_AND_RUN.md#ssb);
-the known Q1.1 file/oracle difference is explained there.
+## Quick start
+
+Run from the repository root on Linux with a GPU driver, PCUDA-capable AdaptiveCpp
+(`acpp`, `clang++` and `ld.lld` on `PATH`), CMake 3.20+, Make and Python 3.10+.
+On a fresh checkout without `deps/`, run `bash install-deps.sh` once.
+
+Configure and build (**one command each**). This example uses the tested ROCm
+SDK's Clang 17 with GCC 14.3.1 headers; see
+[other toolchains](docs/BUILD_AND_RUN.md#toolchain) if yours differs.
+
+```bash
+cmake -S . -B build/pcuda-release -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_COMPILER=clang++ -DACPP_TARGETS=generic \
+  -DCMAKE_CXX_FLAGS=--gcc-install-dir=/usr/lib/gcc/x86_64-pc-linux-gnu/14.3.1 \
+  -DCRYSTAL_PCUDA_FLAGS=--gcc-install-dir=/usr/lib/gcc/x86_64-pc-linux-gnu/14.3.1
+cmake --build build/pcuda-release -j4
+```
+
+If `data/ssb/sf10/dataset.manifest` is missing, run `bash bench/prepare_ssb.sh`
+once. Then run a query:
+
+```bash
+./build/pcuda-release/db_cli < test/queries/sql/q33.sql
+```
+
+No project environment variables or config file are needed. Run the same binary
+without input redirection for the SQL console. See the
+**[Russian guide](docs/BUILD_AND_RUN.md#quick-start)** for
+[SSB validation](docs/BUILD_AND_RUN.md#ssb) or [a smaller dataset](docs/BUILD_AND_RUN.md#data).
 
 ## Build and SQL JIT
 
@@ -29,87 +52,20 @@ GPU PCH dependency tracking requires CMake ≥3.20 or the Ninja generator.
 
 A minimal PCH and universal GPU services are prepared at build/install time, never
 silently rebuilt by a SQL query. Host code remains Release; dynamic kernels use
-`-O0`. Configure a compatible compiler/SDK and, if needed, its additional flags:
-
-```bash
-cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
-  -DAdaptiveCpp_DIR=/path/to/AdaptiveCpp/lib/cmake/AdaptiveCpp \
-  -DCRYSTAL_PCUDA_COMPILER=/path/to/AdaptiveCpp/bin/acpp \
-  -DCRYSTAL_INCLUDE_DIR="$PWD/include" \
-  -DCRYSTAL_DEPS_INCLUDE_DIR="$PWD/deps/include"
-cmake --build build -j4
-```
-
-`CRYSTAL_PCUDA_FLAGS` and `CRYSTAL_PCUDA_LINK_FLAGS` are CMake lists for the
-PCH/modules, not flags for the whole host engine. The default linker flags are
-`-fuse-ld=lld;-Wl,-O0`. The manifest fingerprints PCH dependencies, compiler,
+`-O0`. The manifest fingerprints PCH dependencies, compiler,
 plugins/runtime and compiler-affecting environment. An incompatible input causes
 a diagnostic requesting a rebuild of `pcuda_jit_pch`, not unchecked PCH reuse.
 
-CPU tests can be built without finding AdaptiveCpp (the SQL parser dependency is
-still required):
-
-```bash
-cmake -S . -B build-cpu -DCRYSTAL_BUILD_GPU=OFF -DCMAKE_BUILD_TYPE=Release
-cmake --build build-cpu -j4
-ctest --test-dir build-cpu --output-on-failure
-```
-
-### Installation and PCH selection
-
-```bash
-cmake --install build --prefix /final/deployment/prefix
-```
-
-Installation prepares a new PCH against the installed headers at the **final**
-prefix. Clang PCH contains absolute input paths: relocation/`DESTDIR` is not
-supported by this installation recipe; prepare it again after deployment.
-The compiler/SDK must remain available. Manifest selection, in priority order:
-
-1. `CRYSTAL_PCUDA_MANIFEST` environment variable;
-2. `pcuda_manifest` in the runtime config;
-3. `../lib/crystal/pcuda-jit/toolchain.manifest` relative to the executable;
-4. the build-tree manifest compiled into the engine.
-
-`jit_jobs` allows 1–4 independent compile/link chains. Each session gets a private
-temporary directory. `jit_keep_artifacts=on` retains commands, sources, modules
-and native timing logs for inspection, **not** future-process cache reuse.
-`jit_traces=on` also retains Clang/LLD traces.
-
-## Runtime configuration
-
-At startup `db_cli` reads runtime settings from the first existing file in this order:
-
-1. path from `CRYSTAL_CONFIG`
-2. `./crystal.conf`
-3. `./crystal-sycl.conf`
-4. `$HOME/.config/crystal-sycl/config.conf`
-
-`CRYSTAL_INCLUDE_DIR` and `CRYSTAL_DEPS_INCLUDE_DIR` remain accepted compatibility
-settings, but changing them at runtime does not reconfigure an already prepared
-PCH. Change its CMake inputs and rebuild instead.
-
-See `crystal.conf.example`, [timing.md](timing.md), and the
-[stage-5 report](test/pcuda_stage5/REPORT.md) for scope and reproducible checks.
+See the guide for [developer builds and tests](docs/BUILD_AND_RUN.md#build),
+[installation](docs/BUILD_AND_RUN.md#install), and
+[optional runtime settings](docs/BUILD_AND_RUN.md#config).
 
 ## SSB storage and manual examples
 
-Generate a ready-to-use dataset with **one command**, without a GPU or engine build:
-
-```bash
-bash bench/prepare_ssb.sh                        # SF10 -> data/ssb/sf10
-# Or choose a scale and a new output directory:
-bash bench/prepare_ssb.sh --scale 1 --output data/ssb/sf1
-CRYSTAL_DATA_DIR="$PWD/data/ssb/sf1" build/db_cli < test/queries/sql/q33.sql
-```
-
-The script initializes the pinned `ssb-dbgen` submodule if missing, builds it and
-the host-only C++17 importer, generates all five tables, validates every value,
-then atomically publishes the columns and `dataset.manifest`. Existing output is
-**never overwritten**. Requirements: Git, Bash, CMake and a C/C++17 toolchain;
-the first submodule initialization needs network access. `--keep-tbl` retains raw
-tables; `--from-tbl DIRECTORY` imports existing dbgen output without regeneration.
-Build commands/logs remain under the printed `build/ssb-tools/prepare-*` directory.
+`bash bench/prepare_ssb.sh` creates a ready-to-use native dataset without a GPU
+or engine build. It uses the pinned `ssb-dbgen` and a host-only C++17 importer
+to generate, validate and publish the columns and `dataset.manifest`. Existing
+output is never overwritten. See [other scales and import options](docs/BUILD_AND_RUN.md#data).
 
 `include/storage/ssb_schema.h` describes the native unencoded files, including all
 17 DDATE columns. Numeric Int32 files must have the exact expected length;
@@ -147,11 +103,7 @@ encoded loader and numeric reference files are historical, not native-format inp
 Manual examples also accept the directory directly:
 
 ```bash
-cmake --build build --target ssb_q33 test_manual_ssb_gpu -j4
-build/ssb_q33 "$PWD/data/ssb/sf10" 4
-build/test_manual_ssb_gpu
-python3 test/ssb_native_data/validate.py --build build --data data/ssb/sf10 \
-  --output-root build/native-ssb-check --timing-model pcuda-modules-v1
+./build/pcuda-release/ssb_q33 data/ssb/sf10
 ```
 
 Targets `ssb_q11` through `ssb_q43` cover all thirteen queries. Shared manual
@@ -177,11 +129,7 @@ remain separate so they do not compete for the GPU. The acceptance runner reuses
 the existing nullable/MHT/OR, ABI/resource, Text, manual and full current/heavy
 manifest clients; `future` is not promoted to supported SQL.
 
-```bash
-ctest --test-dir build --output-on-failure
-python3 test/pcuda_stage8/validate.py --build build \
-  --output-root build/stage8-functional --timing-model pcuda-modules-v1
-```
+See [the regression commands](docs/BUILD_AND_RUN.md#regression).
 
 The older numeric-SF10 measurement scripts/results are historical and are not
 native-Text performance oracles. No performance/SLA conclusion follows from the
