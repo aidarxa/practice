@@ -57,7 +57,6 @@ olap_bench/bench/*
 olap_bench/meta/*
 bench/test/results
 /meta/catalog_cache.txt
-/sycl.csv
 
 # Local experiments; retain the small, curated source/plan evidence for 8-ANALYSIS.
 /debug/*
